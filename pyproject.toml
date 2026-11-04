@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "computer-bridge"
+version = "0.2.0"
+description = "Local computer tools and optional research modules for GPT and Dot"
+license = "MIT"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12"
+dependencies = ["httpx2[socks]>=2.13,<3", "websockets>=16,<17", "python-socks[asyncio]>=2.7,<3", "PyYAML==6.0.3", "packaging>=26,<27"]
+
+[project.optional-dependencies]
+build = ["build>=1"]
+
+[project.scripts]
+computer-bridge = "computer_bridge.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/computer_bridge"]
+
+[tool.hatch.build]
+exclude = ["**/node_modules/**", "**/__pycache__/**", "**/*.pyc"]

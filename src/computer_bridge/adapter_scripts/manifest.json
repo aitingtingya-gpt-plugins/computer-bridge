@@ -1,0 +1,7 @@
+{
+  "adapters": [
+    {"name": "native", "script": "native.py"},
+    {"name": "dsh", "script": "dsh.py"},
+    {"name": "codex", "script": "codex.py"}
+  ]
+}

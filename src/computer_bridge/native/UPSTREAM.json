@@ -1,0 +1,38 @@
+{
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "commit": "687f282e8625c6b8d11ff58211a90524be2e4317",
+  "license": "MIT",
+  "file_commits": {
+    "packages/sandbox/sandbox-windows-acl/src/token.ts": "ce7073d51254c26cd63b22a60835b8f948deb447"
+  },
+  "files": {
+    "packages/sandbox/sandbox-windows-acl/src/ffi.ts": "9e90ba38afee21078bfa93c976459a131e8f50fdafd22a8fcf3a3433117b1535",
+    "packages/sandbox/sandbox-windows-acl/src/spawn.ts": "a72479eb80e2c8bb081373d1ed94f5b074c22bb3de4aa317cfbf0f5786b9c3f6",
+    "packages/sandbox/sandbox-windows-acl/src/path-boundary.ts": "42f3b93dd357bebda4eb9268361fad9a64982cfdf0f14518386e797b76654296",
+    "packages/sandbox/sandbox-windows-acl/src/acl.ts": "42376a7c79b7aa3048b325d60bf0a3ebf963bc87b2c168c05f9d32e147f38ee7",
+    "packages/sandbox/sandbox-windows-acl/src/grant.ts": "2d23a95f2f3629707034a0412dc2903df9b5815dfb7a54af3be2a19510024631",
+    "packages/sandbox/sandbox-windows-acl/src/workspace-sid.ts": "7332eef52a304789921e104b1ca38246ea8b44673ea08e952bc43791a9af6411",
+    "packages/sandbox/sandbox-windows-acl/src/index.ts": "d279f21d9e09d70e726d62b1d91d3dccd983fb75db23aa6b322315b35ee6a2e9",
+    "packages/sandbox/sandbox-windows-acl/src/token.ts": "2aa393ad7f542ee986f2a3a09e0530edafaf7f0eb683a8948bf8b125d0b78e73",
+    "packages/sandbox/sandbox-windows-acl/src/acl-skill.ts": "a04e2f6433a039d5bc24b9c0f9aab3b2f4a282da0910554252570f85d4cf6916",
+    "packages/sandbox/sandbox-windows-acl/src/runner.ts": "542b77278d974f5f93c2a0b925468e96e52737366ed88df7d118a5af67c2eff0",
+    "packages/sandbox/sandbox-windows-acl/src/win32-abi.ts": "054c85c9703014d9615a5832b1d98d99042f2e970d2cd5add3f7ad4a13a64f7e",
+    "packages/subprocess/win32-process/src/ffi.ts": "988331864f460138336a29f9290b46e4cd6b46ba5042b39b74621bfb3f72f940",
+    "packages/subprocess/win32-process/src/control-stdio.ts": "8870419b7d48e58acef5e18f98cdfcdb4cc462ec549b3ed853d60a04c3a93c37",
+    "packages/subprocess/win32-process/src/errors.ts": "e0e7377a376ab5c16289d0c9d455ee0460efdcca5f45dd6bad99dfa39e313295",
+    "packages/subprocess/win32-process/src/abi.ts": "02983fd084440c864300ab5c5c4c10bbbcf2e2b1575c01dc2589917b68721126",
+    "packages/subprocess/win32-process/src/process.ts": "2043f59d97f320f83d731fb2f81ec15c77065d4ff98f305be3a95cebb5e776be",
+    "packages/subprocess/win32-process/src/index.ts": "ef120e78e18da1f01fe27066d41eda6eca9ec214f2473e866c7e245b94b2d0bd",
+    "packages/subprocess/win32-process/src/koffi.ts": "13aa290917b636816e17a2656e01a776014b7ea4990bdf799de74d962ce4fec6",
+    "packages/util/lazy-require/src/index.ts": "3453ea694b03c110b366c4d6c18ff6f2d32004ded38cd43ceb89c3ed7aa11fdf",
+    "packages/sandbox/sandbox-local/src/profiles.ts": "b94dd0d0c49c8df63edcbdfe036fafb90eb0bb96e7613e73d46e27b009ae6aaa",
+    "packages/sandbox/sandbox/src/roots.ts": "8a18e1474012415def8197a4ee493394a91cc739a6ec94eb83c6b4d980b7a23b",
+    "packages/web/tool-web/src/fetch.ts": "dc192e9b26d4114704be77e3ce1cffd10c8b2cef611ff0f1b7455f4ba84c3ab0"
+  },
+  "build_changes": [
+    "Remove the DSH ACL diagnosis skill re-export only; confinement implementation stays byte-identical.",
+    "Resolve writableRoots to the multi-directory adapter; Seatbelt profile generation stays unchanged.",
+    "Linux launcher is excluded: native clients support macOS and Windows.",
+    "Extract the unchanged Turndown converter setup from tool-web/fetch.ts, excluding DSH tool registration."
+  ]
+}

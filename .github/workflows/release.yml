@@ -1,0 +1,53 @@
+name: Release
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+      - run: python -m pip install -c constraints.txt -e '.[build]'
+      - run: npm ci --prefix src/computer_bridge/native
+      - run: npm ci --prefix gateway
+      - run: npm run check --prefix gateway
+      - name: Read release version
+        run: python -c 'import os,runpy; v=runpy.run_path("src/computer_bridge/__init__.py")["__version__"]; open(os.environ["GITHUB_ENV"],"a").write("RELEASE_VERSION="+v+"\n")'
+      - name: Require a new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "Release v$RELEASE_VERSION already exists. Publish a new version instead of replacing its resources."
+            exit 1
+          fi
+      - run: python scripts/source_integrity.py
+      - run: python scripts/build_release.py --release-version "$RELEASE_VERSION"
+      - name: Check resource digests
+        working-directory: dist/release-${{ env.RELEASE_VERSION }}
+        run: |
+          sha256sum *.zip *.mjs *.whl release-manifest.json > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Publish components
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "docs/release-$RELEASE_VERSION.md" release-notes.txt
+          printf '\nSource commit: %s\n' "$GITHUB_SHA" >> release-notes.txt
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "v$RELEASE_VERSION" "${release_flags[@]}" --target "$GITHUB_SHA" --title "$RELEASE_VERSION" --notes-file release-notes.txt "dist/release-$RELEASE_VERSION/"*

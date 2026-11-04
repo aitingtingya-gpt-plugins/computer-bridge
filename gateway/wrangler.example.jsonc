@@ -1,0 +1,41 @@
+{
+  "name": "computer-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-28",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public"
+  ],
+  "vars": {
+    "PUBLIC_URL": "https://bridge.example.com"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HUB",
+        "class_name": "ComputerHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ComputerHub"
+      ]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "REPLACE_WITH_YOUR_KV_ID"
+    }
+  ],
+  "routes": [],
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "invocation_logs": false
+    }
+  }
+}

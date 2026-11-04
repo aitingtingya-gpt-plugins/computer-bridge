@@ -1,0 +1,1 @@
+{"id":"work-tree","version":"0.2.0","api":1,"core":">=0.1.4,<=0.2.0","dependencies":["work-tree"],"dependency_versions":{"work-tree":">=0.1.6,<0.2"}}

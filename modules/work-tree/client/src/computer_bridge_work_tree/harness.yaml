@@ -1,0 +1,8 @@
+harnesses:
+  computer-bridge:
+    name: Computer Bridge
+    kind: remote
+    adapter: []
+    skills_path: null
+    answer_tool_approval: false
+    execution: native

@@ -1,0 +1,27 @@
+{
+  "name": "computer-bridge-native",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "node build.mjs && node build-tools.mjs"
+  },
+  "dependencies": {
+    "koffi": "3.1.1",
+    "turndown": "7.2.4",
+    "@joplin/turndown-plugin-gfm": "1.0.68",
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/schemastery": "3.18.5",
+    "chokidar": "5.0.0",
+    "@vscode/ripgrep": "1.18.0",
+    "sharp": "0.35.5",
+    "undici": "8.11.2",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

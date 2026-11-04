@@ -1,0 +1,8 @@
+{
+  "compilerOptions": {
+    "target":"ES2022", "module":"ESNext", "moduleResolution":"Bundler",
+    "strict":true, "skipLibCheck":true, "noEmit":true, "types":["node"],
+    "typeRoots":["../../../gateway/node_modules/@types"]
+  },
+  "files":["runner.ts","html.ts","policy.ts","unsupported-linux.ts","upstream.d.ts"]
+}
