@@ -1,4 +1,4 @@
-/** Durable approval metadata. Commands and approval details stay on the computer. */
+/** Durable approval metadata. Explicit chat approvals also save a complete card in that chat. */
 import {hash, opaque, type Data} from './types'
 import type {KeyStore, Store} from './runtime'
 
@@ -17,16 +17,24 @@ export class CommandApprovals {
   constructor(private store: Store,
     private rpc: (device: string, method: string, args: Data) => Promise<Data>,
     private schedule?: (work: Promise<void>) => void,
-    private changed?: (device: string) => Promise<void>) {}
+    private changed?: (device: string, records: Data[]) => Promise<void>,
+    private projectCard?: (tx: KeyStore, record: Data, details?: Data) => Promise<void>) {}
+
+  private async notify(records:Data[]):Promise<void>{
+    const devices=new Map<string,Data[]>();
+    for(const record of records){const group=devices.get(record.device)??[];group.push(record);devices.set(record.device,group);}
+    await Promise.all([...devices].map(([device,values])=>this.changed?.(device,values)));
+  }
 
   async register(details: Data, projection: Data): Promise<Data> {
     // Shared hub alarms may be rescheduled by other features; also prune on use.
     await this.expire()
-    const record = {id: details.id, device: projection.device, session: details.session,
+    const record: Data = {id: details.id, device: projection.device, session: details.session,
       operation: details.operation, digest: details.digest, caller: details.caller,
       account: projection.account || 'u1', account_epoch: projection.account_epoch ?? 0,
       revision: details.revision, expires_at: details.expires_at * 1000,
-      state: details.state, channel: projection.approval_channel || 'host', projection}
+      state: details.state, channel: projection.approval_channel || 'host', projection,
+      ...(projection.approval_channel === 'chat' && projection.approval_chat_id ? {chat_id: projection.approval_chat_id} : {})}
     let updated = false
     const saved = await this.store.transaction(async tx => {
       const key = 'command-approval:' + record.id
@@ -35,17 +43,19 @@ export class CommandApprovals {
         if (old.digest !== record.digest || old.caller !== record.caller) throw new Error('审批身份冲突')
         if (!old.decision && old.state === 'pending' && record.state !== 'pending') {
           old.state = record.state
+          await this.projectCard?.(tx, old, details)
           await tx.put(key, old)
           updated = true
         }
         return old
       }
+      await this.projectCard?.(tx, record, details)
       await tx.put(key, record)
       updated = true
       return record
     })
     if (saved.state === 'pending') await this.store.setAlarm(saved.expires_at)
-    if (updated) await this.changed?.(record.device)
+    if (updated) await this.notify([saved])
     return saved
   }
 
@@ -99,6 +109,7 @@ export class CommandApprovals {
       const value = await tx.get<Data>(key)
       if (!value || (caller !== undefined && value.caller !== caller)) throw new Error('审批不属于当前调用方')
       await authorize?.(tx, value)
+      if(value.chat_id && notification && notification.chat_id!==value.chat_id)throw new Error('审批目标对话不能变更')
       // A late host form must return the decision already made in chat, not replace it.
       if (value.decision) return value
       if (decision === 'allowed-once') await this.authorize(tx, value)
@@ -110,10 +121,13 @@ export class CommandApprovals {
       value.decided_at = Date.now()
       value.delivery_pending = true
       if (notification) value.notification = {...notification, decision, created_at: value.decided_at}
+      else if (value.chat_id) value.notification = {chat_id: value.chat_id,
+        principal: {kind: 'account', actor: {id: value.account, epoch: value.account_epoch}}, decision, created_at: value.decided_at}
+      await this.projectCard?.(tx, value)
       await tx.put(key, value)
       return value
     })
-    await this.changed?.(record.device)
+    await this.notify([record])
     const result = await this.deliver(record)
     return {record: await this.record(id, caller), result}
   }
@@ -163,17 +177,21 @@ export class CommandApprovals {
     await this.store.transaction(async tx => {
       const key = 'command-approval:' + record.id
       const current = await tx.get<Data>(key)
-      if (current?.decision === record.decision) await tx.put(key, {...current, delivery_pending: false,
-        ...(details.state === 'expired' || details.state === 'invalidated' ? {state: details.state} : {})})
+      if (current?.decision === record.decision) {
+        const updated = {...current, delivery_pending: false,
+          ...(details.state === 'expired' || details.state === 'invalidated' ? {state: details.state} : {})}
+        await this.projectCard?.(tx, updated)
+        await tx.put(key, updated)
+      }
     })
-    await this.changed?.(record.device)
+    await this.notify([record])
     return result
   }
 
   /** Revocation changes only unapproved commands; previously accepted work keeps its lifecycle. */
   async revoke(account: string, device?: string): Promise<void> {
-    const devices = await this.store.transaction(async tx => {
-      const targets = new Set<string>()
+    const changed = await this.store.transaction(async tx => {
+      const targets:Data[] = []
       for (const [key, record] of await tx.list<Data>({prefix: 'command-approval:'})) {
         if ((record.account || record.projection?.account || 'u1') !== account ||
             device !== undefined && record.device !== device ||
@@ -183,12 +201,14 @@ export class CommandApprovals {
         record.state = 'decided'
         record.revoked_at = Date.now()
         record.delivery_pending = true
+        await this.projectCard?.(tx, record)
         await tx.put(key, record)
-        targets.add(record.device)
+        targets.push(record)
       }
       return [...targets]
     })
-    await Promise.all(devices.map(device => this.changed?.(device)))
+    await this.notify(changed)
+    const devices=[...new Set(changed.map(record=>record.device))]
     const delivery = Promise.all(devices.map(target => this.flush(target))).then(() => {})
       .catch(error => {console.error('approval-revoke', (error as Error).name)})
     if (this.schedule) this.schedule(delivery)
@@ -213,9 +233,13 @@ export class CommandApprovals {
         await this.store.transaction(async tx => {
           const key = 'command-approval:' + record.id
           const current = await tx.get<Data>(key)
-          if (current?.decision === record.decision) await tx.put(key, {...current, delivery_pending: false, state: 'ended'})
+          if (current?.decision === record.decision) {
+            const updated = {...current, delivery_pending: false, state: 'ended'}
+            await this.projectCard?.(tx, updated)
+            await tx.put(key, updated)
+          }
         })
-        await this.changed?.(device)
+        await this.notify([record])
       }))
     })
     this.flushing.set(device, work)
@@ -224,18 +248,21 @@ export class CommandApprovals {
 
   async expire(): Promise<void> {
     const changed = await this.store.transaction(async tx => {
-      const devices = new Set<string>()
+      const records:Data[] = []
       for (const prefix of ['command-approval:', 'command-form:']) {
         for (const [key, value] of await tx.list<Data>({prefix})) {
-          if (value.expires_at + 86400_000 < Date.now()) await tx.delete(key)
-          else if (prefix === 'command-approval:' && value.state === 'pending' && value.expires_at <= Date.now()) {
-            await tx.put(key, {...value, state: 'expired'})
-            devices.add(value.device)
+          const remove=value.expires_at + 86400_000 < Date.now()
+          if (prefix === 'command-approval:' && value.state === 'pending' && value.expires_at <= Date.now()) {
+            const updated = {...value, state: 'expired'}
+            await this.projectCard?.(tx, updated)
+            if(!remove)await tx.put(key, updated)
+            records.push(updated)
           }
+          if(remove)await tx.delete(key)
         }
       }
-      return [...devices]
+      return records
     })
-    await Promise.all(changed.map(device => this.changed?.(device)))
+    await this.notify(changed)
   }
 }

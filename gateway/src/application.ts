@@ -99,7 +99,7 @@ async function management(request: Request, env: ApplicationEnv): Promise<Respon
   if(actor.role==='admin') view.users=(await (await control(env,'accounts-list',{},actor)).json<Data>()).users;
   const list = await (await control(env, "list",{},actor)).json<Data>();
   const response = page("设备管理", devicesPage(list.computers, actor.nonce,
-    url.searchParams.get("code") || "", url.searchParams.get("notice") || "", error,view));
+    url.searchParams.get("code") || "", url.searchParams.get("notice") || "", error,view),undefined,'management-page');
   return error ? new Response(response.body, {status:errorStatus, headers: response.headers}) : response;
 }
 
@@ -124,7 +124,7 @@ async function accountManagement(request:Request,env:ApplicationEnv):Promise<Res
     if(response.ok) result=value;else error=value.error;
   }
   const {users}=await (await control(env,'accounts-list',{},actor)).json<Data>();
-  const response=page('账号管理',accountsPage(actor,users,actor.nonce,result,error));
+  const response=page('账号管理',accountsPage(actor,users,actor.nonce,result,error),undefined,'management-page');
   return error?new Response(response.body,{status:400,headers:response.headers}):response;
 }
 
@@ -143,7 +143,7 @@ async function profile(request:Request,env:ApplicationEnv):Promise<Response> {
     else if(password) return new Response(null,{status:303,headers:{Location:'/manage?notice=password_changed','Set-Cookie':expiredCookie}});
     else {actor={...actor,...(value.user || value.actor)};saved=true;}
   }
-  const response=page('我的账号',profilePage(actor,actor.nonce,error,saved));
+  const response=page('我的账号',profilePage(actor,actor.nonce,error,saved),undefined,'management-page');
   return error?new Response(response.body,{status:400,headers:response.headers}):response;
 }
 
@@ -292,7 +292,7 @@ async function chat(request:Request,env:ApplicationEnv):Promise<Response> {
   if(request.method==='POST') return Response.redirect(env.PUBLIC_URL+url.pathname+url.search,303);
   const response=await control(env,'list',{},actor);
   const {computers}=await response.json<Data>();
-  return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''),undefined,'chat-page');
+  return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''),undefined,'management-page chat-page');
 }
 
 async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response> {

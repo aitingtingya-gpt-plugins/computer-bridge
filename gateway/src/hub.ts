@@ -37,7 +37,7 @@ export class ComputerHubCore {
     this.ctx=ctx={...ctx,storage:this.scheduler.store()};
     this.approvals=new CommandApprovals(ctx.storage,(device,method,args)=>
       this.rpc(device,method,args,false,AbortSignal.timeout(30_000)),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;},
-      device=>this.notifyApprovals(device));
+      (device,records)=>this.notifyApprovals(device,records),(tx,record,details)=>this.chats.approvalCard(tx,record,details));
     this.transport=new DeviceTransport(ctx,id=>this.requests.received(id));
     this.modules = new ServerModules(ctx.storage);
     this.updates = new Updates(ctx.storage,env,
@@ -121,18 +121,19 @@ export class ComputerHubCore {
     }));
   }
 
-  private async notifyApprovals(device:string):Promise<void> {
+  private async notifyApprovals(device:string,records:Data[]):Promise<void> {
+    await Promise.all([...new Set(records.map(record=>record.chat_id).filter(Boolean))].map(id=>this.notifyChat(id)));
     const id=await this.refs.assign('c',device);
     await Promise.all(this.ctx.getWebSockets('chat-live').map(async socket=>{
       const state=socket.deserializeAttachment() as Data;
-      if(state.device_id!==device)return;
+      if(state.device_id!==device || !records.some(record=>!record.chat_id))return;
       try {
         if(state.expires_at!==null && state.expires_at<=Date.now())throw new Error('Chat login expired');
         await this.chatDevice(state.principal ?? {kind:'account',actor:{id:state.account,epoch:state.epoch}},device);
         socket.send(JSON.stringify({type:'approvals.changed',device_id:id}));
       }catch{socket.close(1008,'Chat access expired');}
     }));
-    for(const record of await this.approvals.list(device,{include_finished:true}))if(record.notification && !record.notification.delivered_at) {
+    for(const record of records)if(record.notification && !record.notification.delivered_at) {
       try {await this.deliverApprovalNotice(record.id);}catch { /* Durable target is retried by the next query or decision. */ }
     }
   }
@@ -269,6 +270,7 @@ export class ComputerHubCore {
         const selected=await this.chats.authorize(principal,args.chat_id);
         if(selected.device!==record.device)throw Object.assign(new Error('审批与当前对话不属于同一台电脑'),{code:'device_forbidden'});
       }
+      if(record.chat_id && args.chat_id!==record.chat_id)throw Object.assign(new Error('请在审批指定的对话中提交决定'),{code:'approval_chat_mismatch'});
       let delivery_pending=false;
       try {
         await this.approvals.decide(args.id,args.decision,undefined,
@@ -736,10 +738,13 @@ export class ComputerHubCore {
       args._definition={source:reference.source,locator:reference.locator};
     }
     const projection={method,device,scope,root,context,selectedFile,legacyWorkspace,account:actor.id,account_epoch:actor.epoch,
-      ...(method==='computer.exec'?{approval_channel:args.approval_channel??'host'}:{}),args:{
+      ...(method==='computer.exec'?{approval_channel:args.approval_channel??'host',...(args.approval_chat_id?{approval_chat_id:args.approval_chat_id}:{})}:{}),args:{
       session:args.session,operation:args.operation,action:args.action,consume:args.consume,
       payload:{operation:args.payload?.operation,consume:args.payload?.consume}}};
-    const record=await this.requests.begin(device,method,args,projection);
+    const record=await this.requests.begin(device,method,args,projection,async tx=>{
+      if(method==='computer.exec' && args.sandbox_permissions && !access.full_access && args.approval_channel==='chat')
+        await this.chats.approvalTarget(tx,actor,args.approval_chat_id,device);
+    });
     const info=await this.ctx.storage.get<Data>('device:'+device);
     let completed=false;
     try {
@@ -830,6 +835,7 @@ export class ComputerHubCore {
       if(result.state==='awaiting_approval') {
         const approval=await this.approvals.register(result.approval,projection);
         result={...result,approval:{id:approval.id,expires_at:approval.expires_at,channel:approval.channel,
+          ...(approval.chat_id?{chat_id:approval.chat_id}:{}),
           url:this.env.PUBLIC_URL+'/manage/command-approval?id='+encodeURIComponent(approval.id)}};
       }
     }

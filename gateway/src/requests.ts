@@ -1,5 +1,5 @@
 import {hash,opaque,type Data} from './types';
-import type {Store} from './runtime';
+import type {KeyStore,Store} from './runtime';
 import {References} from './references';
 
 function canonical(value:any):any {
@@ -12,7 +12,7 @@ function canonical(value:any):any {
 export class RequestRecords {
   constructor(private store:Store,private refs:References) {}
 
-  async begin(device:string,method:string,args:Data,projection:Data):Promise<Data> {
+  async begin(device:string,method:string,args:Data,projection:Data,validateNew?:(tx:KeyStore)=>Promise<void>):Promise<Data> {
     const {request_key,_access,_guidance_stamps,...parameters}=args;
     const fingerprint=await hash(JSON.stringify(canonical({method,parameters})));
     if(typeof request_key==='string' && /^x[1-9][0-9]*$/.test(request_key)) {
@@ -31,6 +31,7 @@ export class RequestRecords {
         if(record.fingerprint!==fingerprint) throw Object.assign(new Error('同一 request_key 的参数不同'),{code:'request_conflict'});
         return record;
       }
+      await validateNew?.(tx);
       const id=opaque();
       const record={id,device,method,fingerprint,projection,created:Date.now(),state:'pending',claimed:false};
       await tx.put('request:'+id,record);

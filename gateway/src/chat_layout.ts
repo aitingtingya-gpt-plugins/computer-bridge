@@ -1,12 +1,14 @@
 /** Chat-only viewport layout. Dimensions are local preferences, never conversation state. */
 export const chatLayoutStyles=String.raw`
-.chat-page{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
-.chat-page>.topbar{height:44px;flex-shrink:0;padding:0 20px;border:0;background:var(--bg)}
-.chat-page .brand{font-size:14px;gap:8px}.chat-page .brand-mark{width:25px;height:25px;border-radius:7px}.chat-page .brand-mark svg{width:18px;height:18px}
-.chat-page main{max-width:none;width:100%;flex:1;min-height:0;margin:0;padding:0 12px 12px;display:flex;flex-direction:column}
-.chat-page main>h1{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
-.chat-page .account-navigation{flex-shrink:0;margin:0;padding:5px 8px 10px;border:0;min-height:36px;font-size:12px;gap:12px}
-.chat-page .account-navigation>div:last-child{gap:18px}.chat-page .account-navigation .muted{font-size:12px}
+.management-page{min-height:100dvh;display:flex;flex-direction:column}
+.management-page>.topbar{height:44px;flex-shrink:0;padding:0 20px;border:0;background:var(--bg)}
+.management-page .brand{font-size:14px;gap:8px}.management-page .brand-mark{width:25px;height:25px;border-radius:7px}.management-page .brand-mark svg{width:18px;height:18px}
+.management-page main{max-width:none;width:100%;flex:1;margin:0;padding:0 12px 12px;display:flex;flex-direction:column;min-width:0}
+.management-page main>h1{font-size:24px;margin:12px 8px 18px}.management-page main>.auth-card{width:100%;align-self:flex-start;margin:8px 0 0}
+.management-page .account-navigation{flex-shrink:0;margin:0;padding:5px 8px 10px;border:0;min-height:36px;font-size:12px;gap:12px}
+.management-page .account-navigation>div:last-child{gap:18px}.management-page .account-navigation .muted{font-size:12px}
+.chat-page{height:100dvh;overflow:hidden}.chat-page main{min-height:0}
+.chat-page main>h1{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);margin:0}
 .chat-page #chat-notice{flex-shrink:0;margin:0 0 8px;padding:8px 12px}
 .chat-layout{--sidebar-width:280px;--compose-height:160px;display:grid;grid-template-columns:var(--sidebar-width) 8px minmax(0,1fr);position:relative;flex:1;min-height:0;min-width:0;overflow:hidden;background:white;border:1px solid var(--line);border-radius:12px}
 .chat-sidebar{min-width:0;min-height:0;padding:14px;background:#f8faf9;overflow:auto;overscroll-behavior:contain}
@@ -34,7 +36,7 @@ export const chatLayoutStyles=String.raw`
 .chat-sidebar-backdrop{position:absolute;inset:0;z-index:3;background:#163b3640;border:0;border-radius:0;padding:0}.chat-sidebar-backdrop:hover{background:#163b3640}
 .chat-resume button{white-space:nowrap;flex-shrink:0}.chat-list-heading{margin-top:20px}
 @media(max-width:760px){
- .chat-page>.topbar{height:38px;padding:0 12px}.chat-page main{padding:0 6px 6px}.chat-page .account-navigation{padding:3px 4px 8px;gap:5px;align-items:center}.chat-page .account-navigation>div:last-child{gap:12px}.chat-page .account-navigation .muted{display:none}
+ .management-page>.topbar{height:38px;padding:0 12px}.management-page main{padding:0 6px 6px}.management-page .account-navigation{padding:3px 4px 8px;gap:5px;align-items:center;flex-wrap:wrap}.management-page .account-navigation>div:last-child{gap:12px}.management-page .account-navigation .muted{display:none}
  .chat-layout,.chat-layout[data-collapsed=false]{grid-template-columns:minmax(0,1fr);border-radius:9px}.chat-layout>.chat-resize-side{display:none}
  .chat-layout>.chat-sidebar{display:none;position:absolute;z-index:4;top:0;bottom:0;left:0;width:min(320px,calc(100% - 48px));box-shadow:8px 0 32px #163b3620}
  .chat-layout[data-drawer=true]>.chat-sidebar{display:block}.chat-layout #chat-sidebar-open{display:inline-flex}
@@ -45,42 +47,43 @@ export const chatLayoutStyles=String.raw`
 
 export const chatLayoutScript=String.raw`<script>
 (()=>{
- const $=id=>document.getElementById(id),layout=document.querySelector('.chat-layout'),sidebar=$('chat-sidebar'),messages=$('chat-messages'),composer=$('chat-compose');
+ const $=id=>document.getElementById(id),layout=document.querySelector('.chat-layout'),sidebar=$('chat-sidebar'),messages=$('chat-messages'),composer=$('chat-compose'),thread=document.querySelector('.chat-thread');
  const open=$('chat-sidebar-open'),close=$('chat-sidebar-close'),backdrop=$('chat-sidebar-backdrop'),sideHandle=$('chat-sidebar-resize'),composeHandle=$('chat-compose-resize');
  const initial=JSON.parse($('chat-initial').textContent),key='computer-bridge:chat-layout:'+initial.account_id;
  const narrow=matchMedia('(max-width:760px)'),defaults={width:280,height:160,collapsed:false};
- let prefs={...defaults},drawer=false,reading=null,restoring=false,frame=0;
+ let prefs={...defaults},drawer=false,reading=null,restoring=false,applyFrame=0,restoreFrame=0,scrollFrame=0,stopped=false;
  try{const stored=JSON.parse(localStorage.getItem(key));if(stored){prefs.width=Number(stored.width)||280;prefs.height=Number(stored.height)||160;prefs.collapsed=stored.collapsed===true;}}catch{}
  const clamp=(n,min,max)=>Math.max(min,Math.min(max,n));
  function save(){try{localStorage.setItem(key,JSON.stringify(prefs));}catch{}}
  function remember(){
-  const box=messages.getBoundingClientRect(),node=Array.from(messages.querySelectorAll('.chat-message')).find(n=>n.getBoundingClientRect().bottom>box.top);
-  reading={bottom:messages.scrollHeight-messages.scrollTop-messages.clientHeight<4,id:node?.dataset.id,offset:node?node.getBoundingClientRect().top-box.top:0,top:messages.scrollTop};
+  const nodes=window.bridgeChatView.nodes(),top=messages.getBoundingClientRect().top;let low=0,high=nodes.length;
+  while(low<high){const mid=(low+high)>>1;if(nodes[mid].getBoundingClientRect().bottom<=top)low=mid+1;else high=mid;}
+  const node=nodes[low];reading={bottom:messages.scrollHeight-messages.scrollTop-messages.clientHeight<4,id:node?.dataset.id,offset:node?node.getBoundingClientRect().top-top:0,top:messages.scrollTop,generation:window.bridgeChatView.generation()};return reading;
  }
  function restore(anchor){
-  if(!anchor)return;
+  if(!anchor||anchor.generation!==window.bridgeChatView.generation())return;
   if(anchor.bottom)messages.scrollTop=messages.scrollHeight;
-  else{const node=Array.from(messages.querySelectorAll('.chat-message')).find(n=>n.dataset.id===anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}
+  else{const node=window.bridgeChatView.byId(anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}
  }
+ window.bridgeChatLayout={capture:remember,restore};
+ function attr(node,name,value){value=String(value);if(node.getAttribute(name)!==value)node.setAttribute(name,value);}
+ function style(name,value){if(layout.style.getPropertyValue(name)!==value)layout.style.setProperty(name,value);}
  function apply(){
-  const anchor=reading;restoring=true;
-  const width=clamp(prefs.width,200,Math.min(480,layout.clientWidth-368));
-  layout.style.setProperty('--sidebar-width',width+'px');layout.dataset.collapsed=String(prefs.collapsed);layout.dataset.drawer=String(drawer&&narrow.matches);
-  sidebar.inert=narrow.matches?!drawer:prefs.collapsed;sidebar.setAttribute('aria-hidden',String(sidebar.inert));
-  backdrop.hidden=!narrow.matches||!drawer;open.setAttribute('aria-expanded',String(!sidebar.inert));
-  const thread=document.querySelector('.chat-thread');
+  applyFrame=0;if(stopped)return;const anchor=reading;restoring=true;
+  // Read geometry before changing widths/heights. A wrapped header triggers the next observer frame.
+  const maxWidth=Math.max(200,Math.min(480,layout.clientWidth-368)),width=clamp(prefs.width,200,maxWidth);
   const fixed=thread.querySelector('.chat-thread-header').offsetHeight+thread.querySelector('.chat-connection').offsetHeight+composeHandle.offsetHeight;
-  const attached=$('chat-attachments'),style=getComputedStyle(composer),hasAttachments=attached.childElementCount>0;
-  const minHeight=Math.ceil(parseFloat(style.paddingTop)+parseFloat(style.paddingBottom)+30+composer.querySelector('.chat-compose-actions').offsetHeight+parseFloat(style.gap)*(hasAttachments?2:1)+(hasAttachments?Math.min(attached.scrollHeight,64):0));
-  const maxHeight=Math.max(minHeight,Math.min(thread.clientHeight*.6,thread.clientHeight-fixed-120));
-  const height=clamp(prefs.height,minHeight,maxHeight);layout.style.setProperty('--compose-height',height+'px');
-  for(const [handle,value,min,max] of [[sideHandle,width,200,Math.min(480,layout.clientWidth-368)],[composeHandle,height,minHeight,maxHeight]]){
-   handle.setAttribute('aria-valuenow',Math.round(value));handle.setAttribute('aria-valuemin',min);handle.setAttribute('aria-valuemax',Math.round(Math.max(min,max)));
-  }
-  cancelAnimationFrame(frame);frame=requestAnimationFrame(()=>{restore(anchor);restoring=false;remember();});
+  const attached=$('chat-attachments'),computed=getComputedStyle(composer),hasAttachments=attached.childElementCount>0;
+  const minHeight=Math.ceil(parseFloat(computed.paddingTop)+parseFloat(computed.paddingBottom)+30+composer.querySelector('.chat-compose-actions').offsetHeight+parseFloat(computed.gap)*(hasAttachments?2:1)+(hasAttachments?Math.min(attached.scrollHeight,64):0));
+  const maxHeight=Math.max(minHeight,Math.min(thread.clientHeight*.6,thread.clientHeight-fixed-120)),height=clamp(prefs.height,minHeight,maxHeight);
+  style('--sidebar-width',width+'px');style('--compose-height',height+'px');attr(layout,'data-collapsed',prefs.collapsed);attr(layout,'data-drawer',drawer&&narrow.matches);
+  const inert=narrow.matches?!drawer:prefs.collapsed;if(sidebar.inert!==inert)sidebar.inert=inert;attr(sidebar,'aria-hidden',inert);backdrop.hidden=!narrow.matches||!drawer;attr(open,'aria-expanded',!inert);
+  for(const [handle,value,min,max] of [[sideHandle,width,200,maxWidth],[composeHandle,height,minHeight,maxHeight]]){attr(handle,'aria-valuenow',Math.round(value));attr(handle,'aria-valuemin',min);attr(handle,'aria-valuemax',Math.round(max));}
+  cancelAnimationFrame(restoreFrame);restoreFrame=requestAnimationFrame(()=>{restoreFrame=0;restore(anchor);restoring=false;remember();});
  }
- messages.addEventListener('scroll',()=>{if(!restoring)remember();},{passive:true});
- function toggle(show){remember();if(narrow.matches)drawer=show;else{prefs.collapsed=!show;save();}apply();if(show&&narrow.matches)close.focus();else if(!show)open.focus();}
+ function schedule(){if(!stopped&&!applyFrame)applyFrame=requestAnimationFrame(apply);}
+ messages.addEventListener('scroll',()=>{if(!restoring&&!scrollFrame)scrollFrame=requestAnimationFrame(()=>{scrollFrame=0;if(!restoring)remember();});},{passive:true});
+ function toggle(show){remember();if(narrow.matches)drawer=show;else{prefs.collapsed=!show;save();}schedule();if(show&&narrow.matches)requestAnimationFrame(()=>close.focus());else if(!show)requestAnimationFrame(()=>open.focus());}
  open.addEventListener('click',()=>toggle(true));close.addEventListener('click',()=>toggle(false));backdrop.addEventListener('click',()=>toggle(false));
  sidebar.addEventListener('keydown',event=>{
   if(!narrow.matches||!drawer)return;
@@ -90,20 +93,20 @@ export const chatLayoutScript=String.raw`<script>
  sidebar.addEventListener('click',event=>{if(narrow.matches&&event.target.closest('[data-chat-id]'))toggle(false);});
  function resize(handle,field,axis,direction){
   let drag=null;
-  function set(value){prefs[field]=clamp(value,Number(handle.getAttribute('aria-valuemin')),Number(handle.getAttribute('aria-valuemax')));apply();}
+  function set(value){prefs[field]=clamp(value,Number(handle.getAttribute('aria-valuemin')),Number(handle.getAttribute('aria-valuemax')));schedule();}
   handle.addEventListener('pointerdown',event=>{if(event.button!==0)return;event.preventDefault();remember();handle.focus();drag={position:event[axis],size:Number(handle.getAttribute('aria-valuenow'))};handle.setPointerCapture(event.pointerId);handle.dataset.dragging='true';});
   handle.addEventListener('pointermove',event=>{if(drag)set(drag.size+(event[axis]-drag.position)*direction);});
   function finish(){if(drag){drag=null;delete handle.dataset.dragging;save();}}
   handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);handle.addEventListener('lostpointercapture',finish);
-  handle.addEventListener('dblclick',()=>{remember();prefs[field]=defaults[field];apply();save();});
-  handle.addEventListener('keydown',event=>{const delta=field==='width'?{ArrowLeft:-10,ArrowRight:10}:{ArrowDown:-10,ArrowUp:10};if(event.key in delta){event.preventDefault();remember();set(Number(handle.getAttribute('aria-valuenow'))+delta[event.key]);save();}else if(event.key==='Home'){event.preventDefault();remember();prefs[field]=defaults[field];apply();save();}});
+  handle.addEventListener('dblclick',()=>{remember();prefs[field]=defaults[field];schedule();save();});
+  handle.addEventListener('keydown',event=>{const delta=field==='width'?{ArrowLeft:-10,ArrowRight:10}:{ArrowDown:-10,ArrowUp:10};if(event.key in delta){event.preventDefault();remember();set(Number(handle.getAttribute('aria-valuenow'))+delta[event.key]);save();}else if(event.key==='Home'){event.preventDefault();remember();prefs[field]=defaults[field];schedule();save();}});
  }
  resize(sideHandle,'width','clientX',1);resize(composeHandle,'height','clientY',-1);
- narrow.addEventListener('change',()=>{drawer=false;apply();});
- const observed=[layout,document.querySelector('.chat-thread-header'),document.querySelector('.chat-connection'),$('chat-attachments')];
- const observer=new ResizeObserver(apply);for(const node of observed)observer.observe(node);
- window.addEventListener('pagehide',()=>{observer.disconnect();cancelAnimationFrame(frame);});
- window.addEventListener('pageshow',event=>{if(event.persisted){for(const node of observed)observer.observe(node);apply();}});
- remember();apply();
+ narrow.addEventListener('change',()=>{drawer=false;schedule();});
+ const observed=[layout,thread.querySelector('.chat-thread-header'),thread.querySelector('.chat-connection'),$('chat-attachments'),composer.querySelector('.chat-compose-actions')];
+ const observer=new ResizeObserver(schedule);for(const node of observed)observer.observe(node);
+ window.addEventListener('pagehide',()=>{stopped=true;observer.disconnect();cancelAnimationFrame(applyFrame);cancelAnimationFrame(restoreFrame);cancelAnimationFrame(scrollFrame);applyFrame=restoreFrame=scrollFrame=0;});
+ window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;for(const node of observed)observer.observe(node);schedule();}});
+ remember();schedule();
 })();
 </script>`;

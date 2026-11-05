@@ -128,8 +128,10 @@ the original writing connection and ownership remain.
 The existing computer tools remain available during communication with their unchanged account,
 workspace and approval rules. Use the selected chat's computer unless the user explicitly requests
 another target. For commands needing one-time wider access during a Bridge chat, use
-`approval_channel="chat"` with `sandbox_permissions` and `justification`. The human can decide
-in the web chat or TUI `/approve`; this avoids a simultaneous host form. Keep the original operation
+`approval_channel="chat"` and `approval_chat_id="t1"` with `sandbox_permissions` and `justification`.
+Choose an authorized chat on the command's computer. Its web and TUI message history receive
+the approval card, including the actual command, directory, reason and decision; other chats do not.
+The human decides directly on the card; this avoids a simultaneous host form. Keep the original operation
 and wait/recover it after approval; never launch the command again. Ordinary host calls default to
 `approval_channel="host"`. Full-access devices execute directly. An approval decision message
 reports the decision, not command completion. Chat history and attachments are stored on the server until the chat is deleted.

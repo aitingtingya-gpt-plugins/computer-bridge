@@ -22,5 +22,8 @@ export function page(title: string, body: string, headers?: HeadersInit, css = "
   h.set("Cache-Control", "no-store");
   h.set("X-Frame-Options", "DENY");
   h.set("Referrer-Policy", "no-referrer");
-  return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>${css}</style></head><body class="${escape(pageClass)}"><header class="topbar"><a class="brand" href="/manage"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 16V9a3 3 0 0 1 3-3h3m4 0h3a3 3 0 0 1 3 3v7M8 13l4 4 4-4M12 4v13"/></svg></span>Computer Bridge</a></header><main><h1>${escape(title)}</h1>${body}</main></body></html>`, {headers: h});
+  const heading = `<h1>${escape(title)}</h1>`;
+  const navigationEnd = pageClass.split(' ').includes('management-page') ? body.indexOf('</nav>') : -1;
+  const content = navigationEnd < 0 ? heading + body : body.slice(0, navigationEnd + 6) + heading + body.slice(navigationEnd + 6);
+  return new Response(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)}</title><style>${css}</style></head><body class="${escape(pageClass)}"><header class="topbar"><a class="brand" href="/manage"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 16V9a3 3 0 0 1 3-3h3m4 0h3a3 3 0 0 1 3 3v7M8 13l4 4 4-4M12 4v13"/></svg></span>Computer Bridge</a></header><main>${content}</main></body></html>`, {headers: h});
 }

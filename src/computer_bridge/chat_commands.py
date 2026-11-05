@@ -1,9 +1,12 @@
 """One command catalogue for terminal help and interactive completion."""
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 
 
@@ -24,7 +27,6 @@ COMMANDS = (
     Command("/new", "[标题]", "新建对话"),
     Command("/attach", "文件路径", "添加附件，支持含空格的路径", True),
     Command("/unattach", "", "清空待发送附件"),
-    Command("/approve", "", "查看当前电脑的待审批命令"),
     Command("/computers", "", "选择新对话使用的电脑"),
     Command("/login", "", "登录账号，访问账号授权的电脑"),
     Command("/logout", "", "返回本机身份"),
@@ -54,3 +56,42 @@ class CommandCompleter(Completer):
             if command.name.startswith(prefix.lower()):
                 yield Completion(command.name, start_position=-len(prefix), display=command.usage,
                                  display_meta=command.description)
+
+
+class SlashMenu:
+    """Refresh for any edit; selecting or dismissing a menu is not a new edit."""
+
+    def __init__(self, buffer: Buffer, focused: Callable[[], bool]):
+        self.buffer, self.focused = buffer, focused
+        self.suspended = False
+        self.pending: asyncio.Handle | None = None
+        buffer.on_text_changed += self.changed
+
+    def changed(self, buffer: Buffer) -> None:
+        if self.suspended:
+            return
+        if self.pending:
+            self.pending.cancel()
+        self.pending = asyncio.get_running_loop().call_soon(self.refresh)
+
+    def refresh(self) -> None:
+        self.pending = None
+        document = self.buffer.document
+        if (self.focused() and document.is_cursor_at_the_end and document.text.startswith("/")
+                and not any(character.isspace() for character in document.text)):
+            self.buffer.start_completion(select_first=False)
+
+    @contextmanager
+    def selecting(self) -> Iterator[None]:
+        if self.pending:
+            self.pending.cancel()
+            self.pending = None
+        self.suspended = True
+        try:
+            yield
+        finally:
+            self.suspended = False
+
+    def close(self) -> None:
+        with self.selecting():
+            self.buffer.cancel_completion()

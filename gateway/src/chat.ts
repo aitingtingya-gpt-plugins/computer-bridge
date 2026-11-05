@@ -23,7 +23,7 @@ export interface ChatEnvironment {
   background?(work:Promise<unknown>):void;
 }
 interface Conversation {id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;writer?:string;revision?:number}
-interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model';text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string}
+interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model';text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;kind?:'approval';approval?:Data;approval_id?:string}
 interface AttachmentView {id:string;name:string;size:number;mime_type:string;sha256?:string}
 interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string}
 interface Candidate {chat:string;account:string;epoch:number;caller:string;expires_at:number}
@@ -81,6 +81,48 @@ export class ChatService {
   authenticateDevice(device:string,credential:string):Promise<ChatIdentity>{return authenticateDeviceIdentity(this.store,device,credential);}
   async authorize(actor:ChatPrincipal,chatId:string):Promise<{id:string;device:string;device_id:string}>{
     await this.initialize();const chat=await this.chat(chatId,actor);return {id:chat.id,device:chat.device,device_id:chat.device_id};
+  }
+
+  /** Validate a new command's fixed destination before it reaches a computer. */
+  async approvalTarget(tx:KeyStore,actor:Actor,chatId:unknown,device:string):Promise<void>{
+    if(typeof chatId!=='string'||!/^t[1-9][0-9]*$/.test(chatId))throw fail('approval_chat_required','聊天审批需要 approval_chat_id；请从 chat.list 选择这台电脑的对话');
+    await this.accounts.assertAccessIn(tx,actor,device);
+    const chat=await tx.get<Conversation>(key(chatId));
+    if(!chat)throw fail('chat_not_found','目标对话不存在');
+    if(chat.device!==device)throw fail('device_forbidden','审批目标对话与命令不属于同一台电脑');
+  }
+
+  /** Same transaction as the approval record; immutable command details are captured once. */
+  async approvalCard(tx:KeyStore,record:Data,details?:Data):Promise<void>{
+    if(!record.chat_id)return;
+    const chat=await tx.get<Conversation>(key(record.chat_id));
+    if(!chat||chat.device!==record.device)return;
+    const ref='chat-approval:'+chat.id+':'+record.id;
+    const sequence=await tx.get<number>(ref);
+    const previous=sequence?await tx.get<Message>(messageKey(chat.id,sequence)):undefined;
+    let message:Message;
+    const state={state:record.state,...(record.decision?{decision:record.decision}:{}),delivery_pending:!!record.delivery_pending};
+    if(previous){
+      if(previous.approval?.state===state.state&&previous.approval?.decision===record.decision&&previous.approval?.delivery_pending===state.delivery_pending)return;
+      message={...previous,approval:{...previous.approval,...state}};
+    }else{
+      if(!details)return;
+      const account=await tx.get<Actor & {enabled:boolean}>('account:'+record.account);
+      if(!account?.enabled||account.epoch!==record.account_epoch)return;
+      try{await this.accounts.assertAccessIn(tx,account,record.device);}catch(error){
+        if(['account_unavailable','device_forbidden','device_missing'].includes((error as Data).code))return;throw error;
+      }
+      const device=await tx.get<Data>('device:'+record.device);
+      const n=++chat.sequence,stamp=now();
+      message={id:'m'+n,sequence:n,role:'assistant',source:'model',kind:'approval',
+        text:'命令审批',attachments:[],created_at:stamp,saved_at:stamp,
+        approval:{id:record.id,device_id:chat.device_id,device_name:device?.display_name??device?.name??chat.device_id,
+          command:details.command,cwd:details.cwd,justification:details.justification,expires_at:record.expires_at,...state}};
+      await tx.put(ref,n);
+    }
+    chat.updated_at=now();
+    await tx.put(messageKey(chat.id,message.sequence),message);
+    await this.recordChange(tx,chat,[message.sequence]);
   }
 
   private async changed(chat:string):Promise<void>{await this.env.changed?.(chat);}
@@ -249,12 +291,16 @@ export class ChatService {
     try{await this.accounts.assertAccessIn(tx,account,device);return true;}
     catch(error){if(['account_unavailable','device_forbidden','device_missing'].includes((error as Data).code))return false;throw error;}
   }
-  private async chat(id:string,actor:ChatPrincipal):Promise<Conversation>{
+  private deviceView(id:string,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>):Promise<ChatDevice>{
+    if(!views)return this.env.device(id,actor);
+    let value=views.get(id);if(!value){value=this.env.device(id,actor);views.set(id,value);}return value;
+  }
+  private async chat(id:string,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>):Promise<Conversation>{
     await validateIdentity(this.accounts,this.store,actor);
     const value=await this.store.get<Conversation>(key(id));
     if(!value)throw fail('chat_not_found','对话不存在');
     await this.access(actor,value.device);
-    await this.env.device(value.device,actor);
+    await this.deviceView(value.device,actor,views);
     if(value.writer){
       const writer=await this.store.get<Writer>(writerKey(id));
       const owner=writer?await this.store.get<Actor>('account:'+writer.account):undefined;
@@ -283,8 +329,8 @@ export class ChatService {
     }
     return value;
   }
-  private async summary(chat:Conversation,actor:ChatPrincipal):Promise<Data>{
-    const device=await this.env.device(chat.device,actor);
+  private async summary(chat:Conversation,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>):Promise<Data>{
+    const device=await this.deviceView(chat.device,actor,views);
     const last=chat.sequence?await this.store.get<Message>(messageKey(chat.id,chat.sequence)):undefined;
     const lastView=last?await this.viewMessage(this.store,chat.id,last):undefined;
     return {id:chat.id,title:chat.title,device_id:device.id,device_name:device.name,system:device.system,
@@ -301,8 +347,10 @@ export class ChatService {
   async action(action:string,args:Data,actor:ChatPrincipal,caller=''):Promise<Data>{
     await validateIdentity(this.accounts,this.store,actor);await this.initialize();
     if(action==='list'){
+      const views=new Map<string,Promise<ChatDevice>>();
       const identity=normalizeIdentity(actor);
       const requested=args.device_id?await this.env.device(args.device_id,actor):identity.kind==='device'?await this.env.device(identity.device,actor):null;
+      if(requested)views.set(requested.raw,Promise.resolve(requested));
       if(requested)await this.access(actor,requested.raw);
       const after=integer(args.after??0,'after'),limit=limitOf(args.limit);
       const prefix=requested?'chat-device:'+requested.raw+':':'chat-index:';
@@ -311,7 +359,7 @@ export class ChatService {
         const rows=await this.store.list<string>({prefix,startAfter:prefix+padded(last),limit:100});
         for(const id of rows.values()){
           let current:Data|undefined;
-          try{const c=await this.chat(id,actor);current=await this.summary(c,actor);}
+          try{const c=await this.chat(id,actor,views);current=await this.summary(c,actor,views);}
           catch(e){if(!['chat_not_found','device_forbidden','device_missing'].includes((e as Data).code))throw e;}
           if(current&&chats.length===limit){more=true;break;}
           last=Number(id.slice(1));if(current)chats.push(current);
@@ -461,7 +509,8 @@ export class ChatService {
       if(previous)return previous;
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
       const sequence=++current.sequence,stamp=now();
-      const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',text:'命令审批 '+approvalId+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),attachments:[],created_at:stamp,saved_at:stamp};
+      const card=await tx.get<number>('chat-approval:'+chat.id+':'+approvalId);
+      const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',text:'命令审批 '+approvalId+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),attachments:[],created_at:stamp,saved_at:stamp,...(card?{approval_id:approvalId}:{})};
       current.updated_at=stamp;const result={saved:true,chat_id:chat.id,message_id:message.id,decision};
       await tx.put({[messageKey(chat.id,sequence)]:message,[timingKey(chat.id,sequence)]:{saved_at:stamp,attempts:0},[noticeKey]:result});
       await this.recordChange(tx,current,[sequence]);await this.queueMessage(tx,current,message);return result;
@@ -557,7 +606,7 @@ export class ChatService {
       for(const [k,candidate] of await tx.list<Candidate>({prefix:'chat-candidate:'}))if(candidate.chat===chat.id){await tx.delete(k);await this.expiry(tx,'candidate',k.slice('chat-candidate:'.length));}
       for(const a of files)await this.expiry(tx,'upload',chat.id+':'+a.id);
       const head=await tx.get<Head>('chat-head:'+chat.id);if(head)await tx.delete([dueKey(head),'chat-head:'+chat.id]);
-      for(const prefix of ['chat-change:','chat-timing:','chat-pending:','chat-unack:','chat-message:','chat-attachment:','chat-chunk:','chat-event:','chat-request:','chat-import:'])await tx.delete([...(await tx.list({prefix:prefix+chat.id+':'})).keys()]);
+      for(const prefix of ['chat-change:','chat-timing:','chat-pending:','chat-unack:','chat-message:','chat-attachment:','chat-chunk:','chat-event:','chat-request:','chat-import:','chat-approval:'])await tx.delete([...(await tx.list({prefix:prefix+chat.id+':'})).keys()]);
       await tx.delete([key(chat.id),writerKey(chat.id),indexKey(chat.id),deviceIndexKey(chat.device,chat.id)]);
       return files;
     });

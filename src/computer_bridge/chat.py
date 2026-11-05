@@ -7,13 +7,11 @@ import contextlib
 import json
 import secrets
 import time
-from datetime import datetime
 from pathlib import Path
 
 import httpx2
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
@@ -28,7 +26,8 @@ from prompt_toolkit.widgets import Dialog, Frame, Label, TextArea
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
-from .chat_commands import BY_NAME, HELP, CommandCompleter
+from .chat_commands import BY_NAME, HELP, CommandCompleter, SlashMenu
+from .chat_transcript import ChatTranscript
 from .common import Error, Json
 
 STATES = {"waiting": "等待模型连接", "connected": "模型已连接", "expired": "模型连接已到期"}
@@ -49,7 +48,6 @@ class ChatTerminal:
         self.browser = browser
         self.selected_device: Json = dict(client.device) if client.mode == "device" else {}
         self.computers: list[Json] = []
-        self.approvals: list[Json] = []
         self.identity_drafts: dict[str, Json] = {}
         self.chat: Json | None = None
         self.chats: list[Json] = []
@@ -68,19 +66,23 @@ class ChatTerminal:
         self.live_task: asyncio.Task[None] | None = None
         self.last_notification_ms: float | None = None
         self.render_notification_at: float | None = None
-        self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ", completer=CommandCompleter())
-        self.transcript = TextArea(read_only=True, scrollbar=True, wrap_lines=True)
+        self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ", completer=CommandCompleter(), complete_while_typing=False)
+        self.transcript = ChatTranscript(message_status, self.decide_approval)
+        self.transcript_window = Window(self.transcript, wrap_lines=True, right_margins=[ScrollbarMargin(display_arrows=True)])
         keys = KeyBindings()
 
         @keys.add("enter")
         def send(event: object) -> None:
+            if self.application.layout.current_control is self.transcript:
+                self.transcript.activate()
+                return
             if self.application.layout.current_control is not self.input.control:
-                self.application.layout.focus(self.input)
                 return
             state = self.input.buffer.complete_state
             if state:
                 completion = state.current_completion or state.completions[0]
-                self.input.buffer.apply_completion(completion)
+                with self.slash.selecting():
+                    self.input.buffer.apply_completion(completion)
             value = self.input.text
             name, _, argument = value.partition(" ")
             command = BY_NAME.get(name.lower())
@@ -98,26 +100,31 @@ class ChatTerminal:
 
         @keys.add("down", filter=completing)
         def completion_next(event: object) -> None:
-            self.input.buffer.complete_next()
+            with self.slash.selecting():
+                self.input.buffer.complete_next()
 
         @keys.add("up", filter=completing)
         def completion_previous(event: object) -> None:
-            self.input.buffer.complete_previous()
+            with self.slash.selecting():
+                self.input.buffer.complete_previous()
 
         @keys.add("tab", filter=input_focused)
         def complete(event: object) -> None:
             state = self.input.buffer.complete_state
             if state:
                 selected = state.current_completion or state.completions[0]
-                self.input.buffer.apply_completion(selected)
-                if BY_NAME[selected.text].arguments:
-                    self.input.buffer.insert_text(" ")
+                with self.slash.selecting():
+                    self.input.buffer.apply_completion(selected)
+                    if BY_NAME[selected.text].arguments:
+                        self.input.buffer.insert_text(" ")
+            elif self.input.text.startswith("/") and not any(character.isspace() for character in self.input.text):
+                self.slash.refresh()
             else:
-                self.input.buffer.start_completion(select_first=False)
+                self.transcript.focus_action()
 
         @keys.add("escape", filter=completing, eager=True)
         def dismiss_completion(event: object) -> None:
-            self.input.buffer.cancel_completion()
+            self.slash.close()
 
         @keys.add("escape", "enter")
         def newline(event: object) -> None:
@@ -133,11 +140,27 @@ class ChatTerminal:
 
         @keys.add("pageup")
         def scroll_up(event: object) -> None:
-            self.transcript.buffer.cursor_up(count=10)
+            self.transcript.scroll(-10)
 
         @keys.add("pagedown")
         def scroll_down(event: object) -> None:
-            self.transcript.buffer.cursor_down(count=10)
+            self.transcript.scroll(10)
+
+        transcript_focused = Condition(lambda: self.application.layout.current_control is self.transcript)
+
+        @keys.add("tab", filter=transcript_focused)
+        def next_approval(event: object) -> None:
+            if not self.transcript.focus_action():
+                self.application.layout.focus(self.input)
+
+        @keys.add("s-tab", filter=input_focused | transcript_focused)
+        def previous_approval(event: object) -> None:
+            if not self.transcript.focus_action(-1):
+                self.application.layout.focus(self.input)
+
+        @keys.add("escape", filter=transcript_focused, eager=True)
+        def leave_approval(event: object) -> None:
+            self.application.layout.focus(self.input)
 
         @keys.add("f1")
         def help_text(event: object) -> None:
@@ -145,7 +168,7 @@ class ChatTerminal:
 
         layout = HSplit([
             Window(FormattedTextControl(self.header), height=2, style="class:header"),
-            Frame(self.transcript, title="消息"),
+            Frame(self.transcript_window, title="消息"),
             Window(FormattedTextControl(lambda: self.notice), height=2, style="class:status", wrap_lines=True),
             Frame(self.input, title=lambda: "消息" + (f" · {len(self.attachments)} 个附件" if self.attachments else "")),
             Window(FormattedTextControl(" / 命令  Enter 发送  Alt+Enter 换行  Ctrl+Q 退出"), height=1, style="class:hint"),
@@ -158,24 +181,27 @@ class ChatTerminal:
         self.layout = FloatContainer(content=layout, floats=[Float(xcursor=True, ycursor=True,
             content=CompletionsMenu(max_height=8, display_arrows=True, extra_filter=input_focused))])
         self.application: Application[None] = Application(layout=Layout(self.layout, focused_element=self.input),
-            key_bindings=keys, full_screen=True, mouse_support=True, after_render=after_render, style=Style.from_dict({
+            key_bindings=keys, full_screen=True, mouse_support=True, min_redraw_interval=1/30, after_render=after_render, style=Style.from_dict({
                 "header": "bg:#163b36 #e9f6f1 bold", "status": "#72c5af", "hint": "#8c999b",
                 "frame.label": "#72c5af bold", "frame.border": "#4b6260", "text-area": "#e3ebea",
                 "completion-menu.completion": "bg:#163b36 #e3ebea",
                 "completion-menu.completion.current": "bg:#276256 #ffffff bold",
                 "completion-menu.meta.completion": "bg:#163b36 #a0b9b2",
                 "completion-menu.meta.completion.current": "bg:#276256 #ffffff",
+                "approval.heading": "#72c5af bold", "approval.button": "bg:#163b36 #e3ebea",
+                "approval.selected": "bg:#276256 #ffffff bold",
                 "dialog.body": "bg:#163b36 #e3ebea", "chat-choice": "bg:#163b36 #e3ebea",
                 "chat-choice.selected": "bg:#276256 #ffffff bold", "chat-choice.time": "#a0b9b2",
             }))
         self.application.ttimeoutlen = 0.1
+        self.slash = SlashMenu(self.input.buffer, lambda: self.application.layout.current_control is self.input.control)
 
     def header(self) -> str:
         device = self.selected_device
         chat = self.chat or {}
         identity = "本机身份" if self.client.mode == "device" else "账号：" + str(self.client.account.get("username", ""))
         title = f"{chat.get('id', '—')} · {chat.get('title', '选择或新建对话')}"
-        approval = f" · {len(self.approvals)} 条待审批 /approve" if self.approvals else ""
+        approval = f" · {self.transcript.pending_count} 条命令待审批" if self.transcript.pending_count else ""
         return f" Computer Bridge  ·  {chat.get('device_name', device.get('name', '请选择电脑'))} {chat.get('device_id', device.get('id', ''))}  ·  {identity}\n {title}  ·  {STATES.get(chat.get('state', ''), '')}{approval}"
 
     def note(self, value: str) -> None:
@@ -183,24 +209,8 @@ class ChatTerminal:
         self.notes = self.notes[-10:]
         self.render()
 
-    def render(self) -> None:
-        rows: list[str] = []
-        if self.has_older:
-            rows.append("↑ /history 读取更早消息\n")
-        for message in sorted(self.messages.values(), key=lambda item: item["sequence"]):
-            sender = "GPT / Dot" if message["role"] == "assistant" else "你"
-            delivery = message_status(message)
-            rows.append(f"{sender} · {message['id']} · {message.get('created_at', '')}  {delivery}\n{message['text']}")
-            for attachment in message.get("attachments", []):
-                rows.append(f"  ↳ {attachment['id']}  {attachment['name']}  ({attachment['size']} 字节)")
-            rows.append("")
-        if self.notes:
-            rows.append("\n".join("— " + value for value in self.notes))
-        old_position = self.transcript.buffer.cursor_position
-        at_end = self.transcript.buffer.document.is_cursor_at_the_end
-        text = "\n".join(rows)
-        if text != self.transcript.text:
-            self.transcript.buffer.set_document(Document(text, len(text) if at_end else min(old_position, len(text))), bypass_readonly=True)
+    def render(self, messages: list[Json] | None = None, *, reset: bool = False) -> None:
+        self.transcript.update(messages or (), reset=reset, notes=self.notes, older=self.has_older)
         self.application.invalidate()
 
     def require_chat(self) -> str:
@@ -216,9 +226,8 @@ class ChatTerminal:
         return {"device_id": self.client.device["id"]} if self.client.mode == "device" else {}
 
     async def refresh_list(self) -> None:
-        result = await self.client.action("list", **self.list_scope(), limit=100)
+        result = await self.client.action("list", **self.list_scope(), limit=1)
         self.chats = result["chats"]
-        self.render()
 
     async def choose(self, title: str, choices: list[tuple[str, str, str]], *,
                      description: str = "", selected_id: str | None = None) -> str | None:
@@ -277,7 +286,7 @@ class ChatTerminal:
             right_margins=[ScrollbarMargin(display_arrows=True)])])
         floating = Float(content=Dialog(title=title, body=body, width=96))
         focus = self.application.layout.current_control
-        self.input.buffer.cancel_completion()
+        self.slash.close()
         self.layout.floats.append(floating)
         self.application.layout.focus(control)
         self.application.invalidate()
@@ -291,24 +300,31 @@ class ChatTerminal:
     async def choose_chat(self) -> None:
         self.notice = "正在读取历史对话…"
         self.application.invalidate()
-        chats: list[Json] = []
         cursor: int | None = 0
+        chats: list[Json] = []
         while cursor is not None:
-            page = await self.client.action("list", **self.list_scope(), after=cursor, limit=100)
+            page = await self.client.action("list", **self.list_scope(), after=cursor, limit=30)
+            selected = (str(page["chats"][0]["id"]) if chats and page["chats"]
+                        else str(self.chat["id"]) if self.chat else None)
             chats.extend(page["chats"])
             cursor = page["next_cursor"]
-        if not chats:
-            self.notice = "还没有可访问的历史对话；/new 新建。"
-            return
-        choices = [(str(entry["id"]), str(entry["title"]),
-            (str(entry.get("device_name", entry["device_id"])) + " · " if self.client.mode == "account" else "")
-            + str(entry["created_at"]).replace("T", " ").removesuffix("Z")) for entry in chats]
-        chosen = await self.choose("选择历史对话", choices, selected_id=str(self.chat["id"]) if self.chat else None)
-        if chosen is None:
-            self.notice = "已取消选择，当前对话保持不变。"
-        else:
-            await self.open(chosen)
-            self.notice = "已打开「" + str(self.chat["title"] if self.chat else chosen) + "」。/connect 获取连接 ID。"
+            if not chats:
+                self.notice = "还没有可访问的历史对话；/new 新建。"
+                break
+            choices = [(str(entry["id"]), str(entry["title"]),
+                (str(entry.get("device_name", entry["device_id"])) + " · " if self.client.mode == "account" else "")
+                + str(entry["created_at"]).replace("T", " ").removesuffix("Z")) for entry in chats]
+            if cursor is not None:
+                choices.append(("more", "加载更多对话", ""))
+            chosen = await self.choose("选择历史对话", choices, selected_id=selected)
+            if chosen == "more":
+                continue
+            if chosen is None:
+                self.notice = "已取消选择，当前对话保持不变。"
+            else:
+                await self.open(chosen)
+                self.notice = "已打开「" + str(self.chat["title"] if self.chat else chosen) + "」。/connect 获取连接 ID。"
+            break
         self.application.invalidate()
 
     async def refresh_computers(self) -> None:
@@ -333,8 +349,7 @@ class ChatTerminal:
         self.chat, self.messages, self.attachments, self.notes = None, {}, [], []
         self.has_older = False
         self.notice = "已选择「" + str(self.selected_device["name"]) + "」；/new 新建对话，/resume 打开历史对话。"
-        await self.refresh_approvals()
-        self.render()
+        self.render(reset=True)
         return True
 
     async def switch_identity(self, *, login: bool) -> None:
@@ -355,65 +370,35 @@ class ChatTerminal:
         self.identity_drafts[previous] = {"attachments": self.draft_attachments, "pending": self.pending_sends}
         saved = self.identity_drafts.get(self.client.identity, {})
         self.draft_attachments, self.pending_sends = saved.get("attachments", {}), saved.get("pending", {})
-        self.chat, self.messages, self.attachments, self.chats, self.notes, self.approvals = None, {}, [], [], [], []
+        self.chat, self.messages, self.attachments, self.chats, self.notes = None, {}, [], [], []
         self.selected_device = dict(self.client.device) if self.client.mode == "device" else {}
         self.has_older, self.network_error, self.sync_cursor = False, False, 0
         self.input.text = ""
-        self.render()
+        self.render(reset=True)
         await self.refresh_computers()
         await self.refresh_list()
-        await self.refresh_approvals()
         self.notice = ("已登录账号 " + str(self.client.account["username"]) if login else "已返回本机身份") + "；/resume 选择对话，/computers 选择电脑。"
         self.render()
 
-    def approval_device(self) -> str:
-        return str(self.chat["device_id"]) if self.chat else str(self.selected_device.get("id", ""))
+    def decide_approval(self, identifier: str, decision: str) -> None:
+        self.application.create_background_task(self.apply_approval(identifier, decision))
 
-    async def refresh_approvals(self) -> None:
-        device = self.approval_device()
-        if not device:
-            self.approvals = []
+    async def apply_approval(self, identifier: str, decision: str) -> None:
+        chat_id = self.require_chat()
+        if identifier in self.transcript.busy:
             return
-        result = await self.client.action("approvals", device_id=device)
-        if device == self.approval_device():
-            self.approvals = [item for item in result["approvals"] if item["state"] == "pending"]
-            self.application.invalidate()
-
-    async def approve(self) -> None:
-        if not self.approval_device() and not await self.choose_computer():
-            return
-        await self.refresh_approvals()
-        if not self.approvals:
-            self.notice = "当前电脑没有待审批命令。"
-            return
-        chosen = await self.choose("当前电脑的待审批命令", [(str(item["id"]), "待审批命令 " + str(index + 1),
-            "到期 " + datetime.fromtimestamp(float(item["expires_at"]) / 1000).astimezone().strftime("%H:%M:%S"))
-            for index, item in enumerate(self.approvals)])
-        if chosen is None:
-            return
-        details = await self.client.action("approval-details", id=chosen)
-        if details["state"] != "pending":
-            self.notice = "该审批已处理。"
-            await self.refresh_approvals()
-            return
-        expires = float(details["expires_at"])
-        if expires > 10_000_000_000:
-            expires /= 1000
-        detail = ("电脑：" + self.approval_device() + "\n目录：" + str(details["cwd"]) + "\n命令：\n"
-            + str(details["command"]) + "\n理由：" + str(details["justification"])
-            + "\n到期：" + datetime.fromtimestamp(expires).astimezone().isoformat(timespec="seconds")
-            + "\n批准后，本次命令及其子进程、后续输入将以当前登录用户权限在工作区沙盒外运行。")
-        decision = await self.choose("审批命令", [("close", "关闭", "保持待审批"),
-            ("allowed-once", "批准本次", "仅限这次命令"), ("rejected", "拒绝", "不执行命令"),
-            ("cancelled", "取消命令", "不执行命令")], description=detail)
-        if decision is None or decision == "close":
-            self.notice = "已关闭审批详情，未改变审批结果。"
-            return
-        result = await self.client.action("approval-decide", id=chosen, decision=decision,
-            **({"chat_id": self.chat["id"]} if self.chat else {}))
-        labels = {"allowed-once": "已批准本次命令", "rejected": "已拒绝", "cancelled": "已取消命令"}
-        self.notice = labels.get(str(result.get("decision")), "审批已处理")
-        await self.refresh_approvals()
+        self.transcript.busy.add(identifier)
+        self.transcript.refresh_approval(identifier)
+        try:
+            result = await self.client.action("approval-decide", id=identifier, decision=decision, chat_id=chat_id)
+            self.notice = {"allowed-once": "已批准本次命令", "rejected": "已拒绝", "cancelled": "已取消命令"}.get(str(result.get("decision")), "审批已处理")
+            if self.chat and self.chat["id"] == chat_id:
+                await self.sync(chat_id)
+        except (Error, OSError, httpx2.HTTPError) as exc:
+            self.notice = str(exc)
+        finally:
+            self.transcript.busy.discard(identifier)
+            self.transcript.refresh_approval(identifier)
 
     async def open(self, chat_id: str) -> None:
         # Keep the old conversation usable if opening the requested one fails.
@@ -433,9 +418,7 @@ class ChatTerminal:
             self.attachments = self.draft_attachments.setdefault(chat_id, [])
             self.notes.clear()
             self.notice = "已打开 " + chat_id + "。/connect 获取连接 ID。"
-            await self.refresh_list()
-            self.render()
-        await self.refresh_approvals()
+            self.render(result["messages"], reset=True)
         self.live_task = self.application.create_background_task(self.live(chat_id))
 
     async def stop_live(self) -> None:
@@ -464,7 +447,7 @@ class ChatTerminal:
                     self.chats = [self.chat if item["id"] == chat_id else item for item in self.chats]
                     if received_at is not None:
                         self.render_notification_at = received_at
-                    self.render()
+                    self.render(result["messages"])
                 if not result["more"]:
                     return
 
@@ -474,17 +457,12 @@ class ChatTerminal:
             try:
                 async with self.client.live(chat_id) as socket:
                     dirty = asyncio.Event()
-                    dirty.set()
                     received: list[float] = []
 
                     async def receive(changed: asyncio.Event = dirty, arrivals: list[float] = received) -> None:
                         async for raw in socket:
                             event = json.loads(raw)
-                            if event.get("type") == "approvals.changed":
-                                await self.refresh_approvals()
                             if event.get("chat_id") == chat_id and event.get("type") in {"chat.ready", "chat.changed"}:
-                                if event["type"] == "chat.ready":
-                                    await self.refresh_approvals()
                                 if event["type"] == "chat.changed":
                                     arrivals[:] = [time.monotonic()]
                                 changed.set()
@@ -542,7 +520,7 @@ class ChatTerminal:
             self.messages[int(message["sequence"])] = message
             self.attachments.clear()
             self.notice = message_status(message)
-            self.render()
+            self.render([message])
 
     async def submit(self, value: str) -> None:
         async with self.commands:
@@ -569,8 +547,6 @@ class ChatTerminal:
             await self.switch_identity(login=False)
         elif name == "/computers":
             await self.choose_computer()
-        elif name == "/approve":
-            await self.approve()
         elif name == "/new":
             if not self.selected_device and not await self.choose_computer():
                 return
@@ -584,7 +560,7 @@ class ChatTerminal:
                 await self.choose_chat()
         elif name == "/title":
             self.chat = (await self.client.action("rename", chat_id=self.require_chat(), title=argument))["chat"]
-            await self.refresh_list()
+            self.application.invalidate()
         elif name == "/history":
             if not self.has_older:
                 self.notice = "没有更早的消息。"
@@ -594,7 +570,7 @@ class ChatTerminal:
             self.first_cursor = int(result.get("first_cursor", self.first_cursor))
             self.has_older = bool(result.get("has_older", False))
             self.notice = "已加载更早消息；PageUp 向上查看。"
-            self.render()
+            self.render(result["messages"])
         elif name == "/connect":
             chat_id = self.require_chat()
             self.note(f"连接 ID：{chat_id} · {self.chat['device_name'] if self.chat else ''}\n"
@@ -655,13 +631,13 @@ class ChatTerminal:
     async def initialize(self) -> None:
         try:
             await self.refresh_computers()
-            await self.refresh_list()
-            await self.refresh_approvals()
             if self.resume:
                 await self.open(self.resume)
-            elif not self.chats and self.selected_device:
-                await self.command("/new", "")
             else:
+                await self.refresh_list()
+            if not self.resume and not self.chats and self.selected_device:
+                await self.command("/new", "")
+            elif not self.resume:
                 self.notice = "使用 /resume 按名称选择对话，或 /new 新建。"
         except (Error, OSError, httpx2.HTTPError) as exc:
             self.notice = str(exc)
