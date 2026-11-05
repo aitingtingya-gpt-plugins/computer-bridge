@@ -14,10 +14,16 @@ export function handler(hub: ComputerHubCore) {
     server.server.registerCapabilities({events:{}} as any);
     for(const method of ['list','subscribe','unsubscribe'] as const)server.server.setRequestHandler('events/'+method,
       {params:z.record(z.string(),z.unknown()),result:z.record(z.string(),z.unknown())},async(args,ctx)=>{
-        const actor=await hub.identity(String(ctx.http?.authInfo?.extra?.bridgeAccount || ''),Number(ctx.http?.authInfo?.extra?.bridgeEpoch));
-        const caller=String(ctx.http?.authInfo?.extra?.bridgeCaller || '');
-        try{return await hub.chats.events(method,args,actor,caller);}
-        catch(error){const e=error as Data;throw new ProtocolError(typeof e.code==='number'?e.code:-32602,e.message,e.data || {code:e.code});}
+        try{
+          const actor=await hub.identity(String(ctx.http?.authInfo?.extra?.bridgeAccount || ''),Number(ctx.http?.authInfo?.extra?.bridgeEpoch));
+          const caller=String(ctx.http?.authInfo?.extra?.bridgeCaller || '');
+          return await hub.chats.events(method,args,actor,caller);
+        }
+        catch(error){
+          const e=error as Data;
+          const code=typeof e.code==='number'?e.code:typeof e.code==='string'&&e.code.startsWith('invalid_')?-32602:-32000;
+          throw new ProtocolError(code,e.message,{...e.data,code:e.code});
+        }
       });
     for (const [name, description, schema] of [...toolSpecs,...chatToolSpecs]) {
       server.registerTool(name, {description, inputSchema: schema as z.ZodObject<any>, annotations: {
@@ -62,7 +68,7 @@ export function handler(hub: ComputerHubCore) {
             if (!confirmed) return {content: [{type: "text", text: JSON.stringify({started: false})}]};
           }
           const result = await hub.invoke(name, args, confirmed, ctx.mcpReq.signal,caller,actor);
-          if(result.state==='awaiting_approval') {
+          if(result.state==='awaiting_approval' && result.approval?.channel!=='chat') {
             const capabilities=era==='modern' ? (ctx.mcpReq.envelope as Data | undefined)?.[CLIENT_CAPABILITIES_META_KEY] : server.server.getClientCapabilities();
             const elicit=capabilities?.elicitation;
             const supportsForm=elicit !== undefined && ('form' in elicit || Object.keys(elicit).length===0);

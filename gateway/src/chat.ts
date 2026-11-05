@@ -1,7 +1,8 @@
-/** Persistent, account-owned communication. Computer execution keeps its existing transport. */
+/** Persistent, device-owned communication. Computer execution keeps its existing transport. */
 import {sha256} from '@noble/hashes/sha2.js';
 import {Webhook} from 'standardwebhooks';
 import type {Accounts, Actor} from './accounts';
+import {authenticateDeviceIdentity,authorizeIdentity,modelActor,normalizeIdentity,principalScope,validateIdentity,type ChatIdentity,type ChatPrincipal} from './chat_identity';
 import type {KeyStore, Store} from './runtime';
 import {hash, type Data} from './types';
 
@@ -13,7 +14,7 @@ export interface ChatBlobs {
 }
 export interface ChatEnvironment {
   publicUrl:string;
-  device(id:string,actor:Actor):Promise<ChatDevice>;
+  device(id:string,actor:ChatPrincipal):Promise<ChatDevice>;
   webhookFetch(url:string,init:RequestInit):Promise<Response>;
   schedule(time:number):Promise<void>;
   equal(a:Uint8Array,b:Uint8Array):boolean;
@@ -21,15 +22,15 @@ export interface ChatEnvironment {
   changed?(chatId:string):Promise<void>;
   background?(work:Promise<unknown>):void;
 }
-interface Conversation {id:string;owner:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;revision?:number}
+interface Conversation {id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;revision?:number}
 interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model';text:string;attachments:AttachmentView[];created_at:string;delivery:'pending'|'delivered'|'replied'|'failed'|'none';reply_to?:string}
 interface AttachmentView {id:string;name:string;size:number;mime_type:string;sha256?:string}
 interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string}
 interface Candidate {chat:string;account:string;epoch:number;caller:string;expires_at:number}
-interface Subscription {id:string;chat:string;account:string;epoch:number;caller:string;connection_hash:string;url:string;secret:string;previous_secret?:string;rotation_until?:number;expires_at:number|null;cursor:number;verified_at:number}
+interface Subscription {id:string;chat:string;account:string;epoch:number;caller:string;connection_hash:string;event_connection?:string;url:string;secret:string;previous_secret?:string;rotation_until?:number;expires_at:number|null;cursor:number;verified_at:number}
 interface Outbox {chat:string;sequence:number;subscription:string;attempts:number;next_at:number;state:'pending'|'delivered'|'failed';error?:string}
-interface Link {id:string;code:string;device:string;token_hash:string;expires_at:number;approved_by?:string;epoch?:number;credential?:string}
-interface Credential {account:string;epoch:number;device:string}
+interface Link {scope?:'account'|'device';id:string;code:string;device:string;token_hash:string;expires_at:number;approved_by?:string;epoch?:number;credential?:string}
+interface Credential {account:string;epoch:number;device:string;scope?:'account'|'device'}
 interface Timing {saved_at:string;first_attempt_at?:string;host_accepted_at?:string;reply_saved_at?:string;attempts:number}
 interface Head {chat:string;sequence:number;at:number}
 interface Expiry {kind:string;id:string;at:number}
@@ -43,6 +44,8 @@ const expiryKey=(expiry:Expiry)=>'chat-expiry:'+padded(expiry.at)+':'+expiry.kin
 const CHUNK=262144;
 const now=()=>new Date().toISOString();
 const key=(id:string)=>'chat:'+id;
+const indexKey=(id:string)=>'chat-index:'+padded(Number(id.slice(1)));
+const deviceIndexKey=(device:string,id:string)=>'chat-device:'+device+':'+padded(Number(id.slice(1)));
 const messageKey=(id:string,seq:number)=>'chat-message:'+id+':'+String(seq).padStart(16,'0');
 const attachmentKey=(id:string,a:string)=>'chat-attachment:'+id+':'+a;
 const chunkKey=(id:string,a:string,index:number)=>'chat-chunk:'+id+':'+a+':'+String(index).padStart(10,'0');
@@ -60,9 +63,9 @@ const cursorOf=(value:unknown)=>value===null||value===undefined?0:typeof value==
 const viewAttachment=(a:Attachment):AttachmentView=>({id:a.id,name:a.name,size:a.size,mime_type:a.mime_type,...(a.sha256?{sha256:a.sha256}:{})});
 
 export const chatEventDefinition={
-  name:'chat.message',description:'A person sent a message or attachment to a Computer Bridge conversation. Available for Work and dots. After connecting, read chat.history once for context. For a complete event with sufficient context, answer directly with chat.reply; read history or attachments only when needed. Other computer tools remain available. Model replies do not create this event.',delivery:['webhook'],
-  inputSchema:{type:'object',properties:{chat_id:{type:'string',description:'Stable short conversation ID, e.g. t1.'},connection:{type:'string',description:'Connection credential returned by chat.resume.'}},required:['chat_id','connection'],additionalProperties:false},
-  payloadSchema:{type:'object',properties:{chat_id:{type:'string'},device_id:{type:'string'},message_id:{type:'string'},text:{type:'string'},text_truncated:{type:'boolean'},attachments:{type:'array',items:{type:'object'}},url:{type:'string'}},required:['chat_id','device_id','message_id','text','text_truncated','attachments','url'],additionalProperties:false}
+  name:'chat.message',description:'A person sent a message or attachment to a Computer Bridge conversation. Available for Work and dots. Use data.connection from this signed event directly with chat.reply; do not call chat.resume without it. After connecting, read chat.history once for context; later read history or attachments only when needed. Other computer tools remain available. Model replies do not create this event.',delivery:['webhook'],
+  inputSchema:{type:'object',properties:{chat_id:{type:'string',description:'Stable short conversation ID, e.g. t1.'},connection:{type:'string',description:'Original chat.resume credential, or data.connection from this subscription for renewal/unsubscribe.'}},required:['chat_id','connection'],additionalProperties:false},
+  payloadSchema:{type:'object',properties:{chat_id:{type:'string'},connection:{type:'string',description:'Private reply/renewal credential for this active model subscription. Pass to chat.reply; never include in visible text or shared history.'},device_id:{type:'string'},message_id:{type:'string'},text:{type:'string'},text_truncated:{type:'boolean'},attachments:{type:'array',items:{type:'object'}},url:{type:'string'}},required:['chat_id','connection','device_id','message_id','text','text_truncated','attachments','url'],additionalProperties:false}
 };
 
 export class ChatService {
@@ -71,6 +74,12 @@ export class ChatService {
   private wake?:()=>void;
   private wakeVersion=0;
   constructor(private store:Store,private accounts:Accounts,private env:ChatEnvironment){}
+
+  private access(actor:ChatPrincipal,device:string,tx?:KeyStore):Promise<void>{return authorizeIdentity(this.accounts,this.store,actor,device,tx);}
+  authenticateDevice(device:string,credential:string):Promise<ChatIdentity>{return authenticateDeviceIdentity(this.store,device,credential);}
+  async authorize(actor:ChatPrincipal,chatId:string):Promise<{id:string;device:string;device_id:string}>{
+    await this.initialize();const chat=await this.chat(chatId,actor);return {id:chat.id,device:chat.device,device_id:chat.device_id};
+  }
 
   private async changed(chat:string):Promise<void>{await this.env.changed?.(chat);}
   private async recordChange(tx:KeyStore,chat:Conversation,sequences:number[]=[]):Promise<void>{
@@ -109,14 +118,37 @@ export class ChatService {
   }
   private initialize():Promise<void>{
     return this.initialized??=this.store.transaction(async tx=>{
-      if(await tx.get('chat:index-v2'))return;
-      for(const event of (await tx.list<Outbox>({prefix:'chat-event:'})).values())await this.saveEvent(tx,event);
-      for(const sub of (await tx.list<Subscription>({prefix:'chat-subscription:'})).values())await this.expiry(tx,'subscription',sub.id,sub.expires_at);
-      for(const [k,a] of await tx.list<Attachment>({prefix:'chat-attachment:'}))if(a.expires_at)await this.expiry(tx,'upload',k.slice('chat-attachment:'.length),a.expires_at);
-      for(const [k,c] of await tx.list<Candidate>({prefix:'chat-candidate:'}))await this.expiry(tx,'candidate',k.slice('chat-candidate:'.length),c.expires_at);
-      for(const l of (await tx.list<Link>({prefix:'chat-link:'})).values())await this.expiry(tx,'link',l.id,l.expires_at);
-      for(const [k,at] of await tx.list<number>({prefix:'chat-link-denied:'}))await this.expiry(tx,'denied',k.slice('chat-link-denied:'.length),at);
-      await tx.put('chat:index-v2',true);
+      if(!await tx.get('chat:index-v2')){
+        for(const event of (await tx.list<Outbox>({prefix:'chat-event:'})).values())await this.saveEvent(tx,event);
+        for(const sub of (await tx.list<Subscription>({prefix:'chat-subscription:'})).values())await this.expiry(tx,'subscription',sub.id,sub.expires_at);
+        for(const [k,a] of await tx.list<Attachment>({prefix:'chat-attachment:'}))if(a.expires_at)await this.expiry(tx,'upload',k.slice('chat-attachment:'.length),a.expires_at);
+        for(const [k,c] of await tx.list<Candidate>({prefix:'chat-candidate:'}))await this.expiry(tx,'candidate',k.slice('chat-candidate:'.length),c.expires_at);
+        for(const l of (await tx.list<Link>({prefix:'chat-link:'})).values())await this.expiry(tx,'link',l.id,l.expires_at);
+        for(const [k,at] of await tx.list<number>({prefix:'chat-link-denied:'}))await this.expiry(tx,'denied',k.slice('chat-link-denied:'.length),at);
+        await tx.put('chat:index-v2',true);
+      }
+      if(!await tx.get('chat:index-device-v1')){
+        for(const [storedKey,chat] of await tx.list<Conversation>({prefix:'chat:t'})){
+          if(!/^chat:t[1-9]\d*$/.test(storedKey))continue;
+          await tx.put({[indexKey(chat.id)]:chat.id,[deviceIndexKey(chat.device,chat.id)]:chat.id});
+          if(chat.owner){
+            // Old retry keys belonged to the original owner. Keep retries working after sharing.
+            for(const operation of ['send','upload']){
+              const prefix='chat-request:'+chat.id+':'+operation+':';
+              for(const [old,value] of await tx.list({prefix})){
+                const suffix=old.slice(prefix.length);if(suffix.includes(':'))continue;
+                await tx.put(prefix+chat.owner+':'+suffix,value);await tx.delete(old);
+              }
+            }
+            await tx.delete('chat-owner:'+chat.owner+':'+padded(Number(chat.id.slice(1))));
+            delete chat.owner;await tx.put(key(chat.id),chat);
+          }
+        }
+        for(const [k,sub] of await tx.list<Subscription>({prefix:'chat-subscription:'})){
+          sub.event_connection??=secret();await tx.put(k,sub);
+        }
+        await tx.put('chat:index-device-v1',true);
+      }
     });
   }
   private async kick():Promise<void>{
@@ -125,7 +157,7 @@ export class ChatService {
     const work=this.drain().catch(error=>{console.error('chat_delivery',error instanceof Error?error.name:'Error');});
     if(this.env.background)this.env.background(work);else void work;
   }
-  private async sync(chat:Conversation,args:Data,actor:Actor):Promise<Data>{
+  private async sync(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const after=integer(args.cursor??0,'cursor'),limit=Math.min(limitOf(args.limit),50);
     const snapshot=await this.store.transaction(async tx=>{
       const current=(await tx.get<Conversation>(key(chat.id)))!;
@@ -159,21 +191,27 @@ export class ChatService {
     return {chat_id:chat.id,timings:[{message_id:message.id,...t,first_attempt_at:t.first_attempt_at??null,host_accepted_at:t.host_accepted_at??null,reply_saved_at:t.reply_saved_at??null,
       save_to_first_attempt_ms:diff(t.saved_at,t.first_attempt_at),first_attempt_to_host_accept_ms:diff(t.first_attempt_at,t.host_accepted_at),host_accept_to_reply_ms:diff(t.host_accepted_at,t.reply_saved_at)}]};
   }
-  private async chat(id:string,actor:Actor):Promise<Conversation>{
-    await this.accounts.require(actor.id,actor.epoch);
+  private async validSubscription(tx:KeyStore,sub:Subscription|undefined,device:string):Promise<boolean>{
+    if(!sub||sub.expires_at!==null&&sub.expires_at<=Date.now())return false;
+    const account=await tx.get<Actor>('account:'+sub.account);if(!account||account.epoch!==sub.epoch)return false;
+    try{await this.accounts.assertAccessIn(tx,account,device);return true;}
+    catch(error){if(['account_unavailable','device_forbidden','device_missing'].includes((error as Data).code))return false;throw error;}
+  }
+  private async chat(id:string,actor:ChatPrincipal):Promise<Conversation>{
+    await validateIdentity(this.accounts,this.store,actor);
     const value=await this.store.get<Conversation>(key(id));
-    if(!value||value.owner!==actor.id)throw fail('chat_not_found','对话不存在或不属于当前账号');
-    await this.accounts.assertAccess(actor,value.device);
+    if(!value)throw fail('chat_not_found','对话不存在');
+    await this.access(actor,value.device);
     await this.env.device(value.device,actor);
     if(value.active){
       const sub=await this.store.get<Subscription>(subKey(value.active));
-      if(!sub||sub.epoch!==actor.epoch||sub.expires_at!==null&&sub.expires_at<=Date.now()){
+      if(!await this.validSubscription(this.store,sub,value.device)){
         const inspected=await this.store.transaction(async tx=>{
           const current=await tx.get<Conversation>(key(id));
-          if(!current||current.owner!==actor.id)throw fail('chat_not_found','对话不存在或不属于当前账号');
-          await this.accounts.assertAccessIn(tx,actor,current.device);
+          if(!current)throw fail('chat_not_found','对话不存在');
+          await this.access(actor,current.device,tx);
           const live=current.active?await tx.get<Subscription>(subKey(current.active)):undefined;
-          if(current.active&&(!live||live.epoch!==actor.epoch||live.expires_at!==null&&live.expires_at<=Date.now())){
+          if(current.active&&!await this.validSubscription(tx,live,current.device)){
             await this.releaseIn(tx,current.id,current.active);
             return {current:(await tx.get<Conversation>(key(id)))!,released:true};
           }
@@ -184,7 +222,7 @@ export class ChatService {
     }
     return value;
   }
-  private async summary(chat:Conversation,actor:Actor):Promise<Data>{
+  private async summary(chat:Conversation,actor:ChatPrincipal):Promise<Data>{
     const device=await this.env.device(chat.device,actor);
     const last=chat.sequence?await this.store.get<Message>(messageKey(chat.id,chat.sequence)):undefined;
     return {id:chat.id,title:chat.title,device_id:device.id,device_name:device.name,system:device.system,
@@ -198,30 +236,38 @@ export class ChatService {
     if(previous&&previous.fingerprint!==fingerprint)throw fail('request_key_conflict','同一 request_key 的参数不一致');
     return {key:k,fingerprint,result:previous?.result};
   }
-  async action(action:string,args:Data,actor:Actor,caller=''):Promise<Data>{
-    await this.accounts.require(actor.id,actor.epoch);await this.initialize();
+  async action(action:string,args:Data,actor:ChatPrincipal,caller=''):Promise<Data>{
+    await validateIdentity(this.accounts,this.store,actor);await this.initialize();
     if(action==='list'){
-      const requested=args.device_id?await this.env.device(args.device_id,actor):null;
+      const identity=normalizeIdentity(actor);
+      const requested=args.device_id?await this.env.device(args.device_id,actor):identity.kind==='device'?await this.env.device(identity.device,actor):null;
+      if(requested)await this.access(actor,requested.raw);
       const after=integer(args.after??0,'after'),limit=limitOf(args.limit);
-      const rows=await this.store.list<string>({prefix:'chat-owner:'+actor.id+':',startAfter:'chat-owner:'+actor.id+':'+String(after).padStart(16,'0'),limit:limit+1});
-      const chats=[];let last=after,more=false;
-      for(const id of rows.values()){
-        if(chats.length===limit){more=true;break;}
-        last=Number(id.slice(1));
-        try{const c=await this.chat(id,actor);if(!requested||c.device===requested.raw)chats.push(await this.summary(c,actor));}catch(e){if(!['chat_not_found','device_forbidden','device_missing'].includes((e as Data).code))throw e;}
+      const prefix=requested?'chat-device:'+requested.raw+':':'chat-index:';
+      const chats:Data[]=[];let last=after,more=false;
+      for(;;){
+        const rows=await this.store.list<string>({prefix,startAfter:prefix+padded(last),limit:100});
+        for(const id of rows.values()){
+          let current:Data|undefined;
+          try{const c=await this.chat(id,actor);current=await this.summary(c,actor);}
+          catch(e){if(!['chat_not_found','device_forbidden','device_missing'].includes((e as Data).code))throw e;}
+          if(current&&chats.length===limit){more=true;break;}
+          last=Number(id.slice(1));if(current)chats.push(current);
+        }
+        if(more||rows.size<100)break;
       }
-      return {chats,next_cursor:more||rows.size>limit?last:null};
+      return {chats,next_cursor:more?last:null};
     }
     if(action==='create'){
-      const device=await this.env.device(args.device_id,actor);await this.accounts.assertAccess(actor,device.raw);
+      const device=await this.env.device(args.device_id,actor);await this.access(actor,device.raw);
       const title=args.title===undefined?'新对话':textValue(args.title,'title').trim()||'新对话';
       const chat=await this.store.transaction(async tx=>{
-        await this.accounts.assertAccessIn(tx,actor,device.raw);
-        const d=await this.dedupe(tx,actor.id+':create',args.request_key,[device.raw,title]);
+        await this.access(actor,device.raw,tx);
+        const d=await this.dedupe(tx,principalScope(actor)+':create',args.request_key,[device.raw,title]);
         if(d.result){const existing=await tx.get<Conversation>(key(d.result.id));if(!existing)throw fail('chat_deleted','原对话已删除');return existing;}
         const n=await this.next(tx,'t'),id='t'+n,stamp=now();
-        const c:Conversation={id,owner:actor.id,device:device.raw,device_id:device.id,title,created_at:stamp,updated_at:stamp,sequence:0,attachments:0};
-        await tx.put({[key(id)]:c,['chat-owner:'+actor.id+':'+String(n).padStart(16,'0')]:id,[d.key]:{fingerprint:d.fingerprint,result:{id}}});return c;
+        const c:Conversation={id,device:device.raw,device_id:device.id,title,created_at:stamp,updated_at:stamp,sequence:0,attachments:0};
+        await tx.put({[key(id)]:c,[indexKey(id)]:id,[deviceIndexKey(device.raw,id)]:id,[d.key]:{fingerprint:d.fingerprint,result:{id}}});return c;
       });return {chat:await this.summary(chat,actor)};
     }
     const chat=await this.chat(textValue(args.chat_id,'chat_id'),actor);
@@ -231,10 +277,10 @@ export class ChatService {
     if(action==='timing')return this.timing(chat,args);
     if(action==='rename'){
       const title=textValue(args.title,'title').trim();if(!title)throw fail('invalid_chat_argument','标题不能为空');
-      const updated=await this.store.transaction(async tx=>{await this.accounts.assertAccessIn(tx,actor,chat.device);const c=await tx.get<Conversation>(key(chat.id));if(!c)throw fail('chat_deleted','对话已删除');c.title=title;c.updated_at=now();await this.recordChange(tx,c);return c;});
+      const updated=await this.store.transaction(async tx=>{await this.access(actor,chat.device,tx);const c=await tx.get<Conversation>(key(chat.id));if(!c)throw fail('chat_deleted','对话已删除');c.title=title;c.updated_at=now();await this.recordChange(tx,c);return c;});
       await this.changed(chat.id);return {chat:await this.summary(updated,actor)};
     }
-    if(action==='delete'){await this.erase(chat);return {deleted:true};}
+    if(action==='delete'){await this.erase(chat,actor);return {deleted:true};}
     if(action==='resume')return this.resume(chat,args,actor,caller);
     if(action==='disconnect'){
       await this.connection(chat,args.connection,actor,caller);await this.release(chat.id,chat.active!);return {disconnected:true,chat_id:chat.id};
@@ -247,7 +293,7 @@ export class ChatService {
     if(action==='read-attachment')return this.readAttachment(chat,args);
     throw fail('unknown_chat_action','未知聊天操作');
   }
-  private async history(chat:Conversation,args:Data,actor:Actor):Promise<Data>{
+  private async history(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const prefix='chat-message:'+chat.id+':',limit=limitOf(args.limit),forward=args.after!==undefined;
     const after=forward?integer(args.after,'after'):0,before=args.before===undefined?undefined:integer(args.before,'before',1);
     if(forward&&before!==undefined)throw fail('invalid_chat_argument','after 与 before 不能同时使用');
@@ -256,21 +302,27 @@ export class ChatService {
     const first=messages[0]?.sequence??(before??after),last=messages.at(-1)?.sequence??after;
     return {chat:await this.summary(chat,actor),messages,next_cursor:last,first_cursor:first,eof:last>=chat.sequence,has_older:first>1};
   }
-  private async resume(chat:Conversation,args:Data,actor:Actor,caller:string):Promise<Data>{
+  private async resume(chat:Conversation,args:Data,actor:ChatPrincipal,caller:string):Promise<Data>{
     if(!caller)throw fail('model_connection_required','请通过模型 MCP 连接恢复对话');
+    const account=modelActor(actor);
     if(chat.active){await this.connection(chat,args.connection,actor,caller);return {chat:await this.summary(chat,actor),connection:args.connection,subscribed:true,history:{chat_id:chat.id}};}
     let connection=args.connection;
-    if(connection){const candidate=await this.store.get<Candidate>('chat-candidate:'+await hash(connection));if(!candidate||candidate.chat!==chat.id||candidate.account!==actor.id||candidate.epoch!==actor.epoch||candidate.caller!==caller||candidate.expires_at<=Date.now())throw fail('connection_expired','连接凭据已过期，请重新恢复对话');}
-    else {connection=secret();const candidateId=await hash(connection),expires=Date.now()+600_000;await this.store.transaction(async tx=>{await tx.put('chat-candidate:'+candidateId,{chat:chat.id,account:actor.id,epoch:actor.epoch,caller,expires_at:expires} satisfies Candidate);await this.expiry(tx,'candidate',candidateId,expires);});await this.env.schedule(expires);}
+    if(connection){const candidate=await this.store.get<Candidate>('chat-candidate:'+await hash(connection));if(!candidate||candidate.chat!==chat.id||candidate.account!==account.id||candidate.epoch!==account.epoch||candidate.caller!==caller||candidate.expires_at<=Date.now())throw fail('connection_expired','连接凭据已过期，请重新恢复对话');}
+    else {connection=secret();const candidateId=await hash(connection),expires=Date.now()+600_000;await this.store.transaction(async tx=>{await this.access(actor,chat.device,tx);await tx.put('chat-candidate:'+candidateId,{chat:chat.id,account:account.id,epoch:account.epoch,caller,expires_at:expires} satisfies Candidate);await this.expiry(tx,'candidate',candidateId,expires);});await this.env.schedule(expires);}
     return {chat:await this.summary(chat,actor),connection,subscribed:false,next_step:'Use the host event-monitoring/task capability to subscribe to chat.message with these arguments. events/subscribe is an MCP protocol method, not an ordinary tool. Wait for successful subscription before chat.reply.',event:{name:chatEventDefinition.name,arguments:{chat_id:chat.id,connection}},history:{chat_id:chat.id}};
   }
-  private async connection(chat:Conversation,connection:unknown,actor:Actor,caller:string):Promise<Subscription>{
+  private async connection(chat:Conversation,connection:unknown,actor:ChatPrincipal,caller:string):Promise<Subscription>{
+    const account=modelActor(actor);
     const sub=chat.active?await this.store.get<Subscription>(subKey(chat.active)):undefined;
     if(!sub)throw fail('chat_not_connected','对话等待宿主订阅：先 chat.resume，再由 Work/Dot 的事件任务订阅返回的 chat.message，订阅成功后才能 chat.reply；事件订阅不是普通工具。');
-    if(typeof connection!=='string'||sub.account!==actor.id||sub.epoch!==actor.epoch||sub.caller!==caller||sub.connection_hash!==await hash(connection))throw fail('chat_in_use','该对话正在被使用');
+    if(sub.account!==account.id||sub.epoch!==account.epoch||sub.caller!==caller||!await this.matchesConnection(sub,connection))throw fail('chat_in_use','该对话正在被使用。如正在处理此对话的 chat.message 事件，请使用事件 data.connection 直接调用 chat.reply；恢复原连接时也需携带该凭据。不要新建连接或接管其他对话。');
     return sub;
   }
-  private async send(chat:Conversation,args:Data,actor:Actor,caller:string,model:boolean):Promise<Data>{
+  private async matchesConnection(sub:Subscription,value:unknown):Promise<boolean>{
+    if(typeof value!=='string'||!value)return false;
+    return sub.connection_hash===await hash(value)||!!sub.event_connection&&this.env.equal(new TextEncoder().encode(sub.event_connection),new TextEncoder().encode(value));
+  }
+  private async send(chat:Conversation,args:Data,actor:ChatPrincipal,caller:string,model:boolean):Promise<Data>{
     const sub=model?await this.connection(chat,args.connection,actor,caller):undefined;
     const text=args.text===undefined?'':textValue(args.text,'text');
     // A stored message remains comfortably below a SQLite Durable Object's 2 MiB value limit.
@@ -280,10 +332,10 @@ export class ChatService {
     if(!text.trim()&&!attachments.length)throw fail('empty_message','消息不能为空');
     const source=model?'model':args.source==='tui'?'tui':'web';
     const message=await this.store.transaction(async tx=>{
-      await this.accounts.assertAccessIn(tx,actor,chat.device);
+      await this.access(actor,chat.device,tx);
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
       if(model&&current.active!==sub!.id)throw fail('chat_not_connected','原模型连接已结束');
-      const d=await this.dedupe(tx,chat.id+':'+(model?'reply':'send'),args.request_key,[text,ids,args.reply_to??null,model?sub!.id:null]);
+      const d=await this.dedupe(tx,chat.id+':'+(model?'reply':'send:'+principalScope(actor)),args.request_key,[text,ids,args.reply_to??null,model?sub!.id:null]);
       if(d.result)return (await tx.get<Message>(messageKey(chat.id,d.result.sequence)))!;
       const sequence=++current.sequence,id='m'+sequence;
       const m:Message={id,sequence,role:model?'assistant':'user',source,text,attachments:attachments.map(viewAttachment),created_at:now(),delivery:model?'none':'pending',...(args.reply_to?{reply_to:args.reply_to}:{})};
@@ -302,19 +354,37 @@ export class ChatService {
     await this.changed(chat.id);if(!model)await this.kick();
     return {message,chat:await this.summary((await this.store.get<Conversation>(key(chat.id)))!,actor)};
   }
+  async approvalNotice(actor:ChatPrincipal,chatId:string,approvalId:string,decision:string):Promise<Data>{
+    await this.initialize();const chat=await this.chat(chatId,actor);
+    const result=await this.store.transaction(async tx=>{
+      await this.access(actor,chat.device,tx);
+      const noticeKey='chat-approval-notice:'+approvalId,previous=await tx.get<Data>(noticeKey);
+      if(previous)return previous;
+      const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
+      const sequence=++current.sequence;
+      const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',text:'命令审批 '+approvalId+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),attachments:[],created_at:now(),delivery:'pending'};
+      current.updated_at=message.created_at;
+      const result={chat_id:chat.id,message_id:message.id,decision};
+      await tx.put({[messageKey(chat.id,sequence)]:message,[timingKey(chat.id,sequence)]:{saved_at:message.created_at,attempts:0},[noticeKey]:result});
+      await this.recordChange(tx,current,[sequence]);
+      if(current.active)await this.saveEvent(tx,{chat:chat.id,sequence,subscription:current.active,attempts:0,next_at:Date.now(),state:'pending'});
+      return result;
+    });
+    await this.changed(result.chat_id);await this.kick();return result;
+  }
   private async attachment(chat:string,id:unknown,ready=false):Promise<Attachment>{
     if(typeof id!=='string')throw fail('attachment_not_found','附件不存在');
     const a=await this.store.get<Attachment>(attachmentKey(chat,id));
     if(!a||ready&&a.state!=='ready')throw fail('attachment_not_found','附件不存在或尚未上传完成');return a;
   }
-  private async startUpload(chat:Conversation,args:Data,actor:Actor):Promise<Data>{
+  private async startUpload(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const name=textValue(args.name,'name').replaceAll('\\','/').split('/').at(-1)!.trim();if(!name)throw fail('invalid_chat_argument','附件名称不能为空');
     const size=integer(args.size,'size'),mime_type=args.mime_type?textValue(args.mime_type,'mime_type'):'application/octet-stream';
     const expected=args.sha256===undefined?undefined:textValue(args.sha256,'sha256').toLowerCase();
     if(expected&&!/^[0-9a-f]{64}$/.test(expected))throw fail('invalid_chat_argument','sha256 格式不正确');
     const attachment=await this.store.transaction(async tx=>{
-      await this.accounts.assertAccessIn(tx,actor,chat.device);
-      const d=await this.dedupe(tx,chat.id+':upload',args.request_key,[name,size,mime_type,expected??null]);
+      await this.access(actor,chat.device,tx);
+      const d=await this.dedupe(tx,chat.id+':upload:'+principalScope(actor),args.request_key,[name,size,mime_type,expected??null]);
       if(d.result){const a=await tx.get<Attachment>(attachmentKey(chat.id,d.result.id));if(!a)throw fail('upload_expired','上传已过期');return a;}
       const c=await tx.get<Conversation>(key(chat.id));if(!c)throw fail('chat_deleted','对话已删除');
       const a:Attachment={id:'a'+(++c.attachments),name,size,mime_type,offset:0,chunks:0,state:'uploading',expires_at:Date.now()+86_400_000,...(expected?{expected_sha256:expected}:{})};
@@ -322,12 +392,12 @@ export class ChatService {
     });if(attachment.expires_at)await this.env.schedule(attachment.expires_at);
     return {attachment,chunk_size:CHUNK};
   }
-  private async writeUpload(chat:Conversation,args:Data,actor:Actor):Promise<Data>{
+  private async writeUpload(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const offset=integer(args.offset,'offset'),data=textValue(args.data,'data');let bytes:Uint8Array;
     try{bytes=from64(data);}catch{throw fail('invalid_chat_argument','附件分片不是有效 Base64');}
     if(!bytes.length||bytes.length>CHUNK||offset%CHUNK!==0)throw fail('invalid_chat_argument','分片必须按 chunk_size 对齐，且不可为空或超过 chunk_size');
     return this.store.transaction(async tx=>{
-      await this.accounts.assertAccessIn(tx,actor,chat.device);
+      await this.access(actor,chat.device,tx);
       if(!await tx.get(key(chat.id)))throw fail('chat_deleted','对话已删除');
       const a=await tx.get<Attachment>(attachmentKey(chat.id,args.attachment_id));
       if(!a||a.state!=='uploading')throw fail('upload_expired','上传不存在或已完成');
@@ -344,13 +414,13 @@ export class ChatService {
     if(this.env.blobs)return this.env.blobs.read(chat,id,index);
     const raw=await this.store.get<string>(chunkKey(chat,id,index));if(raw===undefined)throw fail('attachment_incomplete','附件分片缺失');return from64(raw);
   }
-  private async completeUpload(chat:Conversation,args:Data,actor:Actor):Promise<Data>{
+  private async completeUpload(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const a=await this.attachment(chat.id,args.attachment_id);if(a.state==='ready')return {attachment:{...viewAttachment(a),state:'ready'}};
     if(a.offset!==a.size)throw fail('upload_incomplete','附件尚未上传完整');
     const digest=sha256.create();let count=0;
     for(let index=0;index<a.chunks;index++){const bytes=await this.chunk(chat.id,a.id,index);count+=bytes.length;digest.update(bytes);}
     const checksum=hex(digest.digest());if(count!==a.size||a.expected_sha256&&checksum!==a.expected_sha256)throw fail('attachment_checksum','附件大小或 SHA256 校验不一致');
-    await this.store.transaction(async tx=>{await this.accounts.assertAccessIn(tx,actor,chat.device);const current=await tx.get<Attachment>(attachmentKey(chat.id,a.id));if(!current)throw fail('upload_expired','上传已过期');current.sha256=checksum;current.state='ready';delete current.expires_at;delete current.expected_sha256;await tx.put(attachmentKey(chat.id,a.id),current);await this.expiry(tx,'upload',chat.id+':'+a.id);});
+    await this.store.transaction(async tx=>{await this.access(actor,chat.device,tx);const current=await tx.get<Attachment>(attachmentKey(chat.id,a.id));if(!current)throw fail('upload_expired','上传已过期');current.sha256=checksum;current.state='ready';delete current.expires_at;delete current.expected_sha256;await tx.put(attachmentKey(chat.id,a.id),current);await this.expiry(tx,'upload',chat.id+':'+a.id);});
     return {attachment:{...viewAttachment({...a,sha256:checksum}),state:'ready'}};
   }
   private async bytes(chat:string,a:Attachment,offset:number,length:number):Promise<Uint8Array>{
@@ -373,15 +443,16 @@ export class ChatService {
     }
     return {attachment:viewAttachment(a),data:to64(bytes),next_offset:offset+bytes.length,eof:offset+bytes.length>=a.size};
   }
-  async download(chatId:string,id:string,actor:Actor):Promise<Response>{
+  async download(chatId:string,id:string,actor:ChatPrincipal):Promise<Response>{
     const chat=await this.chat(chatId,actor),a=await this.attachment(chat.id,id,true);let index=0;
     const stream=new ReadableStream<Uint8Array>({pull:async controller=>{
       try{await this.chat(chat.id,actor);if(index>=a.chunks){controller.close();return;}controller.enqueue(await this.chunk(chat.id,a.id,index++));}catch(e){controller.error(e);}
     }});
     return new Response(stream,{headers:{'Content-Type':a.mime_type,'Content-Length':String(a.size),'Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(a.name),'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
   }
-  private async erase(chat:Conversation):Promise<void>{
+  private async erase(chat:Conversation,actor:ChatPrincipal):Promise<void>{
     const attachments=await this.store.transaction(async tx=>{
+      await this.access(actor,chat.device,tx);
       const current=await tx.get<Conversation>(key(chat.id));if(!current)return [];
       const files=[...(await tx.list<Attachment>({prefix:'chat-attachment:'+chat.id+':'})).values()];
       const subscriptions=new Set<string>();
@@ -391,7 +462,7 @@ export class ChatService {
       for(const a of files)await this.expiry(tx,'upload',chat.id+':'+a.id);
       const head=await tx.get<Head>('chat-head:'+chat.id);if(head)await tx.delete([dueKey(head),'chat-head:'+chat.id]);
       for(const prefix of ['chat-change:','chat-timing:','chat-pending:','chat-unack:','chat-message:','chat-attachment:','chat-chunk:','chat-event:','chat-request:','chat-import:'])await tx.delete([...(await tx.list({prefix:prefix+chat.id+':'})).keys()]);
-      await tx.delete([key(chat.id),'chat-owner:'+chat.owner+':'+chat.id.slice(1).padStart(16,'0')]);
+      await tx.delete([key(chat.id),indexKey(chat.id),deviceIndexKey(chat.device,chat.id)]);
       return files;
     });
     // Deleting metadata first prevents a simultaneous uploader recreating a removed chunk folder.
@@ -402,7 +473,8 @@ export class ChatService {
     const device=await this.store.get<Data>('device:'+textValue(args.device_id,'device_id'));
     if(!device||device.key_hash!==await hash(textValue(args.device_key,'device_key')))throw fail('device_unauthorized','电脑注册凭据无效');
     const id=secret(),poll=secret(),code=hex(crypto.getRandomValues(new Uint8Array(4))).toUpperCase();
-    const link:Link={id,code,device:device.id,token_hash:await hash(poll),expires_at:Date.now()+600_000};
+    if(args.scope!==undefined&&args.scope!=='account'&&args.scope!=='device')throw fail('invalid_chat_argument','scope 必须为 account 或 device');
+    const link:Link={id,code,device:device.id,scope:args.scope??'device',token_hash:await hash(poll),expires_at:Date.now()+600_000};
     await this.store.transaction(async tx=>{await tx.put({['chat-link:'+id]:link,['chat-link-code:'+code]:id});await this.expiry(tx,'link',id,link.expires_at);});await this.env.schedule(link.expires_at);
     return {code,request_id:id,poll_token:poll,verification_url:this.env.publicUrl+'/chat/connect?code='+code,expires_at:link.expires_at};
   }
@@ -410,32 +482,42 @@ export class ChatService {
     const id=await this.store.get<string>('chat-link-code:'+code.toUpperCase()),link=id?await this.store.get<Link>('chat-link:'+id):undefined;
     if(!link||link.expires_at<=Date.now())throw fail('chat_link_expired','终端连接请求已过期');return link;
   }
+  private async authorizeLink(link:Link,actor:Actor,tx?:KeyStore):Promise<void>{
+    if(link.scope==='account')await validateIdentity(this.accounts,this.store,actor,tx);
+    else await this.access(actor,link.device,tx);
+  }
+  private async linkDevice(link:Link):Promise<ChatDevice>{
+    const device=await this.store.get<Data>('device:'+link.device);if(!device)throw fail('device_missing','电脑已注销');
+    return this.env.device(link.device,{kind:'device',device:link.device,key_hash:device.key_hash});
+  }
   async linkDetails(code:string,actor:Actor):Promise<Data>{
-    const link=await this.link(code);await this.accounts.assertAccess(actor,link.device);const d=await this.env.device(link.device,actor);return {device:{id:d.id,name:d.name,system:d.system},expires_at:link.expires_at,approved:!!link.approved_by};
+    const link=await this.link(code);await this.authorizeLink(link,actor);const d=await this.linkDevice(link);return {scope:link.scope??'device',device:{id:d.id,name:d.name,system:d.system},expires_at:link.expires_at,approved:!!link.approved_by};
   }
   async approveLink(code:string,actor:Actor):Promise<Data>{
-    const link=await this.link(code);await this.accounts.assertAccess(actor,link.device);const token=secret();
+    const link=await this.link(code);await this.authorizeLink(link,actor);const token=secret();
     await this.store.transaction(async tx=>{
-      await this.accounts.assertAccessIn(tx,actor,link.device);
+      await this.authorizeLink(link,actor,tx);
       const current=await tx.get<Link>('chat-link:'+link.id);if(!current||current.expires_at<=Date.now())throw fail('chat_link_expired','终端连接请求已过期');
       if(current.approved_by){if(current.approved_by!==actor.id)throw fail('chat_link_claimed','终端已由其他账号连接');return;}
       current.approved_by=actor.id;current.epoch=actor.epoch;current.credential=token;
-      await tx.put({['chat-link:'+link.id]:current,['chat-credential:'+await hash(token)]:{account:actor.id,epoch:actor.epoch,device:link.device} satisfies Credential});
+      await tx.put({['chat-link:'+link.id]:current,['chat-credential:'+await hash(token)]:{account:actor.id,epoch:actor.epoch,device:link.device,scope:link.scope??'device'} satisfies Credential});
     });return {approved:true,...await this.linkDetails(code,actor)};
   }
-  async denyLink(code:string,actor:Actor):Promise<Data>{const link=await this.link(code);await this.accounts.assertAccess(actor,link.device);await this.store.transaction(async tx=>{await tx.put('chat-link-denied:'+link.id,link.expires_at);await tx.delete(['chat-link:'+link.id,'chat-link-code:'+link.code]);await this.expiry(tx,'link',link.id);await this.expiry(tx,'denied',link.id,link.expires_at);});return {denied:true};}
+  async denyLink(code:string,actor:Actor):Promise<Data>{const link=await this.link(code);await this.authorizeLink(link,actor);await this.store.transaction(async tx=>{await this.authorizeLink(link,actor,tx);await tx.put('chat-link-denied:'+link.id,link.expires_at);await tx.delete(['chat-link:'+link.id,'chat-link-code:'+link.code]);await this.expiry(tx,'link',link.id);await this.expiry(tx,'denied',link.id,link.expires_at);});return {denied:true};}
   async pollLink(args:Data):Promise<Data>{
     if(await this.store.get('chat-link-denied:'+args.request_id))return {state:'denied'};
     const link=await this.store.get<Link>('chat-link:'+args.request_id);
     if(!link||link.expires_at<=Date.now())return {state:'expired'};
     if(link.token_hash!==await hash(textValue(args.poll_token,'poll_token')))throw fail('chat_link_unauthorized','终端连接凭据无效');
     if(!link.approved_by)return {state:'pending'};
-    const actor=await this.accounts.require(link.approved_by,link.epoch);await this.accounts.assertAccess(actor,link.device);const d=await this.env.device(link.device,actor);
-    return {state:'approved',credential:link.credential,device:{id:d.id,name:d.name,system:d.system},account:{id:actor.id,username:actor.username}};
+    const actor=await this.accounts.require(link.approved_by,link.epoch);await this.authorizeLink(link,actor);const d=await this.linkDevice(link);
+    return {state:'approved',scope:link.scope??'device',credential:link.credential,device:{id:d.id,name:d.name,system:d.system},account:{id:actor.id,username:actor.username}};
   }
-  async authenticateCredential(token:string):Promise<{actor:Actor;device_id:string;raw_device:string}>{
+  async authenticateCredential(token:string):Promise<{actor:Actor;scope:'account'|'device';device_id?:string;raw_device?:string}>{
     const credential=await this.store.get<Credential>('chat-credential:'+await hash(token));if(!credential)throw fail('chat_credential_invalid','终端登录已失效，请重新连接');
-    const actor=await this.accounts.require(credential.account,credential.epoch);await this.accounts.assertAccess(actor,credential.device);const d=await this.env.device(credential.device,actor);return {actor,device_id:d.id,raw_device:d.raw};
+    const actor=await this.accounts.require(credential.account,credential.epoch);
+    if(credential.scope==='account')return {actor,scope:'account'};
+    await this.access(actor,credential.device);const d=await this.env.device(credential.device,actor);return {actor,scope:'device',device_id:d.id,raw_device:d.raw};
   }
   async events(method:'list'|'subscribe'|'unsubscribe',args:Data,actor:Actor,caller:string):Promise<Data>{
     await this.accounts.require(actor.id,actor.epoch);await this.initialize();
@@ -447,8 +529,8 @@ export class ChatService {
     if(parsed.protocol!=='https:'||parsed.username||parsed.password||parsed.hash)throw fail('invalid_callback','回调必须是无凭据的 HTTPS 地址');
     const index='chat-subscription-index:'+await hash(JSON.stringify([actor.id,caller,url,chatEventDefinition.name,{chat_id:chat.id,connection:input.connection}]));
     if(method==='unsubscribe'){
-      const id=await this.store.get<string>(index);
-      if(id){const sub=await this.store.get<Subscription>(subKey(id));if(sub&&sub.account===actor.id&&sub.caller===caller&&sub.connection_hash===connectionHash&&sub.url===url)await this.release(chat.id,id);}
+      const id=chat.active??await this.store.get<string>(index);
+      if(id){const sub=await this.store.get<Subscription>(subKey(id));if(sub&&sub.account===actor.id&&sub.epoch===actor.epoch&&sub.caller===caller&&await this.matchesConnection(sub,input.connection)&&sub.url===url)await this.release(chat.id,id);}
       await this.store.transaction(async tx=>{await tx.delete('chat-candidate:'+connectionHash);await this.expiry(tx,'candidate',connectionHash);});return {};
     }
     const signingKey=textValue(args.delivery.secret,'delivery.secret');let decoded:Uint8Array;
@@ -464,16 +546,17 @@ export class ChatService {
     const expires_at=ttl===null?null:Date.now()+ttl;
     const cursor=args.cursor===undefined||args.cursor===null?(existing?.cursor??0):cursorOf(args.cursor);
     if(cursor>chat.sequence)throw fail('invalid_event_cursor','事件游标超过现有消息');
-    const id=await this.store.transaction(async tx=>{const previous=await tx.get<string>(index);if(previous)return previous;const value='v'+await this.next(tx,'chat-subscription');await tx.put(index,value);return value;});
+    const id=await this.store.transaction(async tx=>{const previous=existing?.id??await tx.get<string>(index);if(previous){await tx.put(index,previous);return previous;}const value='v'+await this.next(tx,'chat-subscription');await tx.put(index,value);return value;});
     if(!existing||existing.verified_at<Date.now()-300_000)await this.verify(url,signingKey,id);
     const saved=await this.store.transaction(async tx=>{
-      await this.accounts.assertAccessIn(tx,actor,chat.device);
+      await this.access(actor,chat.device,tx);
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_not_found','对话已删除');
       if(current.active&&current.active!==id)throw fail('chat_in_use','该对话正在被使用');
       const candidate=await tx.get<Candidate>('chat-candidate:'+connectionHash);
       const previous=await tx.get<Subscription>(subKey(id));
       if(!previous&&(!candidate||candidate.expires_at<=Date.now()))throw fail('connection_expired','连接请求已取消或过期');
-      const sub:Subscription={id,chat:chat.id,account:actor.id,epoch:actor.epoch,caller,connection_hash:connectionHash,url,secret:signingKey,expires_at,cursor:Math.min(previous?.cursor??cursor,cursor),verified_at:Date.now()};
+      if(previous&&(previous.account!==actor.id||previous.epoch!==actor.epoch||previous.caller!==caller||previous.url!==url||!await this.matchesConnection(previous,input.connection)))throw fail('chat_in_use','该对话正在被使用');
+      const sub:Subscription={id,chat:chat.id,account:actor.id,epoch:actor.epoch,caller,connection_hash:previous?.connection_hash??connectionHash,event_connection:previous?.event_connection??secret(),url,secret:signingKey,expires_at,cursor:Math.min(previous?.cursor??cursor,cursor),verified_at:Date.now()};
       if(previous&&previous.secret!==signingKey){sub.previous_secret=previous.secret;sub.rotation_until=Date.now()+60_000;}
       else if(previous?.rotation_until&&previous.rotation_until>Date.now()){sub.previous_secret=previous.previous_secret;sub.rotation_until=previous.rotation_until;}
       current.active=id;await tx.put(subKey(id),sub);await this.recordChange(tx,current);
@@ -554,7 +637,7 @@ export class ChatService {
     });
     if(!claimed)return;
     const safeCursor=await this.safeCursor(this.store,chat.id,sub.id,message.sequence);
-    const envelope={eventId:chat.id+'-'+message.id,name:chatEventDefinition.name,timestamp:message.created_at,data:{chat_id:chat.id,device_id:chat.device_id,message_id:message.id,text:message.text.slice(0,16384),text_truncated:message.text.length>16384,attachments:message.attachments,url:this.env.publicUrl+'/chat?id='+chat.id},cursor:safeCursor?'m'+safeCursor:null};
+    const envelope={eventId:chat.id+'-'+message.id,name:chatEventDefinition.name,timestamp:message.created_at,data:{chat_id:chat.id,connection:sub.event_connection,device_id:chat.device_id,message_id:message.id,text:message.text.slice(0,16384),text_truncated:message.text.length>16384,attachments:message.attachments,url:this.env.publicUrl+'/chat?id='+chat.id},cursor:safeCursor?'m'+safeCursor:null};
     let status=0,error:string|undefined;
     try{const response=await this.signed(sub,envelope);status=response.status;await response.body?.cancel();}catch(e){error=(e as Data).code==='invalid_callback'?'callback_address':'network';}
     await this.store.transaction(async tx=>{

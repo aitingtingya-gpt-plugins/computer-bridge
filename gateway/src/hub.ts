@@ -13,6 +13,7 @@ import {ConnectionLatency} from './latency';
 import {RequestRecords} from './requests';
 import type {DeviceSocket, HubContext, ServiceEnv} from "./runtime";
 import {ChatService} from './chat';
+import {authorizeIdentity,type ChatIdentity} from './chat_identity';
 import {HubScheduler} from './scheduler';
 
 export class ComputerHubCore {
@@ -35,7 +36,8 @@ export class ComputerHubCore {
     this.scheduler=new HubScheduler(ctx.storage);
     this.ctx=ctx={...ctx,storage:this.scheduler.store()};
     this.approvals=new CommandApprovals(ctx.storage,(device,method,args)=>
-      this.rpc(device,method,args,false,AbortSignal.timeout(30_000)),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;});
+      this.rpc(device,method,args,false,AbortSignal.timeout(30_000)),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;},
+      device=>this.notifyApprovals(device));
     this.transport=new DeviceTransport(ctx,id=>this.requests.received(id));
     this.modules = new ServerModules(ctx.storage);
     this.updates = new Updates(ctx.storage,env,
@@ -46,12 +48,7 @@ export class ComputerHubCore {
     this.guidance = new Guidance(ctx.storage);
     this.accounts = new Accounts(ctx.storage, env.BRIDGE_SECRET, ctx.equal);
     this.chats=new ChatService(ctx.storage,this.accounts,{publicUrl:env.PUBLIC_URL,
-      device:async(id,actor)=>{
-        const raw=await this.refs.raw(id);await this.accounts.assertAccess(actor,raw);
-        const device=await ctx.storage.get<Data>('device:'+raw);
-        if(!device)throw Object.assign(new Error('电脑不存在'),{code:'device_missing'});
-        return {id:await this.refs.assign('c',raw),raw,name:device.display_name || device.name,system:device.system};
-      },webhookFetch:env.webhookFetch!,blobs:env.chatBlobs,
+      device:(id,identity)=>this.chatDevice(identity,id),webhookFetch:env.webhookFetch!,blobs:env.chatBlobs,
       equal:ctx.equal,schedule:time=>this.scheduler.schedule('chat',time),
       changed:id=>this.notifyChat(id),background:work=>{
         const observed=work.catch(error=>console.error('chat delivery',(error as Error).name));
@@ -67,6 +64,28 @@ export class ComputerHubCore {
     return !!device && device.key_hash === await hash(key);
   }
 
+  private async nativeChatIdentity(id:string,key:string):Promise<ChatIdentity> {
+    if(!await this.authorizeDevice(id,key))throw Object.assign(new Error('本机注册凭据已失效，请重新注册电脑'),{code:'device_unauthorized'});
+    return {kind:'device',device:id,key_hash:await hash(key)};
+  }
+
+  private async currentChatIdentity(identity:ChatIdentity|Actor):Promise<ChatIdentity> {
+    if(!('kind' in identity))return {kind:'account',actor:await this.identity(identity.id,identity.epoch)};
+    if(identity.kind==='account')return {kind:'account',actor:await this.identity(identity.actor.id,identity.actor.epoch)};
+    const device=await this.ctx.storage.get<Data>('device:'+identity.device);
+    if(!device || device.key_hash!==identity.key_hash)throw Object.assign(new Error('本机注册凭据已失效，请重新注册电脑'),{code:'device_unauthorized'});
+    return identity;
+  }
+
+  private async chatDevice(identity:ChatIdentity|Actor,id:string) {
+    const principal=await this.currentChatIdentity(identity),raw=await this.refs.raw(id);
+    if(principal.kind==='account')await this.accounts.assertAccess(principal.actor,raw);
+    else if(principal.device!==raw)throw Object.assign(new Error('本机身份只能访问当前电脑'),{code:'device_forbidden'});
+    const device=await this.ctx.storage.get<Data>('device:'+raw);
+    if(!device)throw Object.assign(new Error('电脑不存在'),{code:'device_missing'});
+    return {id:await this.refs.assign('c',raw),raw,name:device.display_name ?? device.name,system:device.system};
+  }
+
   async acceptDevice(socket: DeviceSocket, id: string): Promise<void> {
     for (const old of this.ctx.getWebSockets(id)) {
       this.latency.clear(old);
@@ -80,10 +99,10 @@ export class ComputerHubCore {
   }
 
   async acceptChat(socket:DeviceSocket,identity:Data):Promise<void> {
-    const actor=await this.identity(identity.account,identity.epoch);
-    const {chat}=await this.chats.action('get',{chat_id:identity.chat_id},actor);
+    const principal=await this.currentChatIdentity(identity.principal ?? {kind:'account',actor:{id:identity.account,epoch:identity.epoch}});
+    const {chat}=await this.chats.action('get',{chat_id:identity.chat_id},principal);
     if(identity.expires_at!==null && identity.expires_at<=Date.now())throw new Error('Chat login expired');
-    socket.serializeAttachment({kind:'chat',account:actor.id,epoch:actor.epoch,chat_id:chat.id,
+    socket.serializeAttachment({kind:'chat',principal,...(principal.kind==='account'?{account:principal.actor.id}:{}),chat_id:chat.id,
       device_id:await this.refs.raw(chat.device_id),expires_at:identity.expires_at});
     this.ctx.acceptWebSocket(socket,['chat-live','chat-live:'+chat.id]);
     if(identity.expires_at!==null)await this.scheduler.schedule('chat-live',identity.expires_at);
@@ -95,11 +114,34 @@ export class ComputerHubCore {
       const state=socket.deserializeAttachment() as Data;
       try {
         if(state.expires_at!==null && state.expires_at<=Date.now())throw new Error('Chat login expired');
-        const actor=await this.identity(state.account,state.epoch);
-        await this.chats.action('get',{chat_id:id},actor);
+        const principal=await this.currentChatIdentity(state.principal ?? {kind:'account',actor:{id:state.account,epoch:state.epoch}});
+        await this.chats.action('get',{chat_id:id},principal);
         socket.send(JSON.stringify({type:'chat.changed',chat_id:id}));
       } catch {socket.close(1008,'Chat access expired');}
     }));
+  }
+
+  private async notifyApprovals(device:string):Promise<void> {
+    const id=await this.refs.assign('c',device);
+    await Promise.all(this.ctx.getWebSockets('chat-live').map(async socket=>{
+      const state=socket.deserializeAttachment() as Data;
+      if(state.device_id!==device)return;
+      try {
+        if(state.expires_at!==null && state.expires_at<=Date.now())throw new Error('Chat login expired');
+        await this.chatDevice(state.principal ?? {kind:'account',actor:{id:state.account,epoch:state.epoch}},device);
+        socket.send(JSON.stringify({type:'approvals.changed',device_id:id}));
+      }catch{socket.close(1008,'Chat access expired');}
+    }));
+    for(const record of await this.approvals.list(device,{include_finished:true}))if(record.notification && !record.notification.delivered_at) {
+      try {await this.deliverApprovalNotice(record.id);}catch { /* Durable target is retried by the next query or decision. */ }
+    }
+  }
+
+  private async deliverApprovalNotice(id:string):Promise<void> {
+    const notice=await this.approvals.notification(id);
+    if(!notice || notice.delivered_at)return;
+    await this.chats.approvalNotice(notice.principal,notice.chat_id,id,notice.decision);
+    await this.approvals.markNotification(id,notice.chat_id);
   }
 
   private closeChatSockets(account?:string,device?:string):void {
@@ -198,6 +240,62 @@ export class ComputerHubCore {
     return this.chats.action('upload-complete',{chat_id:args.chat_id,attachment_id},actor,caller);
   }
 
+  /** Human chat routes return approval decisions, never another model's operation handles or output. */
+  private async humanChat(action:string,args:Data,identity:ChatIdentity|Actor):Promise<Data> {
+    const principal=await this.currentChatIdentity(identity);
+    if(action==='devices') {
+      const records=await this.ctx.storage.list<Data>({prefix:'device:'});
+      const allowed=principal.kind==='account'?await this.accounts.devices(principal.actor):new Set([principal.device]);
+      const computers=await Promise.all([...records.values()].filter(d=>!allowed||allowed.has(d.id))
+        .sort((a,b)=>a.registered_at-b.registered_at||a.id.localeCompare(b.id))
+        .map(async d=>({id:await this.refs.assign('c',d.id),name:d.display_name??d.name,system:d.system})));
+      return {computers};
+    }
+    if(action==='approvals') {
+      const device=await this.chatDevice(principal,args.device_id);
+      const records=await this.approvals.list(device.raw);
+      return {approvals:records.map(record=>({id:record.id,state:record.state,decision:record.decision,
+        expires_at:record.expires_at,device_id:device.id}))};
+    }
+    if(action==='approval-details'||action==='approval-decide') {
+      const record=await this.approvals.record(args.id);
+      const device=await this.chatDevice(principal,record.device);
+      if(action==='approval-details') {
+        const details=await this.approvals.details(args.id);
+        return {id:record.id,state:details.state,decision:details.decision,command:details.command,
+          cwd:details.cwd,justification:details.justification,expires_at:record.expires_at,device_id:device.id};
+      }
+      if(args.chat_id) {
+        const selected=await this.chats.authorize(principal,args.chat_id);
+        if(selected.device!==record.device)throw Object.assign(new Error('审批与当前对话不属于同一台电脑'),{code:'device_forbidden'});
+      }
+      let delivery_pending=false;
+      try {
+        await this.approvals.decide(args.id,args.decision,undefined,
+          args.chat_id?{chat_id:args.chat_id,principal}:undefined,async(tx,current)=>{
+            await authorizeIdentity(this.accounts,this.ctx.storage,principal,current.device,tx);
+            if(args.chat_id) {
+              const chat=await tx.get<Data>('chat:'+args.chat_id);
+              if(!chat || chat.device!==current.device)throw Object.assign(new Error('对话不存在或不属于这台电脑'),{code:'chat_not_found'});
+            }
+          });
+      }catch(error) {
+        // A recorded decision survives a disconnected computer; report it without promising execution.
+        if(!['request_pending','connection_interrupted'].includes((error as Data).code) && (error as Error).name!=='TimeoutError')throw error;
+        const current=await this.approvals.record(args.id);
+        if(!current.decision || !current.delivery_pending)throw error;
+        await this.chatDevice(principal,current.device);
+        delivery_pending=true;
+      }
+      let notification_pending=false;
+      try {await this.deliverApprovalNotice(args.id);}catch {notification_pending=true;}
+      const current=await this.approvals.record(args.id);
+      return {id:current.id,state:current.state,decision:current.decision,delivery_pending,
+        ...(notification_pending?{notification_pending:true}:{})};
+    }
+    return this.chats.action(action,args,principal);
+  }
+
   private async control(action:string,value:Data):Promise<Response> {
     if(action==='pair') return json(await this.pair(value));
     if(action==='poll') return json(await this.poll(value.id));
@@ -208,19 +306,35 @@ export class ComputerHubCore {
       return json(await this.chats.startLink(value));
     }
     if(action==='chat-link-poll')return json(await this.chats.pollLink(value));
+    if(action.startsWith('chat-native-')) {
+      const principal=await this.nativeChatIdentity(value.device_id,value.device_key);
+      if(action==='chat-native-auth')return json({principal});
+      if(action==='chat-native-session') {
+        const {raw:_,...device}=await this.chatDevice(principal,value.device_id);
+        return json({mode:'device',device});
+      }
+      if(action==='chat-native-download')return this.chats.download(value.chat_id,value.attachment_id,principal);
+      return json(await this.humanChat(value.action,{...value.parameters,source:'tui'},principal));
+    }
     if(action.startsWith('chat-credential-')){
       const bound=await this.chats.authenticateCredential(value.credential);
       if(action==='chat-credential-auth')return json(bound);
       const args=action==='chat-credential-download'?{chat_id:value.chat_id,attachment_id:value.attachment_id}:{...value.parameters,source:'tui'};
-      if(args.device_id && await this.refs.raw(args.device_id)!==bound.raw_device)
+      if(bound.scope!=='account' && args.device_id && await this.refs.raw(args.device_id)!==bound.raw_device)
         return json({error:'聊天凭据属于另一台电脑',code:'device_forbidden'},403);
-      if(args.chat_id){
+      if(bound.scope!=='account' && args.chat_id){
         const result=await this.chats.action('get',{chat_id:args.chat_id},bound.actor);
         if(result.chat.device_id!==bound.device_id)return json({error:'对话属于另一台电脑',code:'device_forbidden'},403);
       }
       if(action==='chat-credential-download')return this.chats.download(args.chat_id,args.attachment_id,bound.actor);
-      if(value.action==='list'||value.action==='create')args.device_id=bound.device_id;
-      return json(await this.chats.action(value.action,args,bound.actor));
+      if(bound.scope!=='account' && (value.action==='list'||value.action==='create'))args.device_id=bound.device_id;
+      if(bound.scope!=='account' && ['approvals','approval-details','approval-decide','devices'].includes(value.action)) {
+        // Older terminal credentials remain scoped to their original device.
+        if(value.action==='devices')return json({computers:[await this.chatDevice(bound.actor,bound.raw_device!)]});
+        const device=value.action==='approvals'?await this.refs.raw(args.device_id):(await this.approvals.record(args.id)).device;
+        if(device!==bound.raw_device)throw Object.assign(new Error('聊天凭据属于另一台电脑'),{code:'device_forbidden'});
+      }
+      return json(await this.humanChat(value.action,args,bound.actor));
     }
     // These routes are invoked only by the private deployment binding / local updater.
     if(action==='busy') return json({busy:this.transport.active,version:VERSION,modules:await this.modules.list()});
@@ -232,7 +346,7 @@ export class ComputerHubCore {
     if(action==='chat-link-approve')return json(await this.chats.approveLink(value.code,actor));
     if(action==='chat-link-deny')return json(await this.chats.denyLink(value.code,actor));
     if(action==='chat-download')return this.chats.download(value.chat_id,value.attachment_id,actor);
-    if(action.startsWith('chat-'))return json(await this.chats.action(action.slice(5),value,actor));
+    if(action.startsWith('chat-'))return json(await this.humanChat(action.slice(5),value,actor));
     if(action==='accounts-profile') {
       const updated=await this.accounts.update(actor.id,{username:value.username,password:value.password});
       if(updated.epoch!==actor.epoch) {this.closeChatSockets(actor.id);await this.approvals.revoke(actor.id);await this.chats.revoke(actor.id);}
@@ -349,6 +463,10 @@ export class ComputerHubCore {
 
   async approve(code: string, actor:Actor): Promise<Data> {
     const result = await this.accounts.approvePair(code, actor);
+    for(const socket of this.ctx.getWebSockets('chat-live')) {
+      const state=socket.deserializeAttachment() as Data;
+      if(state.principal?.kind==='device' && state.device_id===result.device_id)socket.close(1008,'Device registration changed');
+    }
     return {registered: true, device_id: await this.refs.assign("c", result.device_id), name: result.name};
   }
 
@@ -617,7 +735,8 @@ export class ComputerHubCore {
       if(!reference || reference.scope!==scope) throw new Error('定义不属于所选电脑和工作目录');
       args._definition={source:reference.source,locator:reference.locator};
     }
-    const projection={method,device,scope,root,context,selectedFile,legacyWorkspace,account:actor.id,account_epoch:actor.epoch,args:{
+    const projection={method,device,scope,root,context,selectedFile,legacyWorkspace,account:actor.id,account_epoch:actor.epoch,
+      ...(method==='computer.exec'?{approval_channel:args.approval_channel??'host'}:{}),args:{
       session:args.session,operation:args.operation,action:args.action,consume:args.consume,
       payload:{operation:args.payload?.operation,consume:args.payload?.consume}}};
     const record=await this.requests.begin(device,method,args,projection);
@@ -710,7 +829,7 @@ export class ComputerHubCore {
         {session:projection.args.session,operation:result.operation,seconds:0},false,AbortSignal.timeout(5000));
       if(result.state==='awaiting_approval') {
         const approval=await this.approvals.register(result.approval,projection);
-        result={...result,approval:{id:approval.id,expires_at:approval.expires_at,
+        result={...result,approval:{id:approval.id,expires_at:approval.expires_at,channel:approval.channel,
           url:this.env.PUBLIC_URL+'/manage/command-approval?id='+encodeURIComponent(approval.id)}};
       }
     }
@@ -849,7 +968,8 @@ export class ComputerHubCore {
       }
     }
     for(const prefix of ['command-approval:','command-form:'])for(const value of (await this.ctx.storage.list<Data>({prefix})).values())
-      next=Math.min(next,value.expires_at+86400_000+1);
+      next=Math.min(next,value.expires_at+86400_000+1,
+        prefix==='command-approval:' && value.state==='pending' && value.expires_at>Date.now()?value.expires_at:Infinity);
     if(next<Infinity)await this.scheduler.schedule('maintenance',next);
   }
 }

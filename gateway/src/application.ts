@@ -202,7 +202,15 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
 }
 
 const chatActions=new Set(['list','create','get','history','sync','timing','send','rename','delete','upload-start','upload-chunk',
-  'upload-complete','attachment','read-attachment']);
+  'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide']);
+
+/** Native device credentials are supplied in headers, never in a URL or browser cookie. */
+function nativeChatCredentials(request:Request):Data|null {
+  const device_id=request.headers.get('x-computer-bridge-device');
+  if(!device_id)return null;
+  const authorization=request.headers.get('authorization');
+  return {device_id,device_key:authorization?.startsWith('Bearer ')?authorization.slice(7):''};
+}
 
 /** Authenticate human-only live notifications using the same account/device checks as HTTP. */
 export async function authorizeChatLive(request:Request,env:ApplicationEnv):Promise<Data|Response> {
@@ -211,6 +219,14 @@ export async function authorizeChatLive(request:Request,env:ApplicationEnv):Prom
   const origin=request.headers.get('origin');
   if(origin && origin!==new URL(env.PUBLIC_URL).origin)return json({error:'invalid_origin'},403);
   const authorization=request.headers.get('authorization');
+  const native=nativeChatCredentials(request);
+  if(native) {
+    const selected=await control(env,'chat-native-action',{...native,action:'get',parameters:{chat_id}});
+    if(!selected.ok)return selected;
+    const response=await control(env,'chat-native-auth',native);
+    if(!response.ok)return response;
+    return {chat_id,principal:(await response.json<Data>()).principal,expires_at:null};
+  }
   let actor:Data,expires_at:number|null=null;
   if(authorization?.startsWith('Bearer ')) {
     const credential=authorization.slice(7);
@@ -226,15 +242,17 @@ export async function authorizeChatLive(request:Request,env:ApplicationEnv):Prom
     const selected=await control(env,'chat-get',{chat_id},actor);
     if(!selected.ok)return selected;
   }
-  return {chat_id,account:actor.id,epoch:actor.epoch,expires_at};
+  return {chat_id,principal:{kind:'account',actor:{id:actor.id,epoch:actor.epoch}},expires_at};
 }
 
 async function chatApi(request:Request,env:ApplicationEnv,action:string):Promise<Response> {
   if(request.method!=='POST') return json({error:'method_not_allowed'},405);
   if(!chatActions.has(action)) return json({error:'unknown_action'},404);
   const supplied=await request.json<Data>();
-  const {actor:_,credential:__,chat_credential:___,source:____,csrf:_____,...args}=supplied;
+  const {actor:_,credential:__,chat_credential:___,source:____,csrf:_____,principal:______,device_key:_______,...args}=supplied;
   const authorization=request.headers.get('authorization');
+  const native=nativeChatCredentials(request);
+  if(native)return control(env,'chat-native-action',{...native,action,parameters:args});
   if(authorization?.startsWith('Bearer ')) return control(env,'chat-credential-action',{
     credential:authorization.slice(7),action,parameters:args});
   const actor=await identity(request,env);
@@ -283,8 +301,10 @@ async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response
   const match=/^\/chat\/files\/(t[1-9][0-9]*)\/(a[1-9][0-9]*)$/.exec(url.pathname);
   if(!match)return json({error:'invalid_attachment'},400);
   const authorization=request.headers.get('authorization');
+  const native=nativeChatCredentials(request);
   let response:Response;
-  if(authorization?.startsWith('Bearer ')) response=await control(env,'chat-credential-download',{
+  if(native)response=await control(env,'chat-native-download',{...native,chat_id:match[1],attachment_id:match[2]});
+  else if(authorization?.startsWith('Bearer ')) response=await control(env,'chat-credential-download',{
     credential:authorization.slice(7),chat_id:match[1],attachment_id:match[2]});
   else {
     const actor=await identity(request,env);
@@ -344,6 +364,11 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   }
   if(url.pathname.startsWith('/chat/api/')) return chatApi(request,env,url.pathname.slice('/chat/api/'.length));
   if(url.pathname.startsWith('/chat/files/')) return chatDownload(request,env);
+  if(url.pathname==='/chat/device/session' && request.method==='POST') {
+    const native=nativeChatCredentials(request);
+    if(!native)return json({error:'device_unauthorized',code:'device_unauthorized'},401);
+    return control(env,'chat-native-session',native);
+  }
   if((url.pathname==='/chat/device/start' || url.pathname==='/chat/device/poll') && request.method==='POST') {
     const body=await request.json<Data>();
     return control(env,url.pathname.endsWith('/start')?'chat-link-start':'chat-link-poll',body);

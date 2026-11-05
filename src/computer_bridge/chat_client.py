@@ -1,4 +1,4 @@
-"""Account-authorized chat transport, independent of the computer's device socket."""
+"""Device-native or explicitly account-authorized human chat transport."""
 
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ class ChatClient:
         self.server = str(self.settings["server"]).rstrip("/")
         self.credential_file = config.with_name(config.stem + "-chat.json")
         self.credential: str | None = None
+        self.mode = "device"
+        self.connected = False
         self.device: Json = {"id": "", "name": self.settings.get("name", "本机")}
         self.account: Json = {}
         self.http = http_client(self.settings)
@@ -47,8 +49,23 @@ class ChatClient:
                         traceback: TracebackType | None) -> None:
         await self.http.__aexit__(exc_type, exc, traceback)
 
-    async def _post(self, path: str, body: Json, *, authenticated: bool = True) -> Json:
-        headers = {"Authorization": "Bearer " + self.credential} if authenticated and self.credential else {}
+    @property
+    def authenticated(self) -> bool:
+        return self.connected and (self.mode == "device" or bool(self.credential))
+
+    @property
+    def identity(self) -> str:
+        return "account:" + str(self.account["id"]) if self.mode == "account" else "device:" + str(self.settings["device_id"])
+
+    def headers(self) -> dict[str, str]:
+        if self.mode == "device":
+            return {"Authorization": "Bearer " + str(self.settings["device_key"]),
+                    "X-Computer-Bridge-Device": str(self.settings["device_id"])}
+        return {"Authorization": "Bearer " + str(self.credential)}
+
+    async def _post(self, path: str, body: Json, *, authenticated: bool = True,
+                    headers: dict[str, str] | None = None) -> Json:
+        headers = headers if headers is not None else self.headers() if authenticated else {}
         response = await self.http.post(self.server + path, json=body, headers=headers)
         if response.headers.get("content-type", "").startswith("application/json"):
             result = response.json()
@@ -59,60 +76,84 @@ class ChatClient:
                     message = str(error.get("message", "聊天请求失败"))
                 else:
                     code, message = str(result.get("code", "chat_error")), str(error)
-                if response.status_code == 401:
-                    self.credential_file.unlink(missing_ok=True)
-                    self.credential = None
-                    message += "；请退出后使用 chat --login 重新连接账号。"
+                if response.status_code == 401 and authenticated:
+                    if self.mode == "account":
+                        self.credential_file.unlink(missing_ok=True)
+                        self.credential = None
+                        message += "；请使用 /login 重新登录，或 /logout 返回本机身份。"
+                    else:
+                        self.connected = False
+                        message += "；请检查本机注册是否有效。"
                 raise Error(code, message)
             return result
         response.raise_for_status()
         raise Error("chat_response", "服务器没有返回聊天数据，请确认服务器已安装聊天功能。")
 
     async def action(self, action: str, **parameters: object) -> Json:
-        if not self.credential:
-            raise Error("chat_login_required", "请使用 chat --login 连接账号。")
+        if not self.authenticated:
+            raise Error("chat_login_required", "聊天身份不可用；账号模式可使用 /login 重新登录。")
         return await self._post("/chat/api/" + action, parameters)
 
     @asynccontextmanager
     async def live(self, chat_id: str) -> AsyncIterator[ClientConnection]:
         """Receive human-chat notifications without occupying the device/model connection."""
-        if not self.credential:
-            raise Error("chat_login_required", "请使用 chat --login 连接账号。")
+        if not self.authenticated:
+            raise Error("chat_login_required", "聊天身份不可用；账号模式可使用 /login 重新登录。")
         url = self.server.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
         try:
             async with connect(url + "/chat/live?" + urlencode({"chat_id": chat_id}),
-                additional_headers={"Authorization": "Bearer " + self.credential},
+                additional_headers=self.headers(),
                 proxy=proxy_for(self.settings), open_timeout=30, ping_interval=30,
                 ping_timeout=60, close_timeout=5, max_size=65536) as socket:
                 yield socket
         except InvalidStatus as exc:
-            if exc.response.status_code in (401, 403):
-                self.credential_file.unlink(missing_ok=True)
-                self.credential = None
-                raise Error("chat_login_required", "聊天授权已失效；请退出后使用 chat --login 重新连接账号。") from exc
+            if exc.response.status_code == 403:
+                raise Error("device_forbidden", "这段对话不可访问；使用 /resume 选择有权访问的对话。") from exc
+            if exc.response.status_code == 401:
+                if self.mode == "account":
+                    self.credential_file.unlink(missing_ok=True)
+                    self.credential = None
+                raise Error("chat_login_required", "聊天访问已失效；账号模式可用 /login 重新登录，或 /logout 返回本机身份。") from exc
             raise
 
     async def connect(self, *, browser: bool = True, login: bool = False, notice: Callable[[str], None] = print) -> None:
-        if not login and self.credential_file.exists():
+        await self.use_device()
+        if login:
+            await self.login_account(browser=browser, notice=notice)
+
+    async def use_device(self) -> None:
+        result = await self._post("/chat/device/session", {}, authenticated=False, headers={
+            "Authorization": "Bearer " + str(self.settings["device_key"]),
+            "X-Computer-Bridge-Device": str(self.settings["device_id"]),
+        })
+        self.device = result["device"]
+        self.mode, self.credential, self.account, self.connected = "device", None, {}, True
+
+    async def logout(self) -> None:
+        await self.use_device()
+        self.credential_file.unlink(missing_ok=True)
+
+    async def login_account(self, *, browser: bool = True, notice: Callable[[str], None] = print) -> None:
+        if self.credential_file.exists():
             saved = json.loads(self.credential_file.read_text(encoding="utf-8"))
-            if saved.get("server") == self.server and saved.get("device_id") == self.settings["device_id"]:
-                self.credential = saved.get("credential")
-                self.device = saved.get("device", self.device)
-                self.account = saved.get("account", {})
+            if saved.get("server") == self.server and saved.get("scope") == "account" and saved.get("device_id") == self.settings["device_id"]:
                 try:
-                    await self.action("list", device_id=self.device.get("id") or self.settings["device_id"], limit=1)
-                    return
-                except Error:
-                    if self.credential is not None:
+                    await self._post("/chat/api/devices", {}, authenticated=False,
+                        headers={"Authorization": "Bearer " + str(saved["credential"])})
+                except Error as exc:
+                    if exc.code not in {"chat_login_required", "account_access_expired", "account_unavailable", "unauthorized", "auth_required", "chat_credential_invalid"}:
                         raise
+                    self.credential_file.unlink(missing_ok=True)
+                else:
+                    self.credential, self.account = str(saved["credential"]), saved["account"]
+                    self.mode, self.connected = "account", True
+                    return
         pending = await self._post("/chat/device/start", {
-            "device_id": self.settings["device_id"], "device_key": self.settings["device_key"],
+            "device_id": self.settings["device_id"], "device_key": self.settings["device_key"], "scope": "account",
         }, authenticated=False)
-        notice("请在浏览器登录并连接终端聊天：\n" + str(pending["verification_url"]))
-        notice("配对码：" + str(pending["code"]))
+        notice("请在浏览器登录账号：\n" + str(pending["verification_url"]) + "\n配对码：" + str(pending["code"]))
         if browser:
             webbrowser.open(str(pending["verification_url"]))
-        # The browser grants a human account credential. The computer's key never becomes it.
         expires = float(pending["expires_at"])
         if expires > 10_000_000_000:
             expires /= 1000
@@ -121,20 +162,19 @@ class ChatClient:
                 "request_id": pending["request_id"], "poll_token": pending["poll_token"],
             }, authenticated=False)
             if result["state"] == "approved":
-                self.credential = str(result["credential"])
-                self.device = result["device"]
-                self.account = result["account"]
+                self.credential, self.account = str(result["credential"]), result["account"]
+                self.mode, self.connected = "account", True
                 save(self.credential_file, {
-                    "server": self.server, "device_id": self.settings["device_id"],
-                    "credential": self.credential, "device": self.device, "account": self.account,
+                    "server": self.server, "device_id": self.settings["device_id"], "scope": "account",
+                    "credential": self.credential, "account": self.account,
                 })
                 return
             if result["state"] == "expired":
                 break
             if result["state"] == "denied":
-                raise Error("chat_login_denied", "已取消终端聊天连接。")
+                raise Error("chat_login_denied", "已取消账号登录；当前身份保持不变。")
             await asyncio.sleep(2)
-        raise Error("chat_login_expired", "终端聊天连接已过期，请重新运行 chat。")
+        raise Error("chat_login_expired", "账号登录已过期，请重新使用 /login。")
 
     async def upload(self, chat_id: str, path: Path, progress: Callable[[int, int], None] | None = None) -> Json:
         path = path.expanduser().resolve(strict=True)
