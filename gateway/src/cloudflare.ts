@@ -6,13 +6,17 @@ import {cloudflareWebhookFetch} from './webhook';
 
 function keyStore(storage:DurableObjectStorage|DurableObjectTransaction):KeyStore{
   return {get:storage.get.bind(storage),put:storage.put.bind(storage),delete:storage.delete.bind(storage),
+    requestAlarm:async time=>{
+      const current=await storage.getAlarm();
+      if(current===null||time<current)await storage.setAlarm(time);
+    },
     list:<T>(options:ListOptions)=>{
       const {endBefore,...rest}=options;
       return storage.list<T>({...rest,...(endBefore?{end:endBefore}:{})});
     }};
 }
 function durableStore(storage:DurableObjectStorage):Store{
-  return {...keyStore(storage),setAlarm:time=>storage.setAlarm(time),
+  return {...keyStore(storage),setAlarm:time=>storage.transaction(tx=>keyStore(tx).requestAlarm!(time)),
     transaction:body=>storage.transaction(tx=>body(keyStore(tx)))};
 }
 
@@ -30,6 +34,7 @@ export class ComputerHub extends DurableObject<Env> {
           const result=await response.json<Record<string,any>>();
           if(!response.ok)throw new Error(result.error);return result;
         }:undefined});
+    ctx.waitUntil(this.core.chats.start().catch(error=>console.error("chat_start",error.name)));
   }
 
   async fetch(request: Request): Promise<Response> {

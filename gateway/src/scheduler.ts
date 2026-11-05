@@ -9,17 +9,22 @@ export class HubScheduler {
   }
   schedule(name:string,time:number):Promise<void>{
     return this.run(async()=>{
-      const deadlines=await this.storage.get<Record<string,number>>('runtime:deadlines') || {};
-      deadlines[name]=Math.min(deadlines[name]??Infinity,time);
-      await this.storage.put('runtime:deadlines',deadlines);
-      await this.storage.setAlarm(Math.max(Date.now()+10,Math.min(...Object.values(deadlines))));
+      const next=await this.storage.transaction(async tx=>{
+        const deadlines=await tx.get<Record<string,number>>('runtime:deadlines') || {};
+        deadlines[name]=Math.min(deadlines[name]??Infinity,time);
+        await tx.put('runtime:deadlines',deadlines);
+        return Math.max(Date.now()+10,Math.min(...Object.values(deadlines)));
+      });
+      await this.storage.setAlarm(next);
     });
   }
   fired():Promise<void>{
     return this.run(async()=>{
-      const deadlines=await this.storage.get<Record<string,number>>('runtime:deadlines') || {};
-      for(const [name,time] of Object.entries(deadlines))if(time<=Date.now())delete deadlines[name];
-      await this.storage.put('runtime:deadlines',deadlines);
+      const deadlines=await this.storage.transaction(async tx=>{
+        const deadlines=await tx.get<Record<string,number>>('runtime:deadlines') || {};
+        for(const [name,time] of Object.entries(deadlines))if(time<=Date.now())delete deadlines[name];
+        await tx.put('runtime:deadlines',deadlines);return deadlines;
+      });
       if(Object.keys(deadlines).length)await this.storage.setAlarm(Math.max(Date.now()+10,Math.min(...Object.values(deadlines))));
     });
   }

@@ -67,6 +67,8 @@ class ChatClient:
                     headers: dict[str, str] | None = None) -> Json:
         headers = headers if headers is not None else self.headers() if authenticated else {}
         response = await self.http.post(self.server + path, json=body, headers=headers)
+        if response.status_code >= 500:
+            response.raise_for_status()
         if response.headers.get("content-type", "").startswith("application/json"):
             result = response.json()
             if not response.is_success or "error" in result:

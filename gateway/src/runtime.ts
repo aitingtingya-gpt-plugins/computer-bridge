@@ -6,6 +6,8 @@ export interface KeyStore {
   put<T = unknown>(entries: Record<string, T>): Promise<void>;
   delete(key: string | string[]): Promise<unknown>;
   list<T = unknown>(options: ListOptions): Promise<Map<string, T>>;
+  /** Arm a durable wake in the same transaction as newly queued work. */
+  requestAlarm?(time:number):Promise<void>;
 }
 
 export interface Store extends KeyStore {

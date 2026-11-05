@@ -52,7 +52,14 @@ Enter 发送 · Alt+Enter 换行 · PageUp/PageDown 滚动 · Ctrl+Q 退出
 """
 
 STATES = {"waiting": "等待模型连接", "connected": "模型已连接", "expired": "模型连接已到期"}
-DELIVERIES = {"pending": "待投递", "delivered": "已送达宿主", "replied": "已回复", "failed": "投递失败", "none": ""}
+NOTIFICATIONS = {"waiting": "等待接收方上线", "pending": "等待通知", "unreachable": "暂不可达",
+                 "received": "宿主已接收", "blocked": "通知配置异常", "none": ""}
+
+def message_status(message: Json) -> str:
+    parts = ["已保存", NOTIFICATIONS.get(message.get("notification", {}).get("state", "none"), "")]
+    if message.get("reply", {}).get("state") == "replied" or message.get("delivery") == "replied":
+        parts.append("已回复")
+    return " · ".join(part for part in parts if part)
 
 
 class ChatTerminal:
@@ -161,7 +168,7 @@ class ChatTerminal:
             rows.append("↑ /history 读取更早消息\n")
         for message in sorted(self.messages.values(), key=lambda item: item["sequence"]):
             sender = "GPT / Dot" if message["role"] == "assistant" else "你"
-            delivery = DELIVERIES.get(message.get("delivery", "none"), "")
+            delivery = message_status(message)
             rows.append(f"{sender} · {message['id']} · {message.get('created_at', '')}  {delivery}\n{message['text']}")
             for attachment in message.get("attachments", []):
                 rows.append(f"  ↳ {attachment['id']}  {attachment['name']}  ({attachment['size']} 字节)")
@@ -512,13 +519,17 @@ class ChatTerminal:
             raise Error("chat_pending", "上一条消息的发送结果尚未确认，请先使用 /retry。")
         self.pending_sends[chat_id] = body
         async with self.refreshing:
-            result = await self.client.action("send", **body)
+            try:
+                result = await self.client.action("send", **body)
+            except Error:
+                self.pending_sends.pop(chat_id, None)
+                raise
             self.pending_sends.pop(chat_id, None)
             self.chat = result["chat"]
             message = result["message"]
             self.messages[int(message["sequence"])] = message
             self.attachments.clear()
-            self.notice = "消息已保存；" + DELIVERIES.get(message.get("delivery", "pending"), "待投递")
+            self.notice = message_status(message)
             self.render()
 
     async def submit(self, value: str) -> None:
@@ -532,7 +543,7 @@ class ChatTerminal:
                         "attachments": [item["id"] for item in self.attachments],
                         "request_key": secrets.token_hex(12), "source": "tui"})
             except (Error, OSError, ValueError, httpx2.HTTPError) as exc:
-                self.notice = str(exc) + (" /retry 可确认原消息的发送结果。" if self.unsent else "")
+                self.notice = str(exc) + (" 结果待确认；/retry 查询原消息，不会重复发送。" if self.unsent else "")
                 self.application.invalidate()
 
     async def command(self, name: str, argument: str) -> None:
@@ -584,8 +595,8 @@ class ChatTerminal:
             chat_id = self.require_chat()
             self.note(f"连接 ID：{chat_id} · {self.chat['device_name'] if self.chat else ''}\n"
                 f"在 Work 或 Dot 启用 Computer Bridge 后发送：\n连接对话 {chat_id}：先调用 chat.resume，"
-                "再使用宿主的事件任务订阅 chat.message；订阅成功后，通过 chat.reply 回复。\n"
-                "chat.resume 返回 subscribed:false 时仍在等待订阅。获取 ID 不会连接或替换模型；"
+                "取得凭据后即可通过 chat.reply 保存回复；再使用宿主的事件任务订阅 chat.message 接收通知。\n"
+                "chat.resume 返回 subscribed:false 仅表示通知尚未连接，不影响保存回复。获取 ID 不会连接或替换模型；"
                 "已被其他模型对话使用时会显示占用。收到 chat.message 后使用事件中的 connection 直接回复，不要重新 resume。")
         elif name == "/timing":
             result = await self.client.action("timing", chat_id=self.require_chat(),

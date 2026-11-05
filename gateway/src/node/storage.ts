@@ -66,6 +66,10 @@ class DirectStore implements KeyStore {
   async list<T>(options:ListOptions): Promise<Map<string,T>> {
     return new Map(this.db.page(this.namespace,options).map(row => [row.key,JSON.parse(row.value) as T]));
   }
+  async requestAlarm(time:number):Promise<void> {
+    const current=await this.get<number>('runtime:alarm');
+    if(current===undefined||time<current)await this.put('runtime:alarm',time);
+  }
 }
 
 export class SQLiteStore implements Store {
@@ -80,13 +84,15 @@ export class SQLiteStore implements Store {
   transaction<T>(body: (transaction: KeyStore) => Promise<T>): Promise<T> {
     return this.db.run(async () => {
       this.db.sql.exec("BEGIN IMMEDIATE");
-      try {const result = await body(this.direct);this.db.sql.exec("COMMIT");return result;}
+      let result:T,alarm:number|undefined;
+      try {result=await body(this.direct);alarm=await this.direct.get<number>('runtime:alarm');this.db.sql.exec("COMMIT");}
       catch (error) {this.db.sql.exec("ROLLBACK");throw error;}
+      if(alarm!==undefined)this.schedule(alarm);
+      return result;
     });
   }
   async setAlarm(time: number): Promise<void> {
-    await this.put("runtime:alarm",time);
-    this.schedule(time);
+    await this.transaction(tx=>tx.requestAlarm!(time));
   }
   private schedule(time: number): void {
     clearTimeout(this.alarm);

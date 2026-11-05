@@ -52,6 +52,7 @@ const core = new ComputerHubCore({storage,
   equal: timingSafeEqual}, serviceSettings);
 storage.onAlarm = () => core.alarm();
 await storage.restoreAlarm();
+void core.chats.start().catch(error=>console.error("chat_start",error.name));
 const env: ApplicationEnv = {...serviceSettings,
   OAUTH_KV: new OAuthKV(db) as unknown as KVNamespace, service: request => core.fetch(request)};
 const context = {waitUntil: (work: Promise<unknown>) => {void work.catch(console.error);},
