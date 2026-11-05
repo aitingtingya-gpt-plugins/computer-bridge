@@ -43,11 +43,12 @@ def main() -> None:
                 "install-windows.ps1": ROOT / "installers/source/install-windows.ps1",
                 "install.cmd": ROOT / "installers/install.cmd",
                 "computer-bridge.cmd": ROOT / "installers/computer-bridge.cmd",
+                "chat.cmd": ROOT / "installers/chat.cmd",
             }.items():
                 text = source.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\n", "\r\n")
                 (client / name).write_bytes(text.encode("utf-8-sig" if name.endswith(".ps1") else "ascii"))
         else:
-            for name in ("install-macos.command", "computer-bridge.command"):
+            for name in ("install-macos.command", "computer-bridge.command", "chat-macos.command"):
                 shutil.copyfile(ROOT / "installers/source" / name, client / name)
                 (client / name).chmod(0o755)
     server = folder / "server"

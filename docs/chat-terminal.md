@@ -1,5 +1,7 @@
 # 终端聊天
 
+使用源码安装包时，Mac 可双击 `chat-macos.command`，Windows 可双击 `chat.cmd`。安装后也会在本机 `.computer-bridge` 目录保留聊天入口：Mac 为 `chat.command`，Windows 为 `chat.cmd`；它会使用当前已安装版本。
+
 Computer Bridge 的终端聊天与已经注册的本机绑定，通过同一服务器收发消息。它不会启动另一个电脑连接，也不会中断正在运行的命令。
 
 ```sh

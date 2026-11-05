@@ -213,6 +213,11 @@ def main(*, connection_timeout: float = 90) -> None:
         run("-m", "computer_bridge", "install-service")
         run("-m", "computer_bridge", "status")
         wait_connected(destination, active, previous_revision, seconds=connection_timeout)
+        chat_entry = "chat.cmd" if os.name == "nt" else "chat-macos.command"
+        chat_target = destination / ("chat.cmd" if os.name == "nt" else "chat.command")
+        shutil.copyfile(source / chat_entry, chat_target)
+        if os.name != "nt":
+            chat_target.chmod(0o755)
     except Exception:
         if migration:
             migration.close()
