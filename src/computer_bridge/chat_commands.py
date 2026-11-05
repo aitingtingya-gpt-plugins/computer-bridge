@@ -5,8 +5,8 @@ from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
 
 
@@ -32,6 +32,7 @@ COMMANDS = (
     Command("/logout", "", "返回本机身份"),
     Command("/title", "新标题", "修改当前对话标题", True),
     Command("/history", "", "读取更早的消息"),
+    Command("/math", "[消息 ID]", "选择科研公式并打开本机完整排版"),
     Command("/read", "附件 ID", "查看文本附件，例如 a1", True),
     Command("/download", "附件 ID [路径]", "下载附件并校验 SHA256", True),
     Command("/connect", "", "获取连接 ID 和模型连接步骤"),

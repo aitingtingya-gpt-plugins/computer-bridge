@@ -1,7 +1,8 @@
 """Incremental terminal history with inline, keyboard-accessible approval cards."""
 from __future__ import annotations
 
-from bisect import bisect_right, insort
+import asyncio
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -10,11 +11,13 @@ from typing import Any
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.data_structures import Point
-from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import Window
+from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 
+from .chat_markdown import Body, MarkdownWorker
 from .common import Json
 
 Fragment = tuple[str, str, tuple[str, str] | None]
@@ -61,6 +64,7 @@ def wrap_row(row: Row, width: int) -> list[DisplayRow]:
 
 class TranscriptWindow(Window):
     """The transcript owns its viewport; keyboard focus does not scroll it."""
+    content: ChatTranscript
 
     def __init__(self, content: ChatTranscript, **kwargs: Any):
         super().__init__(content, wrap_lines=False, **kwargs)
@@ -109,6 +113,45 @@ class ChatTranscript(UIControl):
         self.selected: tuple[str, str] | None = None
         self.pending_count = 0
         self.formatted_messages = 0
+        self.markdown: MarkdownWorker | None = None
+        self.documents: dict[int, tuple[str,int,Body]] = {}
+        self.source_positions: dict[int, list[int]] = {}
+        self.format_width = 80
+        self.ready_documents: dict[int,tuple[str,int,Body]] = {}
+        self.document_flush: asyncio.TimerHandle | None = None
+
+    def _apply_documents(self) -> None:
+        self.document_flush=None
+        anchor=self._anchor();changed=False
+        for sequence,(text,columns,body) in self.ready_documents.items():
+            current=self.messages.get(sequence)
+            if current is not None and current['text']==text and self.format_width==columns:
+                self.documents[sequence]=(text,columns,body)
+                self.bodies.pop(sequence,None)
+                self.lines[sequence]=self._format(current);changed=True
+        self.ready_documents.clear()
+        if changed:self._index(anchor);get_app().invalidate()
+
+    def _prepare_body(self, sequence: int, message: Json) -> None:
+        if self.markdown is None:
+            return
+        worker=self.markdown
+        text, columns = str(message['text']), self.format_width
+        cached=self.documents.get(sequence)
+        if cached and cached[:2] == (text,columns):
+            return
+        key=(str(message['id']),columns)
+        if key in self.markdown.tasks:
+            return
+        async def prepare() -> None:
+            try:
+                body=await worker.body(text,str(message['id']),columns)
+                self.ready_documents[sequence]=(text,columns,body)
+                if self.document_flush is None:
+                    self.document_flush=asyncio.get_running_loop().call_later(1/30,self._apply_documents)
+            finally:
+                if worker.tasks.get(key) is asyncio.current_task():worker.tasks.pop(key,None)
+        self.markdown.tasks[key]=asyncio.create_task(prepare())
 
     @staticmethod
     def row(text: str, style: str = "") -> Row:
@@ -154,8 +197,19 @@ class ChatTranscript(UIControl):
         sequence = int(message["sequence"])
         previous = self.bodies.get(sequence)
         if previous is None or previous[0] != signature:
-            body = [self.row(line) for line in message["text"].split("\n")]
+            self._prepare_body(sequence,message)
+            document=self.documents.get(sequence)
+            if document and document[0]==message['text']:
+                body=list(document[2].rows)
+                positions=list(document[2].sources)
+            else:
+                raw=message['text'].split('\n')
+                body=[self.row(line) for line in raw]
+                positions=[];offset=0
+                for line in raw:positions.append(offset);offset+=len(line)+1
             body.extend(self.row(f"  ↳ {file['id']}  {file['name']}  ({file['size']} 字节)") for file in message.get("attachments", []))
+            positions.extend([len(message['text'])]*(len(body)-len(positions)))
+            self.source_positions[sequence]=[-1,*positions,len(message['text'])+1]
             self.bodies[sequence] = signature, body
         else:
             body = previous[1]
@@ -166,6 +220,12 @@ class ChatTranscript(UIControl):
         anchor = self._anchor()
         changed = reset
         if reset:
+            if self.markdown:
+                for task in tuple(self.markdown.tasks.values()):task.cancel()
+                self.markdown.tasks.clear()
+            self.documents.clear();self.source_positions.clear()
+            self.ready_documents.clear()
+            if self.document_flush:self.document_flush.cancel();self.document_flush=None
             self.messages.clear(); self.order.clear(); self.lines.clear()
             self.bodies.clear()
             self.segment_actions.clear()
@@ -203,7 +263,12 @@ class ChatTranscript(UIControl):
             sequence = self.order[index]
             offset = logical - self.starts[index]
             if offset < len(self.lines[sequence]):
-                return sequence, offset, line.start
+                positions=self.source_positions.get(sequence)
+                character=line.start
+                if positions:
+                    first=bisect_left(positions,positions[offset])
+                    character+=sum(sum(len(text) for _,text,_ in row) for row in self.lines[sequence][first:offset])
+                return sequence, positions[offset] if positions else offset, character
         return None, logical, line.start
 
     def _index(self, anchor: Anchor | None = None) -> None:
@@ -241,6 +306,10 @@ class ChatTranscript(UIControl):
 
     def _layout(self, width: int, height: int) -> None:
         width, height = max(1, width), max(1, height)
+        if width != self.format_width:
+            self.format_width=width
+            for sequence in self.order:
+                if self.messages[sequence].get('kind')!='approval':self._prepare_body(sequence,self.messages[sequence])
         anchor = self._anchor()
         if self.dirty or width != self.width:
             cache = self.wrap_cache if width == self.width else {}
@@ -262,10 +331,18 @@ class ChatTranscript(UIControl):
             self.dirty = False
             self.width = width
             if anchor is not None and not self.following:
-                sequence, logical, character = anchor
-                if sequence is not None and sequence in self.messages:
-                    index = bisect_right(self.order, sequence) - 1
-                    logical = self.starts[index] + min(logical, max(0, len(self.lines[sequence]) - 1))
+                anchor_sequence, logical, character = anchor
+                if anchor_sequence is not None and anchor_sequence in self.messages:
+                    index = bisect_right(self.order, anchor_sequence) - 1
+                    positions=self.source_positions.get(anchor_sequence)
+                    offset=max(0,bisect_left(positions,logical)) if positions else logical
+                    if positions:
+                        offset=min(offset,len(positions)-1)
+                        while offset+1<len(positions) and positions[offset+1]==positions[offset]:
+                            size=sum(len(text) for _,text,_ in self.lines[anchor_sequence][offset])
+                            if character<size:break
+                            character-=size;offset+=1
+                    logical = self.starts[index] + min(offset, max(0, len(self.lines[anchor_sequence]) - 1))
                 logical = min(logical, self.count - 1)
                 segments = self.display_rows[logical]
                 part = max(0, bisect_right([row.start for row in segments], character) - 1)
@@ -283,7 +360,7 @@ class ChatTranscript(UIControl):
     def create_content(self, width: int, height: int) -> UIContent:
         self._layout(width, height)
         focused = get_app().layout.current_control is self
-        def line(index: int) -> list[tuple[str, str]]:
+        def line(index: int) -> StyleAndTextTuples:
             return [(style + (" class:approval.selected" if focused and action == self.selected and action else ""), text)
                     for style, text, action in self._screen_row(index).fragments]
         return UIContent(get_line=line, line_count=self.display_count, cursor_position=Point(x=0, y=self.top), show_cursor=False)

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import secrets
+import tempfile
 import time
 from pathlib import Path
 
@@ -21,12 +22,14 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.layout.menus import CompletionsMenu
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import Style, merge_styles, style_from_pygments_cls
 from prompt_toolkit.widgets import Dialog, Frame, Label, TextArea
+from pygments.styles import get_style_by_name  # type: ignore[import-untyped]
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
 from .chat_commands import BY_NAME, HELP, CommandCompleter, SlashMenu
+from .chat_markdown import MarkdownWorker, has_math, preview
 from .chat_transcript import ChatTranscript, TranscriptWindow
 from .common import Error, Json
 
@@ -68,6 +71,9 @@ class ChatTerminal:
         self.render_notification_at: float | None = None
         self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ", completer=CommandCompleter(), complete_while_typing=False)
         self.transcript = ChatTranscript(message_status, self.decide_approval)
+        self.markdown = MarkdownWorker()
+        self.transcript.markdown = self.markdown
+        self.previews = tempfile.TemporaryDirectory(prefix='computer-bridge-formulas-')
         self.transcript_window = TranscriptWindow(self.transcript, right_margins=[ScrollbarMargin(display_arrows=True)])
         keys = KeyBindings()
 
@@ -180,7 +186,7 @@ class ChatTerminal:
         self.layout = FloatContainer(content=layout, floats=[Float(xcursor=True, ycursor=True,
             content=CompletionsMenu(max_height=8, display_arrows=True, extra_filter=input_focused))])
         self.application: Application[None] = Application(layout=Layout(self.layout, focused_element=self.input),
-            key_bindings=keys, full_screen=True, mouse_support=True, min_redraw_interval=1/30, after_render=after_render, style=Style.from_dict({
+            key_bindings=keys, full_screen=True, mouse_support=True, min_redraw_interval=1/30, after_render=after_render, style=merge_styles([style_from_pygments_cls(get_style_by_name('native')),Style.from_dict({
                 "header": "bg:#163b36 #e9f6f1 bold", "status": "#72c5af", "hint": "#8c999b",
                 "frame.label": "#72c5af bold", "frame.border": "#4b6260", "text-area": "#e3ebea",
                 "completion-menu.completion": "bg:#163b36 #e3ebea",
@@ -191,7 +197,9 @@ class ChatTerminal:
                 "approval.selected": "bg:#276256 #ffffff bold",
                 "dialog.body": "bg:#163b36 #e3ebea", "chat-choice": "bg:#163b36 #e3ebea",
                 "chat-choice.selected": "bg:#276256 #ffffff bold", "chat-choice.time": "#a0b9b2",
-            }))
+                "md.heading": "#79d6bc bold", "md.code": "#e0ba86", "md.math": "#d3e9ff",
+                "md.math_hint": "#8eafb4", "md.link": "#83b8e8 underline",
+            })]))
         self.application.ttimeoutlen = 0.1
         self.slash = SlashMenu(self.input.buffer, lambda: self.application.layout.current_control is self.input.control)
 
@@ -570,6 +578,21 @@ class ChatTerminal:
             self.has_older = bool(result.get("has_older", False))
             self.notice = "已加载更早消息；PageUp 向上查看。"
             self.render(result["messages"])
+        elif name == "/math":
+            self.require_chat()
+            candidates=[item for item in self.messages.values() if item.get('kind')!='approval' and has_math(item['text'])]
+            if argument:
+                selected=next((item for item in candidates if item['id']==argument),None)
+                if selected is None:raise Error('chat_math_missing','该消息没有可查看的公式，或尚未加载；/history 读取更早消息。')
+            else:
+                if not candidates:
+                    self.notice='已加载消息中没有数学公式。';return
+                chosen=await self.choose('选择公式消息',[(str(item['id']),' '.join(item['text'].split())[:90],str(item['id'])) for item in candidates])
+                if chosen is None:return
+                selected=next(item for item in candidates if item['id']==chosen)
+            self.notice='正在生成本机完整排版…';self.application.invalidate()
+            path=await preview(self.client.settings,selected,Path(self.previews.name))
+            self.notice='已打开完整排版 · '+str(path)
         elif name == "/connect":
             chat_id = self.require_chat()
             self.note(f"连接 ID：{chat_id} · {self.chat['device_name'] if self.chat else ''}\n"
@@ -649,6 +672,9 @@ class ChatTerminal:
             await self.application.run_async(pre_run=start)
         finally:
             await self.stop_live()
+            if self.transcript.document_flush:self.transcript.document_flush.cancel()
+            self.markdown.close()
+            self.previews.cleanup()
 
 
 async def run(config: Path, resume: str | None = None, *, browser: bool = True, login: bool = False) -> None:

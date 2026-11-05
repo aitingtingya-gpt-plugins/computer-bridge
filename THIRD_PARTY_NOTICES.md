@@ -33,3 +33,15 @@ the exact upstream license and provenance are preserved in
 `gateway/licenses/standardwebhooks-1.1.1.txt` and appended to server bundles.
 Incremental attachment digests use @noble/hashes under MIT; bundled notices
 are included by the same build process.
+
+Chat Markdown uses markdown-it (MIT), markdown-it-texmath (MIT), highlight.js
+(BSD-3-Clause), MathJax 4.1.3 and the MathJax TeX SVG font (Apache-2.0).
+The browser renderer and local SVG preview bundle carry complete dependency
+licenses. MathJax font provenance and license are in
+`gateway/licenses/mathjax-tex-font-4.1.3.txt`.
+
+Terminal presentation uses markdown-it-py 4.2.0 (MIT), mdit-py-plugins 0.6.1
+(MIT), mdurl 0.1.2 (MIT), Pygments 2.21.0 (BSD-2-Clause), and TeXicode 1.0.5
+(MIT, Darcy Zhang; https://github.com/dxddxx/TeXicode). Their license texts
+are included under `src/computer_bridge/licenses/`. The terminal adapter
+does not modify TeXicode or evaluate mathematical expressions.

@@ -1,5 +1,7 @@
 # Computer Bridge 0.2.5-beta
 
+网页和终端聊天支持 Markdown 与科研公式。网页使用 MathJax 完整数学排版；终端显示二维字符公式，`/math` 可在本机打开完整 SVG 排版，无需再次登录或安装 TeX。公式资源随产品提供，不依赖第三方渲染服务。
+
 通过标准 MCP 和 OAuth，让 GPT／Dot 直接操作已注册电脑的文件与终端，也可从终端或网页与 Work／Dot 双向聊天。支持 macOS、Windows；服务端可部署为普通 Node.js 服务、Docker 或 Cloudflare Worker。电脑操作的文件和命令输出留在对应电脑；聊天记录及主动发送的聊天附件保存在服务器。
 
 ```text

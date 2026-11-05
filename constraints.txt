@@ -33,3 +33,8 @@ socksio==1.0.0
 packaging==26.3
 prompt-toolkit==3.0.53
 wcwidth==0.9.4
+markdown-it-py==4.2.0
+mdit-py-plugins==0.6.1
+mdurl==0.1.2
+Pygments==2.21.0
+TeXicode==1.0.5

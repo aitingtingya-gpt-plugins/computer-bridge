@@ -6,6 +6,7 @@ import type {ApplicationEnv} from "./runtime";
 import {VERSION} from './releases';
 import {installedModules} from './modules';
 import {chatPage,chatBindingPage,chatStyles} from './chat_ui';
+import {markdownAsset} from './chat_assets';
 
 type AuthEnv = ApplicationEnv & {OAUTH_PROVIDER: OAuthHelpers};
 const page = (title: string, body: string, headers?: HeadersInit, pageClass = '') => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles,pageClass);
@@ -322,6 +323,7 @@ async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response
 
 async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   const url = new URL(request.url);
+  const asset=markdownAsset(url.pathname);if(asset && request.method==='GET')return asset;
   if (url.pathname === "/authorize") {
     const oauth = env.OAUTH_PROVIDER;
     if (request.method === "GET") {

@@ -40,6 +40,7 @@ def main() -> None:
     if stage.exists():
         shutil.rmtree(stage)
     stage.mkdir(parents=True)
+    subprocess.run(["node", "build-chat.mjs"], cwd=ROOT / "gateway", check=True)
     subprocess.run(["npm", "run", "build"], cwd=ROOT / "src/computer_bridge/native", check=True)
     subprocess.run([sys.executable, str(ROOT / "scripts/source_integrity.py")], check=True)
     subprocess.run(["npm", "run", "build"], cwd=ROOT / "gateway", check=True)

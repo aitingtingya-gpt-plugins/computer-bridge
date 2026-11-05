@@ -57,6 +57,7 @@ def main() -> None:
     for name in (
         "build.mjs",
         "licenses.mjs",
+        "build-chat.mjs",
         "LICENSE",
         "tsconfig.json",
         ".env.example",
