@@ -8,7 +8,7 @@ import {installedModules} from './modules';
 import {chatPage,chatBindingPage,chatStyles} from './chat_ui';
 
 type AuthEnv = ApplicationEnv & {OAUTH_PROVIDER: OAuthHelpers};
-const page = (title: string, body: string, headers?: HeadersInit) => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles);
+const page = (title: string, body: string, headers?: HeadersInit, pageClass = '') => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles,pageClass);
 const expiredCookie='bridge_admin=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0';
 
 /** Only verified application identities may become the hub's actor. Never forward a form/JSON actor. */
@@ -292,7 +292,7 @@ async function chat(request:Request,env:ApplicationEnv):Promise<Response> {
   if(request.method==='POST') return Response.redirect(env.PUBLIC_URL+url.pathname+url.search,303);
   const response=await control(env,'list',{},actor);
   const {computers}=await response.json<Data>();
-  return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''));
+  return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''),undefined,'chat-page');
 }
 
 async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response> {

@@ -14,42 +14,22 @@ import httpx2
 from prompt_toolkit.application import Application
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.containers import AnyContainer
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.margins import ScrollbarMargin
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Dialog, Frame, Label, TextArea
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
+from .chat_commands import BY_NAME, HELP, CommandCompleter
 from .common import Error, Json
-
-HELP = """/new [标题]        新建对话
-/resume             按名称选择历史对话
-/login              登录账号，使用账号有权访问的全部电脑
-/logout             返回本机身份
-/computers          选择新对话使用的电脑
-/approve            查看当前电脑的待审批命令
-/title 新标题       修改当前标题
-/list               刷新对话列表
-/more               显示下一页对话
-/history            读取更早的消息
-/attach 文件路径    添加附件（路径含空格可直接粘贴）
-/unattach           清空待发送附件
-/read a1            查看文本附件
-/download a1 [路径] 下载附件并校验 SHA256
-/connect            获取连接 ID 和 Work / Dot 连接步骤
-/timing [m1]        查看消息投递分段耗时
-/retry              重试未确认发送的消息
-/help               显示命令
-/quit               退出终端，保留模型连接
-
-Enter 发送 · Alt+Enter 换行 · PageUp/PageDown 滚动 · Ctrl+Q 退出
-"""
 
 STATES = {"waiting": "等待模型连接", "connected": "模型已连接", "expired": "模型连接已到期"}
 NOTIFICATIONS = {"waiting": "等待接收方上线", "pending": "等待通知", "unreachable": "暂不可达",
@@ -73,7 +53,6 @@ class ChatTerminal:
         self.identity_drafts: dict[str, Json] = {}
         self.chat: Json | None = None
         self.chats: list[Json] = []
-        self.list_cursor: int | None = None
         self.messages: dict[int, Json] = {}
         self.sync_cursor = 0
         self.first_cursor = 0
@@ -89,9 +68,8 @@ class ChatTerminal:
         self.live_task: asyncio.Task[None] | None = None
         self.last_notification_ms: float | None = None
         self.render_notification_at: float | None = None
-        self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ")
+        self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ", completer=CommandCompleter())
         self.transcript = TextArea(read_only=True, scrollbar=True, wrap_lines=True)
-        self.sidebar = TextArea(read_only=True, width=26, wrap_lines=True)
         keys = KeyBindings()
 
         @keys.add("enter")
@@ -99,10 +77,47 @@ class ChatTerminal:
             if self.application.layout.current_control is not self.input.control:
                 self.application.layout.focus(self.input)
                 return
+            state = self.input.buffer.complete_state
+            if state:
+                completion = state.current_completion or state.completions[0]
+                self.input.buffer.apply_completion(completion)
             value = self.input.text
+            name, _, argument = value.partition(" ")
+            command = BY_NAME.get(name.lower())
+            if command and command.required and not argument.strip():
+                if not value.endswith(" "):
+                    self.input.buffer.insert_text(" ")
+                self.notice = command.usage + " · " + command.description
+                return
             if value.strip() or self.attachments:
                 self.input.text = ""
                 self.application.create_background_task(self.submit(value))
+
+        input_focused = Condition(lambda: self.application.layout.current_control is self.input.control)
+        completing = input_focused & Condition(lambda: self.input.buffer.complete_state is not None)
+
+        @keys.add("down", filter=completing)
+        def completion_next(event: object) -> None:
+            self.input.buffer.complete_next()
+
+        @keys.add("up", filter=completing)
+        def completion_previous(event: object) -> None:
+            self.input.buffer.complete_previous()
+
+        @keys.add("tab", filter=input_focused)
+        def complete(event: object) -> None:
+            state = self.input.buffer.complete_state
+            if state:
+                selected = state.current_completion or state.completions[0]
+                self.input.buffer.apply_completion(selected)
+                if BY_NAME[selected.text].arguments:
+                    self.input.buffer.insert_text(" ")
+            else:
+                self.input.buffer.start_completion(select_first=False)
+
+        @keys.add("escape", filter=completing, eager=True)
+        def dismiss_completion(event: object) -> None:
+            self.input.buffer.cancel_completion()
 
         @keys.add("escape", "enter")
         def newline(event: object) -> None:
@@ -130,24 +145,30 @@ class ChatTerminal:
 
         layout = HSplit([
             Window(FormattedTextControl(self.header), height=2, style="class:header"),
-            VSplit([Frame(self.sidebar, title=lambda: "本机对话" if self.client.mode == "device" else "账号对话"), Frame(self.transcript, title="消息")]),
+            Frame(self.transcript, title="消息"),
             Window(FormattedTextControl(lambda: self.notice), height=2, style="class:status", wrap_lines=True),
             Frame(self.input, title=lambda: "消息" + (f" · {len(self.attachments)} 个附件" if self.attachments else "")),
-            Window(FormattedTextControl(" Enter 发送  Alt+Enter 换行  /help 命令  Ctrl+Q 退出"), height=1, style="class:hint"),
+            Window(FormattedTextControl(" / 命令  Enter 发送  Alt+Enter 换行  Ctrl+Q 退出"), height=1, style="class:hint"),
         ])
         def after_render(application: Application[None]) -> None:
             if self.render_notification_at is not None:
                 self.last_notification_ms = (time.monotonic() - self.render_notification_at) * 1000
                 self.render_notification_at = None
 
-        self.layout = FloatContainer(content=layout, floats=[])
+        self.layout = FloatContainer(content=layout, floats=[Float(xcursor=True, ycursor=True,
+            content=CompletionsMenu(max_height=8, display_arrows=True, extra_filter=input_focused))])
         self.application: Application[None] = Application(layout=Layout(self.layout, focused_element=self.input),
             key_bindings=keys, full_screen=True, mouse_support=True, after_render=after_render, style=Style.from_dict({
                 "header": "bg:#163b36 #e9f6f1 bold", "status": "#72c5af", "hint": "#8c999b",
                 "frame.label": "#72c5af bold", "frame.border": "#4b6260", "text-area": "#e3ebea",
+                "completion-menu.completion": "bg:#163b36 #e3ebea",
+                "completion-menu.completion.current": "bg:#276256 #ffffff bold",
+                "completion-menu.meta.completion": "bg:#163b36 #a0b9b2",
+                "completion-menu.meta.completion.current": "bg:#276256 #ffffff",
                 "dialog.body": "bg:#163b36 #e3ebea", "chat-choice": "bg:#163b36 #e3ebea",
                 "chat-choice.selected": "bg:#276256 #ffffff bold", "chat-choice.time": "#a0b9b2",
             }))
+        self.application.ttimeoutlen = 0.1
 
     def header(self) -> str:
         device = self.selected_device
@@ -180,15 +201,6 @@ class ChatTerminal:
         text = "\n".join(rows)
         if text != self.transcript.text:
             self.transcript.buffer.set_document(Document(text, len(text) if at_end else min(old_position, len(text))), bypass_readonly=True)
-        sidebar = "\n\n".join(
-            ("● " if self.chat and self.chat["id"] == entry["id"] else "  ")
-            + entry["id"] + "\n" + entry["title"]
-            + ("\n" + str(entry.get("device_name", entry["device_id"])) if self.client.mode == "account" else "") for entry in self.chats
-        ) or "暂无对话\n\n/new 新建"
-        if self.list_cursor is not None:
-            sidebar += "\n\n/more 下一页"
-        if sidebar != self.sidebar.text:
-            self.sidebar.text = sidebar
         self.application.invalidate()
 
     def require_chat(self) -> str:
@@ -203,10 +215,9 @@ class ChatTerminal:
     def list_scope(self) -> Json:
         return {"device_id": self.client.device["id"]} if self.client.mode == "device" else {}
 
-    async def refresh_list(self, after: int = 0) -> None:
-        result = await self.client.action("list", **self.list_scope(), after=after, limit=100)
+    async def refresh_list(self) -> None:
+        result = await self.client.action("list", **self.list_scope(), limit=100)
         self.chats = result["chats"]
-        self.list_cursor = result["next_cursor"]
         self.render()
 
     async def choose(self, title: str, choices: list[tuple[str, str, str]], *,
@@ -266,6 +277,7 @@ class ChatTerminal:
             right_margins=[ScrollbarMargin(display_arrows=True)])])
         floating = Float(content=Dialog(title=title, body=body, width=96))
         focus = self.application.layout.current_control
+        self.input.buffer.cancel_completion()
         self.layout.floats.append(floating)
         self.application.layout.focus(control)
         self.application.invalidate()
@@ -559,14 +571,6 @@ class ChatTerminal:
             await self.choose_computer()
         elif name == "/approve":
             await self.approve()
-        elif name == "/list":
-            await self.refresh_list()
-            self.notice = "使用 /resume 按名称选择对话，或 /new 新建。"
-        elif name == "/more":
-            if self.list_cursor is None:
-                self.notice = "已经是最后一页对话。"
-            else:
-                await self.refresh_list(self.list_cursor)
         elif name == "/new":
             if not self.selected_device and not await self.choose_computer():
                 return
