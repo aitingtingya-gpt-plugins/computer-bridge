@@ -218,6 +218,7 @@ def main(*, connection_timeout: float = 90) -> None:
         shutil.copyfile(source / chat_entry, chat_target)
         if os.name != "nt":
             chat_target.chmod(0o755)
+        run("-m", "computer_bridge.command_entry", "install", "--home", str(destination))
     except Exception:
         if migration:
             migration.close()
@@ -262,7 +263,7 @@ def main(*, connection_timeout: float = 90) -> None:
         except subprocess.TimeoutExpired:
             handoff.terminate()
             handoff.wait()
-    print("Computer Bridge installed. You may close the installer.", flush=True)
+    print("Computer Bridge installed. Open a new terminal and run closesi or cs to chat.", flush=True)
 
 
 if __name__ == "__main__":

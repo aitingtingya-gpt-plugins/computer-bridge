@@ -296,6 +296,7 @@ def main(argv: list[str] | None = None) -> None:
         elif name == "register":
             item.add_argument("--no-browser", action="store_true")
         elif name == "chat":
+            item.add_argument("--version", action="version", version=__version__)
             item.add_argument("--resume", metavar="t1", help="打开已有短 ID 对话")
             item.add_argument("--login", action="store_true", help="重新连接聊天账号")
             item.add_argument("--no-browser", action="store_true", help="仅显示账号连接链接")
@@ -368,3 +369,8 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         raise SystemExit(1) from exc
+
+
+def chat_main() -> None:
+    """Both short console commands use the existing terminal chat parser."""
+    main(["chat", *sys.argv[1:]])

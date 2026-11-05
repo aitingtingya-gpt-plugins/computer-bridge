@@ -1,22 +1,24 @@
 # 终端聊天
 
-使用源码安装包时，Mac 可双击 `chat-macos.command`，Windows 可双击 `chat.cmd`。安装后也会在本机 `.computer-bridge` 目录保留聊天入口：Mac 为 `chat.command`，Windows 为 `chat.cmd`；它会使用当前已安装版本。
+安装完成后，新开终端，在任意目录输入 `cs` 或 `closesi` 即可进入 TUI。Mac 和 Windows 使用相同命令，安装器自动配置当前用户的命令路径，无需激活 Python 虚拟环境。
 
 Computer Bridge 的终端聊天与已经注册的本机绑定，通过同一服务器收发消息。它不会启动另一个电脑连接，也不会中断正在运行的命令。
 
 ```sh
-computer-bridge chat
-computer-bridge chat --resume t1
+cs
+closesi
 ```
 
-第一次运行会打开服务器的账号连接页面。使用有权访问这台电脑的账号登录并确认，终端即可显示自己的对话列表。聊天凭据保存在电脑配置旁的 `device-chat.json`，与设备注册凭据分开，不保存账号密码。修改密码或撤销授权后，使用 `computer-bridge chat --login` 重新连接账号。
+第一次运行会打开服务器的账号连接页面。使用有权访问这台电脑的账号登录并确认，终端即可显示自己的对话列表。输入 `/resume` 打开会话名称列表，用方向键选择、Enter 打开，Esc 取消。聊天凭据保存在电脑配置旁的 `device-chat.json`，与设备注册凭据分开，不保存账号密码。修改密码或撤销授权后，使用 `cs --login` 重新连接账号。
 
 没有自动打开浏览器时，可以复制终端中的链接。`--no-browser` 只显示链接；`--config` 可以指定已注册电脑的配置文件。
+
+`cs --help` 查看参数，`cs --version` 查看当前版本；`cs --resume t1` 可直接打开已知短 ID。`closesi` 支持完全相同的参数。命令入口使用当前安装版本，更新后无需重新配置。原 `computer-bridge` 管理命令及双击聊天入口继续可用。
 
 ## 收发消息
 
 - `/new 标题` 新建对话；对话 ID 为 `t1`、`t2` 等递增短编号。
-- `/resume t1` 打开已有对话；`/list` 刷新列表。
+- `/resume` 按会话名称选择已有对话；方向键选择、Enter 打开、Esc 取消。`/list` 刷新侧栏列表。
 - `/title 新标题` 修改标题，ID 不变。
 - 输入消息后按 Enter 发送；Alt+Enter 换行，也可粘贴多行文字。
 - PageUp / PageDown 滚动记录，`/history` 读取更早的消息。

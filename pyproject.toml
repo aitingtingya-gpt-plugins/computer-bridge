@@ -16,6 +16,8 @@ build = ["build>=1"]
 
 [project.scripts]
 computer-bridge = "computer_bridge.cli:main"
+closesi = "computer_bridge.cli:chat_main"
+cs = "computer_bridge.cli:chat_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/computer_bridge"]

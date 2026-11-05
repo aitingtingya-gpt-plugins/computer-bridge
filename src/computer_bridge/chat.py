@@ -11,19 +11,23 @@ from pathlib import Path
 
 import httpx2
 from prompt_toolkit.application import Application
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.margins import ScrollbarMargin
 from prompt_toolkit.styles import Style
-from prompt_toolkit.widgets import Frame, TextArea
+from prompt_toolkit.widgets import Dialog, Frame, Label, TextArea
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
 from .common import Error, Json
 
 HELP = """/new [标题]        新建对话
-/resume t1          打开历史对话
+/resume             按名称选择历史对话
 /title 新标题       修改当前标题
 /list               刷新对话列表
 /more               显示下一页对话
@@ -118,10 +122,13 @@ class ChatTerminal:
                 self.last_notification_ms = (time.monotonic() - self.render_notification_at) * 1000
                 self.render_notification_at = None
 
-        self.application: Application[None] = Application(layout=Layout(layout, focused_element=self.input),
+        self.layout = FloatContainer(content=layout, floats=[])
+        self.application: Application[None] = Application(layout=Layout(self.layout, focused_element=self.input),
             key_bindings=keys, full_screen=True, mouse_support=True, after_render=after_render, style=Style.from_dict({
                 "header": "bg:#163b36 #e9f6f1 bold", "status": "#72c5af", "hint": "#8c999b",
                 "frame.label": "#72c5af bold", "frame.border": "#4b6260", "text-area": "#e3ebea",
+                "dialog.body": "bg:#163b36 #e3ebea", "chat-choice": "bg:#163b36 #e3ebea",
+                "chat-choice.selected": "bg:#276256 #ffffff bold", "chat-choice.time": "#a0b9b2",
             }))
 
     def header(self) -> str:
@@ -165,7 +172,7 @@ class ChatTerminal:
 
     def require_chat(self) -> str:
         if not self.chat:
-            raise Error("chat_required", "先输入 /new 新建对话，或 /resume t1 选择已有对话。")
+            raise Error("chat_required", "先输入 /new 新建对话，或 /resume 按名称选择已有对话。")
         return str(self.chat["id"])
 
     @property
@@ -177,6 +184,91 @@ class ChatTerminal:
         self.chats = result["chats"]
         self.list_cursor = result["next_cursor"]
         self.render()
+
+    async def choose_chat(self) -> None:
+        self.notice = "正在读取本机历史对话…"
+        self.application.invalidate()
+        choices: list[Json] = []
+        cursor: int | None = 0
+        while cursor is not None:
+            page = await self.client.action("list", device_id=self.client.device["id"], after=cursor, limit=100)
+            choices.extend(page["chats"])
+            cursor = page["next_cursor"]
+        if not choices:
+            self.notice = "这台电脑还没有历史对话；/new 新建。"
+            self.application.invalidate()
+            return
+        selected = next((index for index, entry in enumerate(choices)
+                         if self.chat and entry["id"] == self.chat["id"]), 0)
+        decision: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        keys = KeyBindings()
+
+        @keys.add("up")
+        def previous(event: object) -> None:
+            nonlocal selected
+            selected = max(0, selected - 1)
+
+        @keys.add("down")
+        def following(event: object) -> None:
+            nonlocal selected
+            selected = min(len(choices) - 1, selected + 1)
+
+        @keys.add("home")
+        def first(event: object) -> None:
+            nonlocal selected
+            selected = 0
+
+        @keys.add("end")
+        def last(event: object) -> None:
+            nonlocal selected
+            selected = len(choices) - 1
+
+        @keys.add("enter")
+        def accept(event: object) -> None:
+            if not decision.done():
+                decision.set_result(str(choices[selected]["id"]))
+
+        @keys.add("escape", eager=True)
+        def cancel(event: object) -> None:
+            if not decision.done():
+                decision.set_result(None)
+
+        def labels() -> FormattedText:
+            rows: list[tuple[str, str]] = []
+            for index, entry in enumerate(choices):
+                style = "class:chat-choice.selected" if index == selected else "class:chat-choice"
+                title = " ".join(str(entry["title"]).splitlines())
+                rows.append((style, ("› " if index == selected else "  ") + title))
+                rows.append((style + " class:chat-choice.time", "  · " + entry["created_at"].replace("T", " ").removesuffix("Z")))
+                if index < len(choices) - 1:
+                    rows.append(("", "\n"))
+            return FormattedText(rows)
+
+        control = FormattedTextControl(labels, focusable=True, key_bindings=keys, show_cursor=False,
+            get_cursor_position=lambda: Point(x=0, y=selected))
+        dialog = Dialog(title="选择历史对话", body=HSplit([
+            Label("↑ / ↓ 选择 · Enter 打开 · Esc 取消"),
+            Window(control, height=Dimension(min=1, preferred=min(14, len(choices)), max=14),
+                   right_margins=[ScrollbarMargin(display_arrows=True)]),
+        ]), width=86)
+        floating = Float(content=dialog)
+        focus = self.application.layout.current_control
+        self.layout.floats.append(floating)
+        self.application.layout.focus(control)
+        self.application.invalidate()
+        try:
+            chosen = await decision
+        finally:
+            self.layout.floats.remove(floating)
+            self.application.layout.focus(focus)
+            self.application.invalidate()
+        if chosen is None:
+            self.notice = "已取消选择，当前对话保持不变。"
+        else:
+            await self.open(chosen)
+            title = next(entry["title"] for entry in choices if entry["id"] == chosen)
+            self.notice = "已打开「" + str(title) + "」。/connect 获取连接 ID。"
+        self.application.invalidate()
 
     async def open(self, chat_id: str) -> None:
         # Keep the old conversation usable if opening the requested one fails.
@@ -318,7 +410,7 @@ class ChatTerminal:
             self.note(HELP)
         elif name == "/list":
             await self.refresh_list()
-            self.notice = "使用 /resume t1 打开对话，或 /new 新建。"
+            self.notice = "使用 /resume 按名称选择对话，或 /new 新建。"
         elif name == "/more":
             if self.list_cursor is None:
                 self.notice = "已经是最后一页对话。"
@@ -329,7 +421,10 @@ class ChatTerminal:
                 title=argument or "新的对话", request_key=secrets.token_hex(12))
             await self.open(result["chat"]["id"])
         elif name == "/resume":
-            await self.open(argument)
+            if argument:
+                await self.open(argument)
+            else:
+                await self.choose_chat()
         elif name == "/title":
             self.chat = (await self.client.action("rename", chat_id=self.require_chat(), title=argument))["chat"]
             await self.refresh_list()
@@ -408,7 +503,7 @@ class ChatTerminal:
             elif not self.chats:
                 await self.command("/new", "")
             else:
-                self.notice = "使用 /resume t1 打开对话，或 /new 新建。"
+                self.notice = "使用 /resume 按名称选择对话，或 /new 新建。"
         except (Error, OSError, httpx2.HTTPError) as exc:
             self.notice = str(exc)
             self.application.invalidate()
