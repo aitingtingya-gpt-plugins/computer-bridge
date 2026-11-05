@@ -3,18 +3,77 @@ from __future__ import annotations
 
 from bisect import bisect_right, insort
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from typing import Any
 
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.layout.controls import UIContent, UIControl
+from prompt_toolkit.layout import Window
+from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 
 from .common import Json
 
 Fragment = tuple[str, str, tuple[str, str] | None]
 Row = list[Fragment]
+Anchor = tuple[int | None, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayRow:
+    fragments: Row
+    start: int
+
+
+@lru_cache(maxsize=4096)
+def cell_width(character: str) -> int:
+    return Char(character).width
+
+
+def wrap_row(row: Row, width: int) -> list[DisplayRow]:
+    """Use the renderer's character widths, retaining styles and button actions."""
+    result: list[DisplayRow] = []
+    fragments: Row = []
+    column = offset = start = 0
+    for style, text, action in row:
+        span = 0
+        for index, character in enumerate(text):
+            size = cell_width(character)
+            if column and column + size > width:
+                if index > span:
+                    fragments.append((style, text[span:index], action))
+                result.append(DisplayRow(fragments, start))
+                fragments = []
+                start, span, column = offset, index, 0
+            column += size
+            offset += 1
+        if span < len(text):
+            fragments.append((style, text[span:], action))
+    if not result:
+        return [DisplayRow(row, 0)]
+    if fragments:
+        result.append(DisplayRow(fragments, start))
+    return result
+
+
+class TranscriptWindow(Window):
+    """The transcript owns its viewport; keyboard focus does not scroll it."""
+
+    def __init__(self, content: ChatTranscript, **kwargs: Any):
+        super().__init__(content, wrap_lines=False, **kwargs)
+
+    def _scroll(self, ui_content: UIContent, width: int, height: int) -> None:
+        self.horizontal_scroll = self.vertical_scroll_2 = 0
+        self.vertical_scroll = self.content.top
+
+    def _mouse_handler(self, mouse_event: MouseEvent) -> Any:
+        if mouse_event.event_type in {MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN}:
+            self.content.scroll(-3 if mouse_event.event_type == MouseEventType.SCROLL_UP else 3)
+            return None
+        return super()._mouse_handler(mouse_event)
 
 
 class ChatTranscript(UIControl):
@@ -33,6 +92,16 @@ class ChatTranscript(UIControl):
         self.older = False
         self.count = 1
         self.cursor = 0
+        self.top = 0
+        self.width = 0
+        self.height = 1
+        self.display_starts: list[int] = []
+        self.display_rows: list[list[DisplayRow]] = []
+        self.display_count = 1
+        self.wrap_cache: dict[int, tuple[Row, list[DisplayRow]]] = {}
+        self.dirty = True
+        self.pending_anchor: Anchor | None = None
+        self.wrap_computations = 0
         self.following = True
         self.expanded: set[str] = set()
         self.busy: set[str] = set()
@@ -122,13 +191,22 @@ class ChatTranscript(UIControl):
         if changed:
             self._index(anchor)
 
-    def _anchor(self) -> tuple[int, int] | None:
-        index = bisect_right(self.starts, self.cursor) - 1
+    def _anchor(self) -> Anchor | None:
+        if self.pending_anchor is not None:
+            return self.pending_anchor
+        if not self.display_starts:
+            return None
+        logical = bisect_right(self.display_starts, self.top) - 1
+        line = self.display_rows[logical][self.top - self.display_starts[logical]]
+        index = bisect_right(self.starts, logical) - 1
         if index >= 0 and index < len(self.order):
-            return self.order[index], self.cursor - self.starts[index]
-        return None
+            sequence = self.order[index]
+            offset = logical - self.starts[index]
+            if offset < len(self.lines[sequence]):
+                return sequence, offset, line.start
+        return None, logical, line.start
 
-    def _index(self, anchor: tuple[int, int] | None = None) -> None:
+    def _index(self, anchor: Anchor | None = None) -> None:
         self.starts = []
         self.actions = []
         self.pending_count = 0
@@ -142,13 +220,8 @@ class ChatTranscript(UIControl):
             self.actions.extend((action, count + offset) for action, offset in self.segment_actions[sequence])
             count += len(rows)
         self.count = max(1, count + len(self.footer))
-        if self.following:
-            self.cursor = self.count - 1
-        elif anchor and anchor[0] in self.messages:
-            index = bisect_right(self.order, anchor[0]) - 1
-            self.cursor = min(self.count - 1, self.starts[index] + min(anchor[1], max(0, len(self.lines[anchor[0]]) - 1)))
-        else:
-            self.cursor = min(self.cursor, self.count - 1)
+        self.dirty = True
+        self.pending_anchor = None if self.following else anchor
         if self.selected and self.selected not in [action for action, _ in self.actions]:
             self.selected = None
 
@@ -166,18 +239,66 @@ class ChatTranscript(UIControl):
             index -= int(self.older)
         return self.footer[index] if 0 <= index < len(self.footer) else self.row("")
 
+    def _layout(self, width: int, height: int) -> None:
+        width, height = max(1, width), max(1, height)
+        anchor = self._anchor()
+        if self.dirty or width != self.width:
+            cache = self.wrap_cache if width == self.width else {}
+            fresh: dict[int, tuple[Row, list[DisplayRow]]] = {}
+            self.display_starts, self.display_rows = [], []
+            count = 0
+            for index in range(self.count):
+                row = self._row(index)
+                entry = cache.get(id(row))
+                if entry is None or entry[0] is not row:
+                    entry = row, wrap_row(row, width)
+                    self.wrap_computations += 1
+                fresh[id(row)] = entry
+                self.display_starts.append(count)
+                self.display_rows.append(entry[1])
+                count += len(entry[1])
+            self.wrap_cache = fresh
+            self.display_count = count
+            self.dirty = False
+            self.width = width
+            if anchor is not None and not self.following:
+                sequence, logical, character = anchor
+                if sequence is not None and sequence in self.messages:
+                    index = bisect_right(self.order, sequence) - 1
+                    logical = self.starts[index] + min(logical, max(0, len(self.lines[sequence]) - 1))
+                logical = min(logical, self.count - 1)
+                segments = self.display_rows[logical]
+                part = max(0, bisect_right([row.start for row in segments], character) - 1)
+                self.top = self.display_starts[logical] + part
+            self.pending_anchor = None
+        self.height = height
+        maximum = max(0, self.display_count - height)
+        self.top = maximum if self.following else min(self.top, maximum)
+        self.cursor = max(0, bisect_right(self.display_starts, self.top) - 1)
+
+    def _screen_row(self, index: int) -> DisplayRow:
+        logical = bisect_right(self.display_starts, index) - 1
+        return self.display_rows[logical][index - self.display_starts[logical]]
+
     def create_content(self, width: int, height: int) -> UIContent:
+        self._layout(width, height)
         focused = get_app().layout.current_control is self
         def line(index: int) -> list[tuple[str, str]]:
             return [(style + (" class:approval.selected" if focused and action == self.selected and action else ""), text)
-                    for style, text, action in self._row(index)]
-        return UIContent(get_line=line, line_count=self.count, cursor_position=Point(x=0, y=self.cursor), show_cursor=False)
+                    for style, text, action in self._screen_row(index).fragments]
+        return UIContent(get_line=line, line_count=self.display_count, cursor_position=Point(x=0, y=self.top), show_cursor=False)
 
     def scroll(self, amount: int) -> None:
-        self.cursor = max(0, min(self.count - 1, self.cursor + amount))
-        self.following = self.cursor == self.count - 1
+        self._layout(self.width, self.height)
+        maximum = max(0, self.display_count - self.height)
+        self.top = max(0, min(maximum, self.top + amount))
+        self.following = self.top == maximum
+        self.cursor = max(0, bisect_right(self.display_starts, self.top) - 1)
         self.selected = None
         get_app().invalidate()
+
+    def page(self, direction: int) -> None:
+        self.scroll(direction * max(1, self.height - 1))
 
     def move_cursor_up(self) -> None:
         self.scroll(-1)
@@ -197,8 +318,16 @@ class ChatTranscript(UIControl):
         if not 0 <= index < len(actions):
             self.selected = None
             return False
-        self.selected, self.cursor = self.actions[index]
+        self.selected, logical = self.actions[index]
         self.following = False
+        self._layout(self.width, self.height)
+        parts = self.display_rows[logical]
+        part = next(i for i, row in enumerate(parts) if any(action == self.selected for _, _, action in row.fragments))
+        position = self.display_starts[logical] + part
+        if position < self.top:
+            self.top = position
+        elif position >= self.top + self.height:
+            self.top = position - self.height + 1
         get_app().layout.focus(self)
         get_app().invalidate()
         return True
@@ -229,9 +358,12 @@ class ChatTranscript(UIControl):
         get_app().invalidate()
 
     def mouse_handler(self, mouse_event: MouseEvent) -> Any:
+        if mouse_event.event_type in {MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN}:
+            self.scroll(-3 if mouse_event.event_type == MouseEventType.SCROLL_UP else 3)
+            return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
             position = 0
-            for _, text, action in self._row(mouse_event.position.y):
+            for _, text, action in self._screen_row(mouse_event.position.y).fragments:
                 position += len(text)
                 if position > mouse_event.position.x:
                     if action:

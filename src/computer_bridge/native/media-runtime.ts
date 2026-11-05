@@ -17,7 +17,7 @@ globalThis.console = new Console({stdout: process.stderr, stderr: process.stderr
 async function execute(request: any) {
   if (request.operation === 'web') {
     const provider = new HttpFetchProvider({maxResponseBytes: 5_000_000, maxBodyChars: 100_000,
-      timeoutMs: 30_000, maxRedirects: 5, userAgent: 'computer-bridge/0.2.5-alpha'});
+      timeoutMs: 30_000, maxRedirects: 5, userAgent: 'computer-bridge/0.2.5-beta'});
     let media = 'text/plain', rawComplete = false;
     // The pinned provider owns all retrieval and decoding. This artifact tap only
     // saves the exact bytes returned by its unchanged bounded reader, once.

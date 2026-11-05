@@ -3547,7 +3547,7 @@ async function execute(request) {
       maxBodyChars: 1e5,
       timeoutMs: 3e4,
       maxRedirects: 5,
-      userAgent: "computer-bridge/0.2.5-alpha"
+      userAgent: "computer-bridge/0.2.5-beta"
     });
     let media = "text/plain", rawComplete = false;
     const originalRead = Reflect.get(provider, "readCapped").bind(provider);

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "computer-bridge"
-version = "0.2.5a0"
+version = "0.2.5b0"
 description = "Local computer tools and optional research modules for GPT and Dot"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]

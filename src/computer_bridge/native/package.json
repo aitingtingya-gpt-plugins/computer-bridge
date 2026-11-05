@@ -1,6 +1,6 @@
 {
   "name": "computer-bridge-native",
-  "version": "0.2.5-alpha",
+  "version": "0.2.5-beta",
   "private": true,
   "type": "module",
   "engines": {

@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "computer-bridge-work-tree"
-version = "0.2.5a0"
+version = "0.2.5b0"
 description = "Optional Work Tree connection module for Computer Bridge"
 license = "MIT"
 license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12"
-dependencies = ["computer-bridge>=0.1.5,<=0.2.5a0"]
+dependencies = ["computer-bridge>=0.1.5,<=0.2.5b0"]
 
 [project.entry-points."computer_bridge.modules"]
 work-tree = "computer_bridge_work_tree:WorkTreeModule"

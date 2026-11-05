@@ -188,7 +188,7 @@ def main() -> None:
         }
         if module:
             record.update(module=module)
-            record["requires"].update(core=">=0.1.4 <=0.2.5-alpha", module_api=1)
+            record["requires"].update(core=f">=0.1.4 <={version}", module_api=1)
         if target == "module-client":
             record["dependencies"] = ["work-tree"]
         artifacts.append(record)
@@ -216,6 +216,11 @@ def main() -> None:
         **({"source_commit": revision} if revision else {}),
     }
     (output / "release-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    resources = sorted(path for path in output.iterdir() if path.is_file() and path.name != "SHA256SUMS")
+    (output / "SHA256SUMS").write_text(
+        "".join(hashlib.sha256(path.read_bytes()).hexdigest() + "  " + path.name + "\n" for path in resources),
+        encoding="utf-8",
+    )
     print(
         json.dumps(
             {"release": release_version, "directory": str(output), "assets": len(list(output.iterdir()))}

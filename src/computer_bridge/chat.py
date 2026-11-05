@@ -27,7 +27,7 @@ from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
 from .chat_commands import BY_NAME, HELP, CommandCompleter, SlashMenu
-from .chat_transcript import ChatTranscript
+from .chat_transcript import ChatTranscript, TranscriptWindow
 from .common import Error, Json
 
 STATES = {"waiting": "等待模型连接", "connected": "模型已连接", "expired": "模型连接已到期"}
@@ -68,7 +68,7 @@ class ChatTerminal:
         self.render_notification_at: float | None = None
         self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ", completer=CommandCompleter(), complete_while_typing=False)
         self.transcript = ChatTranscript(message_status, self.decide_approval)
-        self.transcript_window = Window(self.transcript, wrap_lines=True, right_margins=[ScrollbarMargin(display_arrows=True)])
+        self.transcript_window = TranscriptWindow(self.transcript, right_margins=[ScrollbarMargin(display_arrows=True)])
         keys = KeyBindings()
 
         @keys.add("enter")
@@ -96,6 +96,7 @@ class ChatTerminal:
                 self.application.create_background_task(self.submit(value))
 
         input_focused = Condition(lambda: self.application.layout.current_control is self.input.control)
+        transcript_focused = Condition(lambda: self.application.layout.current_control is self.transcript)
         completing = input_focused & Condition(lambda: self.input.buffer.complete_state is not None)
 
         @keys.add("down", filter=completing)
@@ -138,15 +139,13 @@ class ChatTerminal:
         def clear(event: object) -> None:
             self.input.text = ""
 
-        @keys.add("pageup")
+        @keys.add("pageup", filter=(input_focused & ~completing) | transcript_focused)
         def scroll_up(event: object) -> None:
-            self.transcript.scroll(-10)
+            self.transcript.page(-1)
 
-        @keys.add("pagedown")
+        @keys.add("pagedown", filter=(input_focused & ~completing) | transcript_focused)
         def scroll_down(event: object) -> None:
-            self.transcript.scroll(10)
-
-        transcript_focused = Condition(lambda: self.application.layout.current_control is self.transcript)
+            self.transcript.page(1)
 
         @keys.add("tab", filter=transcript_focused)
         def next_approval(event: object) -> None:
