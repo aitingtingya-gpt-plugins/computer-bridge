@@ -18,7 +18,7 @@ export function chatPage(actor:Data,devices:Data[],selectedDevice='',selectedCha
       <div id="chat-sidebar-resize" class="chat-resize chat-resize-side" role="separator" aria-label="调整侧栏宽度" aria-orientation="vertical" aria-controls="chat-sidebar" tabindex="0"></div>
       <button id="chat-sidebar-backdrop" class="chat-sidebar-backdrop" aria-label="关闭侧栏" type="button" hidden></button>
       <section class="chat-thread" aria-label="聊天内容">
-        <header class="chat-thread-header"><div class="chat-thread-title"><button type="button" id="chat-sidebar-open" class="chat-icon-button" aria-label="展开侧栏" title="展开侧栏" aria-controls="chat-sidebar">☰</button><div><div id="chat-heading" class="chat-heading">选择或新建对话</div><div id="chat-context" class="muted"></div></div></div>
+        <header class="chat-thread-header"><div class="chat-thread-title"><button type="button" id="chat-sidebar-open" class="chat-icon-button" aria-label="电脑与对话" title="电脑与对话" aria-controls="chat-sidebar">☰</button><div><div id="chat-heading" class="chat-heading">选择或新建对话</div><div id="chat-context" class="muted"></div></div></div>
           <div class="chat-thread-actions"><button type="button" class="secondary" id="chat-host" disabled>获取连接 ID</button><details id="chat-more" hidden><summary aria-label="对话操作">···</summary><div><button type="button" class="text-button" id="chat-rename">修改标题</button><button type="button" class="text-button danger" id="chat-delete">删除对话</button></div></details></div>
         </header>
         <div class="chat-connection"><span id="chat-status" role="status">尚未选择对话</span><span id="chat-refresh" class="muted"></span></div>
@@ -156,7 +156,7 @@ const chatScript=String.raw`<script>
       clearMessages();insertMessages(value.messages,true);
       before=value.has_older?value.first_cursor:null;updateOlder();
       if(!seen.size){const empty=document.createElement('div');empty.className='chat-empty';empty.textContent='消息会保留在这段对话中。获取连接 ID 并在 GPT／Dot 中完成订阅后即可交流。';messages.append(empty);}
-      markUpdated(value.messages);messages.scrollTop=messages.scrollHeight;retry=0;connectLive();await refreshList();if(own===generation)text.focus();
+      markUpdated(value.messages);messages.scrollTop=messages.scrollHeight;retry=0;connectLive();await refreshList();if(own===generation){window.dispatchEvent(new Event('bridge-chat-opened'));if(!window.bridgeChatLayout?.isCompact())text.focus();}
     }catch(error){if(own===generation && chat)connectLive();throw error;}
   }
   function requestSync(){

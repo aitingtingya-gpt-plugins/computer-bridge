@@ -7,9 +7,10 @@ import {VERSION} from './releases';
 import {installedModules} from './modules';
 import {chatPage,chatBindingPage,chatStyles} from './chat_ui';
 import {markdownAsset} from './chat_assets';
+import {mobileStyles} from './mobile_ui';
 
 type AuthEnv = ApplicationEnv & {OAUTH_PROVIDER: OAuthHelpers};
-const page = (title: string, body: string, headers?: HeadersInit, pageClass = '') => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles,pageClass);
+const page = (title: string, body: string, headers?: HeadersInit, pageClass = '') => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles+mobileStyles,pageClass);
 const expiredCookie='bridge_admin=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0';
 
 /** Only verified application identities may become the hub's actor. Never forward a form/JSON actor. */
