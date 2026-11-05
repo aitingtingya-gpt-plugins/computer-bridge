@@ -34,6 +34,12 @@ export class ComputerHub extends DurableObject<Env> {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if(url.pathname==='/chat/live') {
+      const identity=JSON.parse(request.headers.get('x-computer-bridge-chat')!);
+      const pair=new WebSocketPair();
+      await this.core.acceptChat(pair[1],identity);
+      return new Response(null,{status:101,webSocket:pair[0]});
+    }
     if (url.pathname !== "/device/connect") return this.core.fetch(request);
     const id = url.searchParams.get("id")!;
     const key = request.headers.get("authorization")?.replace(/^Bearer /, "") || "";

@@ -11,15 +11,19 @@ import os
 import secrets
 import time
 import webbrowser
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path, PureWindowsPath
 from types import TracebackType
 from typing import Self
+from urllib.parse import urlencode
 
 import httpx2
+from websockets.asyncio.client import ClientConnection, connect
+from websockets.exceptions import InvalidStatus
 
 from .common import Error, Json, save
-from .network import http_client
+from .network import http_client, proxy_for
 
 
 class ChatClient:
@@ -68,6 +72,25 @@ class ChatClient:
         if not self.credential:
             raise Error("chat_login_required", "请使用 chat --login 连接账号。")
         return await self._post("/chat/api/" + action, parameters)
+
+    @asynccontextmanager
+    async def live(self, chat_id: str) -> AsyncIterator[ClientConnection]:
+        """Receive human-chat notifications without occupying the device/model connection."""
+        if not self.credential:
+            raise Error("chat_login_required", "请使用 chat --login 连接账号。")
+        url = self.server.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+        try:
+            async with connect(url + "/chat/live?" + urlencode({"chat_id": chat_id}),
+                additional_headers={"Authorization": "Bearer " + self.credential},
+                proxy=proxy_for(self.settings), open_timeout=30, ping_interval=30,
+                ping_timeout=60, close_timeout=5, max_size=65536) as socket:
+                yield socket
+        except InvalidStatus as exc:
+            if exc.response.status_code in (401, 403):
+                self.credential_file.unlink(missing_ok=True)
+                self.credential = None
+                raise Error("chat_login_required", "聊天授权已失效；请退出后使用 chat --login 重新连接账号。") from exc
+            raise
 
     async def connect(self, *, browser: bool = True, login: bool = False, notice: Callable[[str], None] = print) -> None:
         if not login and self.credential_file.exists():

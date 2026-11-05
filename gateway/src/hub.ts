@@ -52,7 +52,11 @@ export class ComputerHubCore {
         if(!device)throw Object.assign(new Error('电脑不存在'),{code:'device_missing'});
         return {id:await this.refs.assign('c',raw),raw,name:device.display_name || device.name,system:device.system};
       },webhookFetch:env.webhookFetch!,blobs:env.chatBlobs,
-      equal:ctx.equal,schedule:time=>this.scheduler.schedule('chat',time)});
+      equal:ctx.equal,schedule:time=>this.scheduler.schedule('chat',time),
+      changed:id=>this.notifyChat(id),background:work=>{
+        const observed=work.catch(error=>console.error('chat delivery',(error as Error).name));
+        if(ctx.waitUntil)ctx.waitUntil(observed);else void observed;
+      }});
     this.mcp = handler(this);
     this.latency=new ConnectionLatency(device=>this.transport.socket(device),
       (device,signal)=>this.rpc(device,'bridge.ping',{},false,signal));
@@ -73,6 +77,47 @@ export class ComputerHubCore {
     this.ctx.acceptWebSocket(socket, [id]);
     const device = await this.ctx.storage.get<Data>("device:" + id);
     await this.ctx.storage.put("device:" + id, {...device, connected_at: Date.now()});
+  }
+
+  async acceptChat(socket:DeviceSocket,identity:Data):Promise<void> {
+    const actor=await this.identity(identity.account,identity.epoch);
+    const {chat}=await this.chats.action('get',{chat_id:identity.chat_id},actor);
+    if(identity.expires_at!==null && identity.expires_at<=Date.now())throw new Error('Chat login expired');
+    socket.serializeAttachment({kind:'chat',account:actor.id,epoch:actor.epoch,chat_id:chat.id,
+      device_id:await this.refs.raw(chat.device_id),expires_at:identity.expires_at});
+    this.ctx.acceptWebSocket(socket,['chat-live','chat-live:'+chat.id]);
+    if(identity.expires_at!==null)await this.scheduler.schedule('chat-live',identity.expires_at);
+    socket.send(JSON.stringify({type:'chat.ready',chat_id:chat.id}));
+  }
+
+  private async notifyChat(id:string):Promise<void> {
+    await Promise.all(this.ctx.getWebSockets('chat-live:'+id).map(async socket=>{
+      const state=socket.deserializeAttachment() as Data;
+      try {
+        if(state.expires_at!==null && state.expires_at<=Date.now())throw new Error('Chat login expired');
+        const actor=await this.identity(state.account,state.epoch);
+        await this.chats.action('get',{chat_id:id},actor);
+        socket.send(JSON.stringify({type:'chat.changed',chat_id:id}));
+      } catch {socket.close(1008,'Chat access expired');}
+    }));
+  }
+
+  private closeChatSockets(account?:string,device?:string):void {
+    for(const socket of this.ctx.getWebSockets('chat-live')) {
+      const state=socket.deserializeAttachment() as Data;
+      if((!account||state.account===account)&&(!device||state.device_id===device))socket.close(1008,'Chat access expired');
+    }
+  }
+
+  private async expireChatSockets():Promise<void> {
+    let next=Infinity;
+    for(const socket of this.ctx.getWebSockets('chat-live')) {
+      const {expires_at}=socket.deserializeAttachment() as Data;
+      if(expires_at===null)continue;
+      if(expires_at<=Date.now())socket.close(1008,'Chat login expired');
+      else next=Math.min(next,expires_at);
+    }
+    if(next<Infinity)await this.scheduler.schedule('chat-live',next);
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -190,7 +235,7 @@ export class ComputerHubCore {
     if(action.startsWith('chat-'))return json(await this.chats.action(action.slice(5),value,actor));
     if(action==='accounts-profile') {
       const updated=await this.accounts.update(actor.id,{username:value.username,password:value.password});
-      if(updated.epoch!==actor.epoch) {await this.approvals.revoke(actor.id);await this.chats.revoke(actor.id);}
+      if(updated.epoch!==actor.epoch) {this.closeChatSockets(actor.id);await this.approvals.revoke(actor.id);await this.chats.revoke(actor.id);}
       return json({actor:updated});
     }
     if(['accounts-list','accounts-create','accounts-update','accounts-delete','accounts-grant','accounts-revoke'].includes(action)) {
@@ -200,15 +245,15 @@ export class ComputerHubCore {
       if(action==='accounts-update') {
         const previous=(await this.accounts.list()).find(u=>u.id===value.id);
         const updated=await this.accounts.update(value.id,{username:value.username,enabled:value.enabled,password:value.password});
-        if(updated.epoch!==previous?.epoch) {await this.approvals.revoke(value.id);await this.chats.revoke(value.id);}
+        if(updated.epoch!==previous?.epoch) {this.closeChatSockets(value.id);await this.approvals.revoke(value.id);await this.chats.revoke(value.id);}
         return json({user:updated});
       }
       if(action==='accounts-delete') {
-        await this.accounts.delete(value.id);await this.approvals.revoke(value.id);await this.chats.revoke(value.id);return json({deleted:true});
+        await this.accounts.delete(value.id);this.closeChatSockets(value.id);await this.approvals.revoke(value.id);await this.chats.revoke(value.id);return json({deleted:true});
       }
       const device=await this.refs.raw(value.id);
       if(action==='accounts-grant') await this.accounts.grant(value.user_id,device);
-      else {await this.accounts.revoke(value.user_id,device);await this.approvals.revoke(value.user_id,device);await this.chats.revoke(value.user_id,device);}
+      else {await this.accounts.revoke(value.user_id,device);this.closeChatSockets(value.user_id,device);await this.approvals.revoke(value.user_id,device);await this.chats.revoke(value.user_id,device);}
       return json({saved:true});
     }
     if(action==='list') return json(await this.list(actor));
@@ -226,7 +271,7 @@ export class ComputerHubCore {
       const device=await this.refs.raw(value.id);await this.accounts.assertAccess(actor,device);
       if(action==='remove') {
         if(actor.role==='admin') return json(await this.remove(value.id));
-        await this.accounts.revoke(actor.id,device);await this.approvals.revoke(actor.id,device);await this.chats.revoke(actor.id,device);return json({removed:true});
+        await this.accounts.revoke(actor.id,device);this.closeChatSockets(actor.id,device);await this.approvals.revoke(actor.id,device);await this.chats.revoke(actor.id,device);return json({removed:true});
       }
       if(action==='rename') return json(await this.rename(value.id,value.name));
       if(action==='lock-mode') return json(await this.lockMode(value.id,value.enabled));
@@ -471,6 +516,7 @@ export class ComputerHubCore {
 
   async remove(id: string): Promise<Data> {
     id = await this.refs.raw(id);
+    this.closeChatSockets(undefined,id);
     for (const ws of this.ctx.getWebSockets(id)) ws.close(1000, "Device removed by operator");
     for(const user of await this.accounts.grants(id)) await this.accounts.revoke(user,id);
     await this.ctx.storage.delete("device:" + id);
@@ -745,6 +791,9 @@ export class ComputerHubCore {
   }
 
   async webSocketMessage(ws: DeviceSocket, message: string | ArrayBuffer): Promise<void> {
+    if((ws.deserializeAttachment() as Data)?.kind==='chat') {
+      ws.close(1008,'Chat notifications are receive-only');return;
+    }
     const value=await this.transport.message(ws,typeof message==='string'?message:new TextDecoder().decode(message));
     if(!value) return;
     const device=(ws.deserializeAttachment() as Data).device_id;
@@ -778,6 +827,7 @@ export class ComputerHubCore {
   }
 
   async webSocketClose(ws: DeviceSocket, code: number, reason: string): Promise<void> {
+    if((ws.deserializeAttachment() as Data)?.kind==='chat')return;
     this.latency.clear(ws);
     this.transport.close(ws);
   }
@@ -785,6 +835,7 @@ export class ComputerHubCore {
 
   async alarm(): Promise<void> {
     await this.scheduler.fired();
+    await this.expireChatSockets();
     await this.chats.alarm();
     await this.approvals.expire();
     let next=Infinity;

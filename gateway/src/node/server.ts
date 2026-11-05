@@ -9,7 +9,7 @@ import {Readable} from "node:stream";
 import {pipeline} from "node:stream/promises";
 import {WebSocketServer, WebSocket} from "ws";
 import {ComputerHubCore} from "../hub";
-import {serveApplication} from "../application";
+import {serveApplication,authorizeChatLive} from "../application";
 import {Database, SQLiteStore, OAuthKV} from "./storage";
 import {chatBlobs} from './chat_blobs';
 import {nodeWebhookFetch} from './webhook';
@@ -104,12 +104,23 @@ server.on("upgrade",(request,connection,head) => {
     const url = new URL(request.url!,publicUrl);
     const id = url.searchParams.get("id") || "";
     const key = request.headers.authorization?.replace(/^Bearer /,"") || "";
-    if (url.pathname !== "/device/connect" || !await core.authorizeDevice(id,key)) {
+    let chatIdentity:Record<string,any>|undefined;
+    if(url.pathname==='/chat/live') {
+      const headers=new Headers();
+      for(const [name,value] of Object.entries(request.headers))if(value!==undefined)
+        headers.set(name,Array.isArray(value)?value.join(','):value);
+      const result=await authorizeChatLive(new Request(url,{headers}),env);
+      if(result instanceof Response) {
+        connection.end(`HTTP/1.1 ${result.status} Unauthorized\r\nConnection: close\r\n\r\n`);return;
+      }
+      chatIdentity=result;
+    } else if (url.pathname !== "/device/connect" || !await core.authorizeDevice(id,key)) {
       connection.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");return;
     }
     websocket.handleUpgrade(request,connection,head,ws => {
       const socket = new Socket(ws);
-      let messages = core.acceptDevice(socket,id);
+      let messages = chatIdentity?core.acceptChat(socket,chatIdentity):core.acceptDevice(socket,id);
+      messages=messages.catch(error=>{console.error('websocket accept',error.message);socket.close(1008,'Chat access expired');});
       ws.on("message",data => {messages = messages.then(() => core.webSocketMessage(socket,data.toString()))
         .catch(error => {console.error("device",error.message);socket.close(1011,"Device transport error");});});
       ws.on("close",(code,reason) => {sockets.delete(socket);void core.webSocketClose(socket,code,reason.toString());});

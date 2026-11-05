@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import secrets
+import time
 from pathlib import Path
 
 import httpx2
@@ -15,6 +17,7 @@ from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, TextArea
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .chat_client import ChatClient
 from .common import Error, Json
@@ -29,7 +32,8 @@ HELP = """/new [标题]        新建对话
 /unattach           清空待发送附件
 /read a1            查看文本附件
 /download a1 [路径] 下载附件并校验 SHA256
-/connect            显示 Work / Dot 连接指令
+/connect            获取连接 ID 和 Work / Dot 连接步骤
+/timing [m1]        查看消息投递分段耗时
 /retry              重试未确认发送的消息
 /help               显示命令
 /quit               退出终端，保留模型连接
@@ -49,7 +53,7 @@ class ChatTerminal:
         self.chats: list[Json] = []
         self.list_cursor: int | None = None
         self.messages: dict[int, Json] = {}
-        self.cursor = 0
+        self.sync_cursor = 0
         self.first_cursor = 0
         self.has_older = False
         self.attachments: list[Json] = []
@@ -60,6 +64,9 @@ class ChatTerminal:
         self.network_error = False
         self.commands = asyncio.Lock()
         self.refreshing = asyncio.Lock()
+        self.live_task: asyncio.Task[None] | None = None
+        self.last_notification_ms: float | None = None
+        self.render_notification_at: float | None = None
         self.input = TextArea(multiline=True, wrap_lines=True, height=4, prompt="› ")
         self.transcript = TextArea(read_only=True, scrollbar=True, wrap_lines=True)
         self.sidebar = TextArea(read_only=True, width=26, wrap_lines=True)
@@ -106,8 +113,13 @@ class ChatTerminal:
             Frame(self.input, title=lambda: "消息" + (f" · {len(self.attachments)} 个附件" if self.attachments else "")),
             Window(FormattedTextControl(" Enter 发送  Alt+Enter 换行  /help 命令  Ctrl+Q 退出"), height=1, style="class:hint"),
         ])
+        def after_render(application: Application[None]) -> None:
+            if self.render_notification_at is not None:
+                self.last_notification_ms = (time.monotonic() - self.render_notification_at) * 1000
+                self.render_notification_at = None
+
         self.application: Application[None] = Application(layout=Layout(layout, focused_element=self.input),
-            key_bindings=keys, full_screen=True, mouse_support=True, style=Style.from_dict({
+            key_bindings=keys, full_screen=True, mouse_support=True, after_render=after_render, style=Style.from_dict({
                 "header": "bg:#163b36 #e9f6f1 bold", "status": "#72c5af", "hint": "#8c999b",
                 "frame.label": "#72c5af bold", "frame.border": "#4b6260", "text-area": "#e3ebea",
             }))
@@ -139,13 +151,16 @@ class ChatTerminal:
         old_position = self.transcript.buffer.cursor_position
         at_end = self.transcript.buffer.document.is_cursor_at_the_end
         text = "\n".join(rows)
-        self.transcript.buffer.set_document(Document(text, len(text) if at_end else min(old_position, len(text))), bypass_readonly=True)
-        self.sidebar.text = "\n\n".join(
+        if text != self.transcript.text:
+            self.transcript.buffer.set_document(Document(text, len(text) if at_end else min(old_position, len(text))), bypass_readonly=True)
+        sidebar = "\n\n".join(
             ("● " if self.chat and self.chat["id"] == entry["id"] else "  ")
             + entry["id"] + "\n" + entry["title"] for entry in self.chats
         ) or "暂无对话\n\n/new 新建"
         if self.list_cursor is not None:
-            self.sidebar.text += "\n\n/more 下一页"
+            sidebar += "\n\n/more 下一页"
+        if sidebar != self.sidebar.text:
+            self.sidebar.text = sidebar
         self.application.invalidate()
 
     def require_chat(self) -> str:
@@ -164,41 +179,107 @@ class ChatTerminal:
         self.render()
 
     async def open(self, chat_id: str) -> None:
+        # Keep the old conversation usable if opening the requested one fails.
+        result = await self.client.action("sync", chat_id=chat_id, cursor=0)
+        await self.stop_live()
         async with self.refreshing:
-            result = await self.client.action("history", chat_id=chat_id, limit=50)
             if self.chat:
                 self.draft_attachments[str(self.chat["id"])] = self.attachments
             self.chat = result["chat"]
             self.messages = {int(m["sequence"]): m for m in result["messages"]}
-            self.cursor = int(result["next_cursor"])
-            self.first_cursor = int(result.get("first_cursor", 0))
-            self.has_older = bool(result.get("has_older", False))
+            self.sync_cursor = int(result["cursor"])
+            self.last_notification_ms = None
+            self.render_notification_at = None
+            self.first_cursor = min(self.messages, default=0)
+            self.has_older = self.first_cursor > 1
             self.attachments = self.draft_attachments.setdefault(chat_id, [])
             self.notes.clear()
-            self.notice = "已打开 " + chat_id + "。/connect 查看模型连接指令。"
+            self.notice = "已打开 " + chat_id + "。/connect 获取连接 ID。"
             await self.refresh_list()
             self.render()
+        self.live_task = self.application.create_background_task(self.live(chat_id))
 
-    async def poll(self) -> None:
-        while True:
-            await asyncio.sleep(2)
-            if not self.chat:
-                continue
-            try:
-                async with self.refreshing:
-                    # Include recent rows so host-delivery/reply status changes are reflected.
-                    result = await self.client.action("history", chat_id=self.chat["id"], after=max(0, self.cursor - 20), limit=50)
-                    self.chat = result["chat"]
-                    self.messages.update({int(m["sequence"]): m for m in result["messages"]})
-                    self.cursor = max(self.cursor, int(result["next_cursor"]))
-                    if self.network_error:
-                        self.network_error = False
-                        self.notice = "连接已恢复。"
+    async def stop_live(self) -> None:
+        if self.live_task:
+            self.live_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.live_task
+            self.live_task = None
+
+    async def sync(self, chat_id: str, received_at: float | None = None) -> None:
+        async with self.refreshing:
+            while self.chat and self.chat["id"] == chat_id:
+                result = await self.client.action("sync", chat_id=chat_id, cursor=self.sync_cursor)
+                changed = self.chat != result["chat"]
+                self.chat = result["chat"]
+                for message in result["messages"]:
+                    sequence = int(message["sequence"])
+                    changed = changed or self.messages.get(sequence) != message
+                    self.messages[sequence] = message
+                self.sync_cursor = int(result["cursor"])
+                if self.network_error:
+                    self.network_error = False
+                    self.notice = "实时连接已恢复。"
+                    changed = True
+                if changed:
+                    self.chats = [self.chat if item["id"] == chat_id else item for item in self.chats]
+                    if received_at is not None:
+                        self.render_notification_at = received_at
                     self.render()
-            except (Error, httpx2.HTTPError, OSError) as exc:
+                if not result["more"]:
+                    return
+
+    async def live(self, chat_id: str) -> None:
+        delay = 1
+        while self.chat and self.chat["id"] == chat_id:
+            try:
+                async with self.client.live(chat_id) as socket:
+                    dirty = asyncio.Event()
+                    dirty.set()
+                    received: list[float] = []
+
+                    async def receive(changed: asyncio.Event = dirty, arrivals: list[float] = received) -> None:
+                        async for raw in socket:
+                            event = json.loads(raw)
+                            if event.get("chat_id") == chat_id and event.get("type") in {"chat.ready", "chat.changed"}:
+                                if event["type"] == "chat.changed":
+                                    arrivals[:] = [time.monotonic()]
+                                changed.set()
+
+                    async def update(changed: asyncio.Event = dirty, arrivals: list[float] = received) -> None:
+                        nonlocal delay
+                        while True:
+                            await changed.wait()
+                            changed.clear()
+                            received_at = arrivals[0] if arrivals else None
+                            arrivals.clear()
+                            await self.sync(chat_id, received_at)
+                            delay = 1
+
+                    receiver = asyncio.create_task(receive())
+                    updater = asyncio.create_task(update())
+                    try:
+                        done, _ = await asyncio.wait((receiver, updater), return_when=asyncio.FIRST_COMPLETED)
+                        for task in done:
+                            await task
+                    finally:
+                        for task in (receiver, updater):
+                            task.cancel()
+                        await asyncio.gather(receiver, updater, return_exceptions=True)
+                raise Error("chat_live_closed", "实时连接已断开，正在重新连接。")
+            except (Error, WebSocketException, httpx2.HTTPError, OSError) as exc:
                 self.network_error = True
                 self.notice = str(exc)
+                if isinstance(exc, ConnectionClosed) and exc.rcvd and exc.rcvd.code == 1008:
+                    self.notice = "聊天访问已失效；请退出后使用 chat --login 重新连接账号。"
                 self.application.invalidate()
+                if not self.client.credential or isinstance(exc, Error) and exc.code in {
+                    "chat_not_found", "chat_login_required", "account_access_expired", "account_unavailable",
+                    "device_forbidden", "device_missing",
+                } or isinstance(exc, ConnectionClosed) and exc.rcvd and exc.rcvd.code == 1008:
+                    return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 15)
 
     async def send(self, body: Json) -> None:
         chat_id = str(body["chat_id"])
@@ -206,14 +287,15 @@ class ChatTerminal:
         if pending and body["request_key"] != pending["request_key"]:
             raise Error("chat_pending", "上一条消息的发送结果尚未确认，请先使用 /retry。")
         self.pending_sends[chat_id] = body
-        result = await self.client.action("send", **body)
-        self.pending_sends.pop(chat_id, None)
-        self.chat = result["chat"]
-        message = result["message"]
-        self.messages[int(message["sequence"])] = message
-        self.attachments.clear()
-        self.notice = "消息已保存；" + DELIVERIES.get(message.get("delivery", "pending"), "待投递")
-        self.render()
+        async with self.refreshing:
+            result = await self.client.action("send", **body)
+            self.pending_sends.pop(chat_id, None)
+            self.chat = result["chat"]
+            message = result["message"]
+            self.messages[int(message["sequence"])] = message
+            self.attachments.clear()
+            self.notice = "消息已保存；" + DELIVERIES.get(message.get("delivery", "pending"), "待投递")
+            self.render()
 
     async def submit(self, value: str) -> None:
         async with self.commands:
@@ -263,7 +345,28 @@ class ChatTerminal:
             self.render()
         elif name == "/connect":
             chat_id = self.require_chat()
-            self.note(f"在 Work 或 Dot 启用 Computer Bridge 后发送：\n连接对话 {chat_id} 并订阅新消息，收到后在这里回复。\n已被其他模型对话使用时会显示占用，不会替换原连接。")
+            self.note(f"连接 ID：{chat_id} · {self.chat['device_name'] if self.chat else ''}\n"
+                f"在 Work 或 Dot 启用 Computer Bridge 后发送：\n连接对话 {chat_id}：先调用 chat.resume，"
+                "再使用宿主的事件任务订阅 chat.message；订阅成功后，通过 chat.reply 回复。\n"
+                "chat.resume 返回 subscribed:false 时仍在等待订阅。获取 ID 不会连接或替换模型；"
+                "已被其他模型对话使用时会显示占用。")
+        elif name == "/timing":
+            result = await self.client.action("timing", chat_id=self.require_chat(),
+                **({"message_id": argument} if argument else {}))
+            if not result["timings"]:
+                self.notice = "当前对话没有可查看的消息。"
+                return
+            item = result["timings"][0]
+            rows = [f"{item['message_id']} · 投递分段耗时"]
+            for field, label in (("save_to_first_attempt_ms", "保存 → 首次投递"),
+                ("first_attempt_to_host_accept_ms", "首次投递 → 宿主接收"),
+                ("host_accept_to_reply_ms", "宿主接收 → 回复保存")):
+                value = item[field]
+                rows.append(label + "：" + (f"{value} ms" if value is not None else "尚无记录"))
+            if self.last_notification_ms is not None:
+                rows.append(f"最近一次终端通知 → 显示更新：{self.last_notification_ms:.1f} ms")
+            rows.append("宿主接收表示事件已送达，不代表模型已开始处理。")
+            self.note("\n".join(rows))
         elif name == "/attach":
             path = Path(argument.strip('"'))
             self.notice = "正在上传 " + path.name
@@ -306,7 +409,6 @@ class ChatTerminal:
                 await self.command("/new", "")
             else:
                 self.notice = "使用 /resume t1 打开对话，或 /new 新建。"
-            self.application.create_background_task(self.poll())
         except (Error, OSError, httpx2.HTTPError) as exc:
             self.notice = str(exc)
             self.application.invalidate()
@@ -314,7 +416,10 @@ class ChatTerminal:
     async def run(self) -> None:
         def start() -> None:
             self.application.create_background_task(self.initialize())
-        await self.application.run_async(pre_run=start)
+        try:
+            await self.application.run_async(pre_run=start)
+        finally:
+            await self.stop_live()
 
 
 async def run(config: Path, resume: str | None = None, *, browser: bool = True, login: bool = False) -> None:

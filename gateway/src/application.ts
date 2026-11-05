@@ -31,7 +31,7 @@ async function identity(request: Request, env: ApplicationEnv): Promise<Data | n
   if(value.expires_at<=Date.now()) return null;
   const response=await control(env,'accounts-auth',value.id?{id:value.id,epoch:value.epoch}:{legacy:true});
   const {actor}=await response.json<Data>();
-  return actor?{...actor,nonce:value.nonce}:null;
+  return actor?{...actor,nonce:value.nonce,expires_at:value.expires_at}:null;
 }
 async function sessionCookie(env: ApplicationEnv,actor:Data): Promise<string> {
   const payload = btoa(JSON.stringify({id:actor.id,epoch:actor.epoch,nonce: opaque(), expires_at: Date.now() + 3600_000}));
@@ -201,8 +201,33 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
   return env.service(new Request(request,{headers}));
 }
 
-const chatActions=new Set(['list','create','get','history','send','rename','delete','upload-start','upload-chunk',
+const chatActions=new Set(['list','create','get','history','sync','timing','send','rename','delete','upload-start','upload-chunk',
   'upload-complete','attachment','read-attachment']);
+
+/** Authenticate human-only live notifications using the same account/device checks as HTTP. */
+export async function authorizeChatLive(request:Request,env:ApplicationEnv):Promise<Data|Response> {
+  const url=new URL(request.url),chat_id=url.searchParams.get('chat_id') || '';
+  if(request.method!=='GET' || !/^t[1-9][0-9]*$/.test(chat_id))return json({error:'invalid_chat'},400);
+  const origin=request.headers.get('origin');
+  if(origin && origin!==new URL(env.PUBLIC_URL).origin)return json({error:'invalid_origin'},403);
+  const authorization=request.headers.get('authorization');
+  let actor:Data,expires_at:number|null=null;
+  if(authorization?.startsWith('Bearer ')) {
+    const credential=authorization.slice(7);
+    const selected=await control(env,'chat-credential-action',{credential,action:'get',parameters:{chat_id}});
+    if(!selected.ok)return selected;
+    const response=await control(env,'chat-credential-auth',{credential});
+    if(!response.ok)return response;
+    actor=(await response.json<Data>()).actor;
+  } else {
+    const logged=await identity(request,env);
+    if(!logged)return json({error:'login_required'},401);
+    actor=logged;expires_at=logged.expires_at;
+    const selected=await control(env,'chat-get',{chat_id},actor);
+    if(!selected.ok)return selected;
+  }
+  return {chat_id,account:actor.id,epoch:actor.epoch,expires_at};
+}
 
 async function chatApi(request:Request,env:ApplicationEnv,action:string):Promise<Response> {
   if(request.method!=='POST') return json({error:'method_not_allowed'},405);
@@ -308,6 +333,15 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   if (url.pathname === "/manage/accounts") return accountManagement(request,env);
   if (url.pathname === "/manage/profile") return profile(request,env);
   if(url.pathname==='/chat' || url.pathname==='/chat/connect') return chat(request,env);
+  if(url.pathname==='/chat/live') {
+    if(request.headers.get('upgrade')?.toLowerCase()!=='websocket')return json({error:'websocket_required'},426);
+    const identity=await authorizeChatLive(request,env);
+    if(identity instanceof Response)return identity;
+    const headers=new Headers();
+    headers.set('Upgrade','websocket');
+    headers.set('x-computer-bridge-chat',JSON.stringify(identity));
+    return env.service(new Request('https://internal/chat/live',{headers}));
+  }
   if(url.pathname.startsWith('/chat/api/')) return chatApi(request,env,url.pathname.slice('/chat/api/'.length));
   if(url.pathname.startsWith('/chat/files/')) return chatDownload(request,env);
   if((url.pathname==='/chat/device/start' || url.pathname==='/chat/device/poll') && request.method==='POST') {
