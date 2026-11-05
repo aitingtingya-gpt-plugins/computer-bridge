@@ -1,12 +1,19 @@
 import {request} from 'node:https';
 import {lookup} from 'node:dns/promises';
+import type {LookupAddress} from 'node:dns';
 import {Readable} from 'node:stream';
 import {callbackUrl,publicAddress} from '../webhook';
 
 /** Resolve on every new connection; the addresses supplied to TLS are exactly those validated. */
 export async function nodeWebhookFetch(value:string,init:RequestInit):Promise<Response>{
   const url=callbackUrl(value);
-  const addresses=await lookup(url.hostname.replace(/^\[|\]$/g,''),{all:true});
+  init.signal?.throwIfAborted();
+  const addresses=await new Promise<LookupAddress[]>((resolve,reject)=>{
+    const aborted=()=>reject(init.signal?.reason);
+    init.signal?.addEventListener('abort',aborted,{once:true});
+    lookup(url.hostname.replace(/^\[|\]$/g,''),{all:true}).then(resolve,reject)
+      .finally(()=>init.signal?.removeEventListener('abort',aborted));
+  });
   if(!addresses.length || addresses.some(item=>!publicAddress(item.address)))throw new Error('回调 DNS 必须全部解析到公共地址');
   return new Promise((resolve,reject)=>{
     const req=request(url.href,{method:init.method || 'POST',agent:false,signal:init.signal || undefined,
