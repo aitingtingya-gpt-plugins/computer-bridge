@@ -1,9 +1,9 @@
 import {DatabaseSync} from "node:sqlite";
-import type {KeyStore, Store} from "../runtime";
+import type {KeyStore, Store, ListOptions} from "../runtime";
 
 interface Row {key: string; value: string; expires: number | null; metadata: string | null}
 
-/** One ordinary SQLite file; only authentication and routing metadata are stored here. */
+/** Authentication, routing and explicitly created chat history share one SQLite file. */
 export class Database {
   readonly sql: DatabaseSync;
   private tail: Promise<unknown> = Promise.resolve();
@@ -36,6 +36,12 @@ export class Database {
       AND key>? AND (expires IS NULL OR expires>?) ORDER BY key LIMIT ?`)
       .all(namespace,prefix,prefix+"\uffff",cursor,Math.floor(Date.now()/1000),limit) as unknown as Row[];
   }
+  page(namespace:string,options:ListOptions):Row[] {
+    const {prefix,startAfter='',endBefore=prefix+'\uffff',limit=-1,reverse=false}=options;
+    return this.sql.prepare(`SELECT key,value,expires,metadata FROM kv WHERE namespace=? AND key>=? AND key<?
+      AND key>? AND key<? AND (expires IS NULL OR expires>?) ORDER BY key ${reverse?'DESC':'ASC'} LIMIT ?`)
+      .all(namespace,prefix,prefix+'\uffff',startAfter,endBefore,Math.floor(Date.now()/1000),limit) as unknown as Row[];
+  }
   async close(): Promise<void> {clearInterval(this.sweep);await this.tail;this.sql.close();}
 }
 
@@ -57,8 +63,8 @@ class DirectStore implements KeyStore {
       "DELETE FROM kv WHERE namespace=? AND key=?").run(this.namespace,item).changes);
     return removed;
   }
-  async list<T>({prefix}: {prefix: string}): Promise<Map<string,T>> {
-    return new Map(this.db.rows(this.namespace,prefix).map(row => [row.key,JSON.parse(row.value) as T]));
+  async list<T>(options:ListOptions): Promise<Map<string,T>> {
+    return new Map(this.db.page(this.namespace,options).map(row => [row.key,JSON.parse(row.value) as T]));
   }
 }
 
@@ -70,7 +76,7 @@ export class SQLiteStore implements Store {
   get<T>(key: string) {return this.db.run(() => this.direct.get<T>(key));}
   put<T>(key: string | Record<string,T>, value?: T) {return this.db.run(() => this.direct.put(key,value));}
   delete(key: string | string[]) {return this.db.run(() => this.direct.delete(key));}
-  list<T>(options: {prefix: string}) {return this.db.run(() => this.direct.list<T>(options));}
+  list<T>(options: ListOptions) {return this.db.run(() => this.direct.list<T>(options));}
   transaction<T>(body: (transaction: KeyStore) => Promise<T>): Promise<T> {
     return this.db.run(async () => {
       this.db.sql.exec("BEGIN IMMEDIATE");
@@ -84,7 +90,9 @@ export class SQLiteStore implements Store {
   }
   private schedule(time: number): void {
     clearTimeout(this.alarm);
-    this.alarm = setTimeout(() => {void this.onAlarm().then(() => this.delete("runtime:alarm")).catch(console.error);},Math.max(0,time-Date.now()));
+    this.alarm = setTimeout(() => {void this.transaction(async tx=>{
+      if(await tx.get<number>('runtime:alarm')===time)await tx.delete('runtime:alarm');
+    }).then(()=>this.onAlarm()).catch(console.error);},Math.max(0,time-Date.now()));
     this.alarm.unref();
   }
   async restoreAlarm(): Promise<void> {const time = await this.get<number>("runtime:alarm");if (time) this.schedule(time);}

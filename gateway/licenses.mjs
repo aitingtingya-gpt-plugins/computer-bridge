@@ -22,8 +22,9 @@ export async function dependencyLicenses(metafile,base=process.cwd()) {
   const notices=[];
   for(const [directory,metadata] of [...packages].sort((a,b)=>a[1].name.localeCompare(b[1].name))) {
     const files=(await readdir(directory)).filter(name=>/^(licen[cs]e|copying|notice)(\.|$)/i.test(name)).sort();
-    if(!files.length)throw new Error('License text missing for '+metadata.name);
-    const texts=await Promise.all(files.map(async name=>name+'\n'+await readFile(join(directory,name),'utf8')));
+    if(!files.length && !(metadata.name==='standardwebhooks' && metadata.version==='1.1.1'))throw new Error('License text missing for '+metadata.name);
+    const texts=files.length?await Promise.all(files.map(async name=>name+'\n'+await readFile(join(directory,name),'utf8'))):
+      [await readFile(new URL('./licenses/standardwebhooks-1.1.1.txt',import.meta.url),'utf8')];
     notices.push(metadata.name+' '+metadata.version+'\n'+texts.join('\n\n'));
   }
   return notices.join('\n\n--------------------\n\n');

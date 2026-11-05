@@ -31,6 +31,7 @@ export function devicesPage(computers: Data[], nonce: string, code: string, noti
     <div class="device-top"><span class="device-icon">${d.system === "Windows" ? monitor : laptop}</span>
       ${connectionBadge(d)}</div>
     <h2 class="device-name">${escape(d.name)}</h2><div class="device-meta"><code>${escape(d.id)}</code><span>${escape(d.system === "Darwin" ? "macOS" : d.system || "电脑")}</span></div>
+    <a class="chat-device-link" href="/chat?device=${encodeURIComponent(d.id)}" onclick="event.stopPropagation()">打开聊天 ↗</a>
     ${d.access.workspaces.some((w:Data)=>workspaceStatus(w))?'<div class="field-note">工作区有待核实或异常路径</div>':''}
     </summary><div class="device-body"><div class="modules">${d.modules?.length ? d.modules.map((m: string) => `<span class="module-tag">${escape(m === "work-tree" ? "Work Tree" : m)}</span>`).join("") : '<span>文件与终端</span>'}</div>
     <div class="device-actions"><details class="rename"><summary>修改名称</summary><form method="post" class="rename-form">

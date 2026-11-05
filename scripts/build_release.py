@@ -188,7 +188,7 @@ def main() -> None:
         }
         if module:
             record.update(module=module)
-            record["requires"].update(core=">=0.1.4 <=0.2.0", module_api=1)
+            record["requires"].update(core=">=0.1.4 <=0.2.5-alpha", module_api=1)
         if target == "module-client":
             record["dependencies"] = ["work-tree"]
         artifacts.append(record)

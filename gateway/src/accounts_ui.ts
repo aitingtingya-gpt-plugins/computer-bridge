@@ -1,7 +1,7 @@
 import {escape, type Data} from './types';
 
 export function accountNavigation(actor:Data):string {
-  return `<nav class="account-navigation" aria-label="管理导航"><div><strong>${escape(actor.username)}</strong> <code>${escape(actor.id)}</code> <span class="muted">${actor.role==='admin'?'管理员':'普通用户'}</span></div><div><a href="/manage">设备</a><a href="/manage/profile">我的账号</a>${actor.role==='admin'?'<a href="/manage/accounts">账号管理</a>':''}</div></nav>`;
+  return `<nav class="account-navigation" aria-label="管理导航"><div><strong>${escape(actor.username)}</strong> <code>${escape(actor.id)}</code> <span class="muted">${actor.role==='admin'?'管理员':'普通用户'}</span></div><div><a href="/manage">设备</a><a href="/chat">聊天</a><a href="/manage/profile">我的账号</a>${actor.role==='admin'?'<a href="/manage/accounts">账号管理</a>':''}</div></nav>`;
 }
 
 export function loginFields(username='admin'):string {

@@ -1,18 +1,27 @@
 import {McpServer, createMcpHandler, inputRequired, isLegacyRequest,
-  WebStandardStreamableHTTPServerTransport, type ServerContext, CLIENT_CAPABILITIES_META_KEY} from "@modelcontextprotocol/server";
+  WebStandardStreamableHTTPServerTransport, type ServerContext, CLIENT_CAPABILITIES_META_KEY,ProtocolError} from "@modelcontextprotocol/server";
 import {z} from "zod";
 import type {ComputerHubCore} from "./hub";
 import type {Data} from "./types";
 import {toolSpecs,serverInstructions,helpText,promptText} from "./contracts";
 import {VERSION} from './releases';
 import {commandDecision} from './approvals';
+import {chatToolSpecs,chatInstructions} from './chat_contracts';
 
 export function handler(hub: ComputerHubCore) {
   const factory = ({era}: {era: "modern" | "legacy"}) => {
-    const server = new McpServer({name: "computer-bridge", version: VERSION}, {instructions:serverInstructions});
-    for (const [name, description, schema] of toolSpecs) {
+    const server = new McpServer({name: "computer-bridge", version: VERSION}, {instructions:serverInstructions+' '+chatInstructions});
+    server.server.registerCapabilities({events:{}} as any);
+    for(const method of ['list','subscribe','unsubscribe'] as const)server.server.setRequestHandler('events/'+method,
+      {params:z.record(z.string(),z.unknown()),result:z.record(z.string(),z.unknown())},async(args,ctx)=>{
+        const actor=await hub.identity(String(ctx.http?.authInfo?.extra?.bridgeAccount || ''),Number(ctx.http?.authInfo?.extra?.bridgeEpoch));
+        const caller=String(ctx.http?.authInfo?.extra?.bridgeCaller || '');
+        try{return await hub.chats.events(method,args,actor,caller);}
+        catch(error){const e=error as Data;throw new ProtocolError(typeof e.code==='number'?e.code:-32602,e.message,e.data || {code:e.code});}
+      });
+    for (const [name, description, schema] of [...toolSpecs,...chatToolSpecs]) {
       server.registerTool(name, {description, inputSchema: schema as z.ZodObject<any>, annotations: {
-        readOnlyHint: ["computer.recover", "computer.list", "computer.workspaces", "computer.image", "computer.skills", "computer.agents", "computer.jobs", "computer.modules", "computer.module_tools"].includes(name),
+        readOnlyHint: ["computer.recover", "computer.list", "computer.workspaces", "computer.image", "computer.skills", "computer.agents", "computer.jobs", "computer.modules", "computer.module_tools","chat.list","chat.history"].includes(name),
         openWorldHint: name === "computer.exec",
       }}, async (args: any, ctx: ServerContext) => {
         try {
@@ -76,6 +85,7 @@ export function handler(hub: ComputerHubCore) {
             }
           }
           if (name === "computer.image") return {content: [result as any]};
+          if(name==='chat.attachment' && args.operation==='image')return {content:[result as any]};
           return {content: [{type: "text", text: JSON.stringify(result)}]};
         } catch (error) {
           return {isError: true, content: [{type: "text", text: JSON.stringify({error: {
@@ -87,7 +97,7 @@ export function handler(hub: ComputerHubCore) {
       });
     }
     server.registerResource("computer-bridge-help", "computer-bridge://help", {mimeType: "text/plain"}, async uri => ({
-      contents: [{uri: uri.href, text: helpText}],
+      contents: [{uri: uri.href, text: helpText+'\n'+chatInstructions}],
     }));
     server.registerPrompt("computer-bridge", {description: "Select a registered computer and use its local tools."}, async () => ({
       messages: [{role: "user", content: {type: "text", text: promptText}}],

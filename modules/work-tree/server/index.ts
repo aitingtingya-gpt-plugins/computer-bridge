@@ -1,7 +1,7 @@
 import type {GatewayModule} from '../../../gateway/src/modules';
 
 const workTree:GatewayModule={
-  id:'work-tree',version:'0.2.0',api:1,core:'>=0.1.4 <=0.2.0',
+  id:'work-tree',version:'0.2.5-alpha',api:1,core:'>=0.1.4 <=0.2.5-alpha',
   kinds:{bridge_session:'r',bridge_run:'r',step:'t',normtask:'t',run:'e',attempt:'a',changeset:'d',
     memory:'p',proposal:'p',normproposal:'p',question:'q',team:'g'},
   identityFields:['research_session','parent_session','resume','project','step','step_id','work_id','task_id',

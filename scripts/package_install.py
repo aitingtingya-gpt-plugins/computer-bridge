@@ -23,6 +23,9 @@ def main() -> None:
     shutil.copyfile(ROOT / "源码安装说明.md", folder / "安装说明.md")
     shutil.copyfile(ROOT / "适配协议.md", folder / "适配协议.md")
     shutil.copyfile(ROOT / "docs/更新与模块协议.md", folder / "更新与模块协议.md")
+    (folder / 'docs').mkdir()
+    for name in ('chat.md','chat-terminal.md'):
+        shutil.copyfile(ROOT / 'docs' / name, folder / 'docs' / name)
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
         shutil.copyfile(ROOT / name, folder / name)
     for system in ("windows", "macos"):
@@ -49,6 +52,7 @@ def main() -> None:
                 (client / name).chmod(0o755)
     server = folder / "server"
     shutil.copytree(ROOT / "gateway/src", server / "src", ignore=shutil.ignore_patterns("index-work-tree.ts"))
+    shutil.copytree(ROOT / "gateway/licenses", server / "licenses")
     for name in (
         "build.mjs",
         "licenses.mjs",

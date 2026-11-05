@@ -12,6 +12,8 @@ import {DeviceTransport} from './transport';
 import {ConnectionLatency} from './latency';
 import {RequestRecords} from './requests';
 import type {DeviceSocket, HubContext, ServiceEnv} from "./runtime";
+import {ChatService} from './chat';
+import {HubScheduler} from './scheduler';
 
 export class ComputerHubCore {
   draining=false;
@@ -26,8 +28,12 @@ export class ComputerHubCore {
   private guidance:Guidance;
   private accessUpdates=new Map<string,Promise<void>>();
   private latency:ConnectionLatency;
+  readonly chats:ChatService;
+  private scheduler:HubScheduler;
 
   constructor(private ctx: HubContext, private env: ServiceEnv) {
+    this.scheduler=new HubScheduler(ctx.storage);
+    this.ctx=ctx={...ctx,storage:this.scheduler.store()};
     this.approvals=new CommandApprovals(ctx.storage,(device,method,args)=>
       this.rpc(device,method,args,false,AbortSignal.timeout(30_000)),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;});
     this.transport=new DeviceTransport(ctx,id=>this.requests.received(id));
@@ -39,6 +45,14 @@ export class ComputerHubCore {
     this.requests=new RequestRecords(ctx.storage,this.refs);
     this.guidance = new Guidance(ctx.storage);
     this.accounts = new Accounts(ctx.storage, env.BRIDGE_SECRET, ctx.equal);
+    this.chats=new ChatService(ctx.storage,this.accounts,{publicUrl:env.PUBLIC_URL,
+      device:async(id,actor)=>{
+        const raw=await this.refs.raw(id);await this.accounts.assertAccess(actor,raw);
+        const device=await ctx.storage.get<Data>('device:'+raw);
+        if(!device)throw Object.assign(new Error('电脑不存在'),{code:'device_missing'});
+        return {id:await this.refs.assign('c',raw),raw,name:device.display_name || device.name,system:device.system};
+      },webhookFetch:env.webhookFetch!,blobs:env.chatBlobs,
+      equal:ctx.equal,schedule:time=>this.scheduler.schedule('chat',time)});
     this.mcp = handler(this);
     this.latency=new ConnectionLatency(device=>this.transport.socket(device),
       (device,signal)=>this.rpc(device,'bridge.ping',{},false,signal));
@@ -66,6 +80,7 @@ export class ComputerHubCore {
     if (url.pathname.startsWith("/internal/")) {
       try {return await this.control(url.pathname.slice(10), request.method === "POST" ? await request.json<Data>() : {});}
       catch(error) {return json({error:(error as Error).message,code:(error as Data).code || 'computer_error'},
+        url.pathname.startsWith('/internal/chat-')&&['account_unavailable','chat_credential_invalid','device_unauthorized'].includes((error as Data).code)?401:
         ['account_unavailable','device_forbidden','admin_required','handle_forbidden'].includes((error as Data).code)?403:400);}
     }
     if(url.pathname.startsWith('/device/update-asset/') || url.pathname.startsWith('/device/bootstrap')) {
@@ -90,20 +105,92 @@ export class ComputerHubCore {
 
   async identity(id:string,epoch:number):Promise<Actor> {return this.accounts.require(id,epoch);}
 
+  private async chatInvoke(action:string,args:Data,signal:AbortSignal,caller:string,actor:Actor):Promise<Data>{
+    if(action!=='attachment')return this.chats.action(action,args,actor,caller);
+    if(args.operation==='info')return this.chats.action('attachment',args,actor,caller);
+    if(args.operation==='read')return this.chats.action('read-attachment',args,actor,caller);
+    if(args.operation==='image'){
+      const {attachment}=await this.chats.action('attachment',args,actor,caller);
+      if(!['image/png','image/jpeg','image/webp','image/gif'].includes(attachment.mime_type))throw new Error('附件不是支持的图片格式');
+      const parts:Buffer[]=[];let offset=0;
+      do{
+        signal.throwIfAborted();
+        const chunk=await this.chats.action('read-attachment',{...args,offset,length:1048576,encoding:'base64'},actor,caller);
+        parts.push(Buffer.from(chunk.data,'base64'));offset=chunk.next_offset;
+      }while(offset<attachment.size);
+      return {type:'image',mimeType:attachment.mime_type,data:Buffer.concat(parts).toString('base64')};
+    }
+    if(args.operation!=='from_file')throw new Error('未知附件操作');
+    if(!args.request_key)throw new Error('from_file 需要 request_key');
+    if(!args.session || (!args.path&&!args.file_ref))throw new Error('from_file 需要 session 和 path 或 file_ref');
+    const selected=await this.chats.action('get',{chat_id:args.chat_id},actor,caller);
+    const session=await this.refs.raw(args.session),workspace=await this.ctx.storage.get<Data>('workspace:'+session);
+    if(!workspace || (workspace.account || 'u1')!==actor.id || workspace.device_id!==await this.refs.raw(selected.chat.device_id))
+      throw new Error('文件会话必须属于当前账号和对话绑定的电脑');
+    const identity='chat-import:'+args.chat_id+':'+await hash(actor.id+'|'+args.request_key);
+    const fingerprint=await hash(JSON.stringify([args.session,args.path,args.file_ref,args.name]));
+    let record=await this.ctx.storage.get<Data>(identity);
+    if(record&&record.fingerprint!==fingerprint)throw new Error('同一 request_key 的文件参数不一致');
+    const read=async(offset:number,length:number,version?:string)=>this.invoke('computer.files',{
+      session:args.session,operation:'read',payload:{...(args.file_ref?{file_ref:args.file_ref}:{path:args.path}),offset,length,binary:true,...(version?{version}:{})}},false,signal,caller,actor);
+    if(!record){
+      const first=await read(0,1);
+      record=await this.ctx.storage.transaction(async tx=>{
+        const old=await tx.get<Data>(identity);if(old){if(old.fingerprint!==fingerprint)throw new Error('同一 request_key 的文件参数不一致');return old;}
+        const value={fingerprint,version:first.version,size:first.size,mime_type:first.media_type};await tx.put(identity,value);return value;
+      });
+    }
+    const started=await this.chats.action('upload-start',{chat_id:args.chat_id,
+      name:args.name || args.path?.replaceAll('\\','/').split('/').at(-1) || args.file_ref,
+      size:record.size,mime_type:record.mime_type,request_key:'file:'+args.request_key},actor,caller);
+    const attachment_id=started.attachment.id;let offset=started.attachment.offset;
+    while(offset<record.size){
+      signal.throwIfAborted();
+      const chunk=await read(offset,started.chunk_size,record.version);
+      const uploaded=await this.chats.action('upload-chunk',{chat_id:args.chat_id,attachment_id,offset,data:chunk.base64},actor,caller);
+      offset=uploaded.next_offset;
+    }
+    return this.chats.action('upload-complete',{chat_id:args.chat_id,attachment_id},actor,caller);
+  }
+
   private async control(action:string,value:Data):Promise<Response> {
     if(action==='pair') return json(await this.pair(value));
     if(action==='poll') return json(await this.poll(value.id));
     if(action==='accounts-login') return json({actor:await this.accounts.login(value.username || 'admin',value.password || '')});
     if(action==='accounts-auth') return json({actor:await this.accounts.authenticate(value)});
+    if(action==='chat-link-start'){
+      if(!await this.authorizeDevice(value.device_id,value.device_key))return json({error:'device_unauthorized'},401);
+      return json(await this.chats.startLink(value));
+    }
+    if(action==='chat-link-poll')return json(await this.chats.pollLink(value));
+    if(action.startsWith('chat-credential-')){
+      const bound=await this.chats.authenticateCredential(value.credential);
+      if(action==='chat-credential-auth')return json(bound);
+      const args=action==='chat-credential-download'?{chat_id:value.chat_id,attachment_id:value.attachment_id}:{...value.parameters,source:'tui'};
+      if(args.device_id && await this.refs.raw(args.device_id)!==bound.raw_device)
+        return json({error:'聊天凭据属于另一台电脑',code:'device_forbidden'},403);
+      if(args.chat_id){
+        const result=await this.chats.action('get',{chat_id:args.chat_id},bound.actor);
+        if(result.chat.device_id!==bound.device_id)return json({error:'对话属于另一台电脑',code:'device_forbidden'},403);
+      }
+      if(action==='chat-credential-download')return this.chats.download(args.chat_id,args.attachment_id,bound.actor);
+      if(value.action==='list'||value.action==='create')args.device_id=bound.device_id;
+      return json(await this.chats.action(value.action,args,bound.actor));
+    }
     // These routes are invoked only by the private deployment binding / local updater.
     if(action==='busy') return json({busy:this.transport.active,version:VERSION,modules:await this.modules.list()});
     if(action==='drain') return json({ready:this.drain(),version:VERSION,modules:await this.modules.list()});
     if(action==='resume') {this.draining=false;return json({ready:true});}
     const actor=await this.accounts.authenticate(value.actor || {});
     if(!actor) throw Object.assign(new Error('请重新登录'),{code:'account_unavailable'});
+    if(action==='chat-link-details')return json(await this.chats.linkDetails(value.code,actor));
+    if(action==='chat-link-approve')return json(await this.chats.approveLink(value.code,actor));
+    if(action==='chat-link-deny')return json(await this.chats.denyLink(value.code,actor));
+    if(action==='chat-download')return this.chats.download(value.chat_id,value.attachment_id,actor);
+    if(action.startsWith('chat-'))return json(await this.chats.action(action.slice(5),value,actor));
     if(action==='accounts-profile') {
       const updated=await this.accounts.update(actor.id,{username:value.username,password:value.password});
-      if(updated.epoch!==actor.epoch) await this.approvals.revoke(actor.id);
+      if(updated.epoch!==actor.epoch) {await this.approvals.revoke(actor.id);await this.chats.revoke(actor.id);}
       return json({actor:updated});
     }
     if(['accounts-list','accounts-create','accounts-update','accounts-delete','accounts-grant','accounts-revoke'].includes(action)) {
@@ -113,15 +200,15 @@ export class ComputerHubCore {
       if(action==='accounts-update') {
         const previous=(await this.accounts.list()).find(u=>u.id===value.id);
         const updated=await this.accounts.update(value.id,{username:value.username,enabled:value.enabled,password:value.password});
-        if(updated.epoch!==previous?.epoch) await this.approvals.revoke(value.id);
+        if(updated.epoch!==previous?.epoch) {await this.approvals.revoke(value.id);await this.chats.revoke(value.id);}
         return json({user:updated});
       }
       if(action==='accounts-delete') {
-        await this.accounts.delete(value.id);await this.approvals.revoke(value.id);return json({deleted:true});
+        await this.accounts.delete(value.id);await this.approvals.revoke(value.id);await this.chats.revoke(value.id);return json({deleted:true});
       }
       const device=await this.refs.raw(value.id);
       if(action==='accounts-grant') await this.accounts.grant(value.user_id,device);
-      else {await this.accounts.revoke(value.user_id,device);await this.approvals.revoke(value.user_id,device);}
+      else {await this.accounts.revoke(value.user_id,device);await this.approvals.revoke(value.user_id,device);await this.chats.revoke(value.user_id,device);}
       return json({saved:true});
     }
     if(action==='list') return json(await this.list(actor));
@@ -139,7 +226,7 @@ export class ComputerHubCore {
       const device=await this.refs.raw(value.id);await this.accounts.assertAccess(actor,device);
       if(action==='remove') {
         if(actor.role==='admin') return json(await this.remove(value.id));
-        await this.accounts.revoke(actor.id,device);await this.approvals.revoke(actor.id,device);return json({removed:true});
+        await this.accounts.revoke(actor.id,device);await this.approvals.revoke(actor.id,device);await this.chats.revoke(actor.id,device);return json({removed:true});
       }
       if(action==='rename') return json(await this.rename(value.id,value.name));
       if(action==='lock-mode') return json(await this.lockMode(value.id,value.enabled));
@@ -421,6 +508,7 @@ export class ComputerHubCore {
   }
 
   async invoke(method: string, args: Data, confirmed: boolean, signal: AbortSignal, caller: string, actor:Actor): Promise<any> {
+    if(method.startsWith('chat.'))return this.chatInvoke(method.slice(5),args,signal,caller,actor);
     if (method === "computer.list") return this.list(actor);
     if (method === "computer.recover") return this.recover(args,signal,actor);
     if (method === "computer.lock_mode") {await this.accounts.assertAccess(actor,await this.refs.raw(args.device_id));return this.lockMode(args.device_id,args.enabled);}
@@ -696,15 +784,21 @@ export class ComputerHubCore {
   async webSocketError(ws: DeviceSocket): Promise<void> {await this.webSocketClose(ws, 1011, "Device transport error");}
 
   async alarm(): Promise<void> {
+    await this.scheduler.fired();
+    await this.chats.alarm();
     await this.approvals.expire();
+    let next=Infinity;
     for (const prefix of ["pair:", "human:", "download:"]) {
       for (const [key, value] of await this.ctx.storage.list<Data>({prefix})) {
         const now = prefix === "pair:" ? Date.now() / 1000 : Date.now();
-        if (value.expires_at < now) {
+        if (value.expires_at <= now) {
           await this.ctx.storage.delete(key);
           if (value.code) await this.ctx.storage.delete("code:" + value.code);
-        }
+        }else if(value.expires_at)next=Math.min(next,prefix==='pair:'?value.expires_at*1000:value.expires_at);
       }
     }
+    for(const prefix of ['command-approval:','command-form:'])for(const value of (await this.ctx.storage.list<Data>({prefix})).values())
+      next=Math.min(next,value.expires_at+86400_000+1);
+    if(next<Infinity)await this.scheduler.schedule('maintenance',next);
   }
 }

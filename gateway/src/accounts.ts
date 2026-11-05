@@ -153,6 +153,14 @@ export class Accounts {
     });
   }
 
+  /** The same permission check inside an existing atomic mutation, without nesting transactions. */
+  async assertAccessIn(tx: KeyStore, identity: Actor, device: string): Promise<void> {
+    const current = await tx.get<Account>(accountKey(identity.id));
+    if (!current?.enabled || current.epoch !== identity.epoch) throw failure('account_unavailable', '账号已失效，请重新登录');
+    if (current.role !== 'admin' && !await tx.get(grantKey(current.id, device))) throw failure('device_forbidden', '无权访问这台电脑');
+    if (!await tx.get('device:' + device)) throw failure('device_missing', '电脑不存在');
+  }
+
   async assertAccess(identity: Actor, device: string): Promise<void> {
     if (!await this.canAccess(identity, device)) throw failure('device_forbidden', '无权访问这台电脑');
   }

@@ -1,10 +1,11 @@
 /** The shared service needs key/value transactions and live device sockets, not a hosting platform. */
+export interface ListOptions {prefix:string;startAfter?:string;endBefore?:string;limit?:number;reverse?:boolean}
 export interface KeyStore {
   get<T = unknown>(key: string): Promise<T | undefined>;
   put<T = unknown>(key: string, value: T): Promise<void>;
   put<T = unknown>(entries: Record<string, T>): Promise<void>;
   delete(key: string | string[]): Promise<unknown>;
-  list<T = unknown>(options: {prefix: string}): Promise<Map<string, T>>;
+  list<T = unknown>(options: ListOptions): Promise<Map<string, T>>;
 }
 
 export interface Store extends KeyStore {
@@ -34,6 +35,12 @@ export interface ServiceEnv {
   GITHUB_RELEASE_TOKEN?:string;
   RUNTIME?:'node'|'cloudflare';
   updateServer?(request:Record<string,any>):Promise<Record<string,any>>;
+  webhookFetch?(url:string,init:RequestInit):Promise<Response>;
+  chatBlobs?:{
+    write(chat:string,attachment:string,index:number,bytes:Uint8Array):Promise<void>;
+    read(chat:string,attachment:string,index:number):Promise<Uint8Array>;
+    remove(chat:string,attachment:string):Promise<void>;
+  };
 }
 
 export interface ApplicationEnv extends ServiceEnv {

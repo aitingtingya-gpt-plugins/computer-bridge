@@ -1,17 +1,30 @@
 import {DurableObject} from "cloudflare:workers";
 import {ComputerHubCore} from "./hub";
 import {json, type Env} from "./types";
-import type {DeviceSocket} from "./runtime";
+import type {DeviceSocket,Store,KeyStore,ListOptions} from "./runtime";
+import {cloudflareWebhookFetch} from './webhook';
+
+function keyStore(storage:DurableObjectStorage|DurableObjectTransaction):KeyStore{
+  return {get:storage.get.bind(storage),put:storage.put.bind(storage),delete:storage.delete.bind(storage),
+    list:<T>(options:ListOptions)=>{
+      const {endBefore,...rest}=options;
+      return storage.list<T>({...rest,...(endBefore?{end:endBefore}:{})});
+    }};
+}
+function durableStore(storage:DurableObjectStorage):Store{
+  return {...keyStore(storage),setAlarm:time=>storage.setAlarm(time),
+    transaction:body=>storage.transaction(tx=>body(keyStore(tx)))};
+}
 
 /** Cloudflare is one runtime adapter; the service core is shared with ordinary Node.js. */
 export class ComputerHub extends DurableObject<Env> {
   private core: ComputerHubCore;
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    this.core = new ComputerHubCore({storage: ctx.storage,waitUntil:work=>ctx.waitUntil(work),
+    this.core = new ComputerHubCore({storage: durableStore(ctx.storage),waitUntil:work=>ctx.waitUntil(work),
       acceptWebSocket: (socket, tags) => ctx.acceptWebSocket(socket as WebSocket, tags),
       getWebSockets: tag => ctx.getWebSockets(tag).filter(socket=>socket.readyState===WebSocket.OPEN),
-      equal: (a, b) => crypto.subtle.timingSafeEqual(a, b)}, {...env,RUNTIME:'cloudflare',
+      equal: (a, b) => crypto.subtle.timingSafeEqual(a, b)}, {...env,RUNTIME:'cloudflare',webhookFetch:cloudflareWebhookFetch,
         updateServer:env.UPDATER?async body=>{
           const response=await env.UPDATER!.fetch('https://update/',{method:'POST',body:JSON.stringify(body)});
           const result=await response.json<Record<string,any>>();

@@ -286,6 +286,7 @@ def main(argv: list[str] | None = None) -> None:
         "status",
         "module",
         "network",
+        "chat",
     ]:
         item = commands.add_parser(name)
         item.add_argument("--config", type=Path, default=home() / "device.json")
@@ -294,6 +295,10 @@ def main(argv: list[str] | None = None) -> None:
             item.add_argument("--name", required=True)
         elif name == "register":
             item.add_argument("--no-browser", action="store_true")
+        elif name == "chat":
+            item.add_argument("--resume", metavar="t1", help="打开已有短 ID 对话")
+            item.add_argument("--login", action="store_true", help="重新连接聊天账号")
+            item.add_argument("--no-browser", action="store_true", help="仅显示账号连接链接")
         elif name == "network":
             item.add_argument("--mode", choices=["auto", "direct", "proxy"], required=True)
             item.add_argument("--proxy-url")
@@ -312,6 +317,11 @@ def main(argv: list[str] | None = None) -> None:
             result = setup(args.config, args.server, args.name)
         elif args.command == "register":
             result = asyncio.run(register(args.config, not args.no_browser))
+        elif args.command == "chat":
+            from .chat import run
+
+            asyncio.run(run(args.config, args.resume, browser=not args.no_browser, login=args.login))
+            return
         elif args.command == "network":
             from .network import proxy_for
 

@@ -11,6 +11,8 @@ import {WebSocketServer, WebSocket} from "ws";
 import {ComputerHubCore} from "../hub";
 import {serveApplication} from "../application";
 import {Database, SQLiteStore, OAuthKV} from "./storage";
+import {chatBlobs} from './chat_blobs';
+import {nodeWebhookFetch} from './webhook';
 import type {ApplicationEnv, DeviceSocket} from "../runtime";
 
 const modulePaths:string[]=JSON.parse(process.env.BRIDGE_MODULE_PATHS || '[]');
@@ -42,7 +44,8 @@ const updateServer=process.env.BRIDGE_UPDATER_URL?async(value:Record<string,any>
   if(!response.ok)throw new Error(result.error);return result;
 }:undefined;
 const serviceSettings={PUBLIC_URL:publicUrl,BRIDGE_SECRET:secret,RUNTIME:'node' as const,
-  GITHUB_RELEASE_TOKEN:process.env.GITHUB_RELEASE_TOKEN,updateServer};
+  GITHUB_RELEASE_TOKEN:process.env.GITHUB_RELEASE_TOKEN,updateServer,
+  webhookFetch:nodeWebhookFetch,chatBlobs:chatBlobs(data)};
 const core = new ComputerHubCore({storage,
   acceptWebSocket: (socket,tags) => {const s = socket as Socket;s.tags.push(...tags);sockets.add(s);},
   getWebSockets: tag => [...sockets].filter(s => s.tags.includes(tag) && s.ws.readyState === WebSocket.OPEN),

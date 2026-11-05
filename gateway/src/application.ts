@@ -5,9 +5,10 @@ import {accountsPage,profilePage,loginFields,accountStyles} from './accounts_ui'
 import type {ApplicationEnv} from "./runtime";
 import {VERSION} from './releases';
 import {installedModules} from './modules';
+import {chatPage,chatBindingPage,chatStyles} from './chat_ui';
 
 type AuthEnv = ApplicationEnv & {OAUTH_PROVIDER: OAuthHelpers};
-const page = (title: string, body: string, headers?: HeadersInit) => renderPage(title, body, headers, styles+cardStyles+accountStyles);
+const page = (title: string, body: string, headers?: HeadersInit) => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles);
 const expiredCookie='bridge_admin=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0';
 
 /** Only verified application identities may become the hub's actor. Never forward a form/JSON actor. */
@@ -200,6 +201,80 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
   return env.service(new Request(request,{headers}));
 }
 
+const chatActions=new Set(['list','create','get','history','send','rename','delete','upload-start','upload-chunk',
+  'upload-complete','attachment','read-attachment']);
+
+async function chatApi(request:Request,env:ApplicationEnv,action:string):Promise<Response> {
+  if(request.method!=='POST') return json({error:'method_not_allowed'},405);
+  if(!chatActions.has(action)) return json({error:'unknown_action'},404);
+  const supplied=await request.json<Data>();
+  const {actor:_,credential:__,chat_credential:___,source:____,csrf:_____,...args}=supplied;
+  const authorization=request.headers.get('authorization');
+  if(authorization?.startsWith('Bearer ')) return control(env,'chat-credential-action',{
+    credential:authorization.slice(7),action,parameters:args});
+  const actor=await identity(request,env);
+  if(!actor) return json({error:'login_required'},401);
+  if(supplied.csrf!==actor.nonce || request.headers.has('origin') && request.headers.get('origin')!==new URL(env.PUBLIC_URL).origin)
+    return json({error:'invalid_form'},403);
+  return control(env,'chat-'+action,{...args,source:'web'},actor);
+}
+
+async function chat(request:Request,env:ApplicationEnv):Promise<Response> {
+  const url=new URL(request.url);
+  const actor=await identity(request,env);
+  const form=request.method==='POST'?await request.formData():null;
+  if(!actor) {
+    const logged=form && await login(form,env);
+    if(logged) return new Response(null,{status:303,headers:{Location:url.pathname+url.search,
+      'Set-Cookie':await sessionCookie(env,logged),'Cache-Control':'no-store'}});
+    return loginPage(url.pathname==='/chat/connect'?'连接终端聊天':'聊天',form);
+  }
+  if(url.pathname==='/chat/connect') {
+    const code=url.searchParams.get('code') || '';
+    if(!code) return json({error:'missing_code'},400);
+    if(form) {
+      if(form.get('csrf')!==actor.nonce) return json({error:'invalid_form'},403);
+      const decision=String(form.get('decision'));
+      if(!['approve','deny'].includes(decision))return json({error:'invalid_decision'},400);
+      const response=await control(env,'chat-link-'+decision,{code},actor);
+      const value=await response.json<Data>();
+      if(response.ok) return page('连接终端聊天',`<section class="auth-card"><h2>${decision==='approve'?'已连接':'已取消'}</h2><p>${decision==='approve'?'请回到终端继续聊天。':'终端连接没有获得授权。'}</p><a href="/chat">打开网页聊天 →</a></section>`);
+      return page('连接终端聊天',`<p class="notice error" role="alert">${escape(value.error || '连接未完成')}</p>`);
+    }
+    const response=await control(env,'chat-link-details',{code},actor);
+    const value=await response.json<Data>();
+    if(!response.ok) return new Response(page('连接终端聊天',`<p class="notice error" role="alert">${escape(value.error || '连接已失效')}</p>`).body,{status:response.status,headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}});
+    return page('连接终端聊天',chatBindingPage(actor,value,actor.nonce));
+  }
+  if(request.method==='POST') return Response.redirect(env.PUBLIC_URL+url.pathname+url.search,303);
+  const response=await control(env,'list',{},actor);
+  const {computers}=await response.json<Data>();
+  return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''));
+}
+
+async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response> {
+  if(request.method!=='GET' && request.method!=='HEAD') return json({error:'method_not_allowed'},405);
+  const url=new URL(request.url);
+  const match=/^\/chat\/files\/(t[1-9][0-9]*)\/(a[1-9][0-9]*)$/.exec(url.pathname);
+  if(!match)return json({error:'invalid_attachment'},400);
+  const authorization=request.headers.get('authorization');
+  let response:Response;
+  if(authorization?.startsWith('Bearer ')) response=await control(env,'chat-credential-download',{
+    credential:authorization.slice(7),chat_id:match[1],attachment_id:match[2]});
+  else {
+    const actor=await identity(request,env);
+    if(!actor)return Response.redirect(env.PUBLIC_URL+'/chat',303);
+    response=await control(env,'chat-download',{chat_id:match[1],attachment_id:match[2]},actor);
+  }
+  const headers=new Headers(response.headers);
+  headers.set('X-Content-Type-Options','nosniff');
+  headers.set('Content-Security-Policy',"sandbox; default-src 'none'");
+  if(url.searchParams.get('inline')==='1' && ['image/png','image/jpeg','image/webp','image/gif'].includes(headers.get('Content-Type') || ''))
+    headers.set('Content-Disposition','inline');
+  if(request.method==='HEAD') await response.body?.cancel();
+  return new Response(request.method==='HEAD'?null:response.body,{status:response.status,headers});
+}
+
 async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   const url = new URL(request.url);
   if (url.pathname === "/authorize") {
@@ -232,6 +307,13 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   if (url.pathname === "/manage") return management(request, env);
   if (url.pathname === "/manage/accounts") return accountManagement(request,env);
   if (url.pathname === "/manage/profile") return profile(request,env);
+  if(url.pathname==='/chat' || url.pathname==='/chat/connect') return chat(request,env);
+  if(url.pathname.startsWith('/chat/api/')) return chatApi(request,env,url.pathname.slice('/chat/api/'.length));
+  if(url.pathname.startsWith('/chat/files/')) return chatDownload(request,env);
+  if((url.pathname==='/chat/device/start' || url.pathname==='/chat/device/poll') && request.method==='POST') {
+    const body=await request.json<Data>();
+    return control(env,url.pathname.endsWith('/start')?'chat-link-start':'chat-link-poll',body);
+  }
   if(url.pathname==='/manage/updates') {
     const actor=await identity(request,env);
     if(!actor) return json({error:'login_required'},401);
@@ -254,7 +336,7 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   if(url.pathname.startsWith('/device/bootstrap')) return env.service(request);
   if (url.pathname.startsWith('/download/')) return download(request,env);
   if (url.pathname === "/health") return json({service: "computer-bridge", version: VERSION,modules:installedModules.map(module=>({id:module.id,version:module.version}))});
-  if (url.pathname === "/") return page("Computer Bridge", '<a href="/manage">设备管理</a>');
+  if (url.pathname === "/") return page("Computer Bridge", '<a href="/manage">设备管理</a> · <a href="/chat">聊天</a>');
   return json({error: "not_found"}, 404);
 }
 
