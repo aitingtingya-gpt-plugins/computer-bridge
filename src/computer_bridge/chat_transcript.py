@@ -6,7 +6,6 @@ from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from functools import lru_cache
 from typing import Any
 
 from prompt_toolkit.application.current import get_app
@@ -14,15 +13,17 @@ from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.layout import Window
 from prompt_toolkit.layout.controls import UIContent, UIControl
-from prompt_toolkit.layout.screen import Char
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 
+from .chat_cells import cell_width as cell_width
+from .chat_cells import graphemes, source_lines
 from .chat_markdown import Body, MarkdownWorker
 from .common import Json
 
 Fragment = tuple[str, str, tuple[str, str] | None]
 Row = list[Fragment]
 Anchor = tuple[int | None, int, int]
+RenderKey = tuple[int, str, str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,33 +32,59 @@ class DisplayRow:
     start: int
 
 
-@lru_cache(maxsize=4096)
-def cell_width(character: str) -> int:
-    return Char(character).width
-
-
 def wrap_row(row: Row, width: int) -> list[DisplayRow]:
-    """Use the renderer's character widths, retaining styles and button actions."""
-    result: list[DisplayRow] = []
-    fragments: Row = []
-    column = offset = start = 0
+    """Break at grapheme boundaries; mathematical spans remain indivisible."""
+    text = "".join(value for _, value, _ in row)
+    clusters = list(graphemes(text))
+    math_ranges: list[tuple[int, int]] = []
+    offset = 0
     for style, text, action in row:
-        span = 0
-        for index, character in enumerate(text):
-            size = cell_width(character)
-            if column and column + size > width:
-                if index > span:
-                    fragments.append((style, text[span:index], action))
-                result.append(DisplayRow(fragments, start))
-                fragments = []
-                start, span, column = offset, index, 0
-            column += size
-            offset += 1
-        if span < len(text):
-            fragments.append((style, text[span:], action))
-    if not result:
+        end = offset + len(text)
+        if "class:md.math" in style.split() and text:
+            if math_ranges and math_ranges[-1][1] == offset:
+                math_ranges[-1] = math_ranges[-1][0], end
+            else:
+                math_ranges.append((offset, end))
+        offset = end
+    boundaries = [0]
+    column = cluster_index = math_index = 0
+    while cluster_index < len(clusters):
+        begin, cluster, size = clusters[cluster_index]
+        end = begin + len(cluster)
+        while math_index < len(math_ranges) and math_ranges[math_index][1] <= begin:
+            math_index += 1
+        # A styled boundary may lie inside a combining sequence. Keep both the
+        # source fragments and that entire sequence on the same physical row.
+        if math_index < len(math_ranges) and math_ranges[math_index][0] < end:
+            math_end = math_ranges[math_index][1]
+            while cluster_index + 1 < len(clusters) and clusters[cluster_index + 1][0] < math_end:
+                cluster_index += 1
+                position, following, following_size = clusters[cluster_index]
+                end = position + len(following)
+                size += following_size
+        if column and column + size > width:
+            boundaries.append(begin)
+            column = 0
+        column += size
+        cluster_index += 1
+    if len(boundaries) == 1:
         return [DisplayRow(row, 0)]
-    if fragments:
+    boundaries.append(offset)
+    result: list[DisplayRow] = []
+    fragment_index = fragment_start = 0
+    for start, end in zip(boundaries, boundaries[1:]):
+        fragments: Row = []
+        while fragment_index < len(row):
+            style, value, action = row[fragment_index]
+            fragment_end = fragment_start + len(value)
+            if fragment_start >= end:
+                break
+            if fragment_end > start:
+                fragments.append((style, value[max(0, start-fragment_start):end-fragment_start], action))
+            if fragment_end > end:
+                break
+            fragment_index += 1
+            fragment_start = fragment_end
         result.append(DisplayRow(fragments, start))
     return result
 
@@ -114,44 +141,62 @@ class ChatTranscript(UIControl):
         self.pending_count = 0
         self.formatted_messages = 0
         self.markdown: MarkdownWorker | None = None
+        self.generation = 0
         self.documents: dict[int, tuple[str,int,Body]] = {}
         self.source_positions: dict[int, list[int]] = {}
         self.format_width = 80
-        self.ready_documents: dict[int,tuple[str,int,Body]] = {}
+        self.ready_documents: dict[RenderKey,tuple[int,Body]] = {}
+        self.pending_documents: dict[int,RenderKey] = {}
         self.document_flush: asyncio.TimerHandle | None = None
 
     def _apply_documents(self) -> None:
         self.document_flush=None
         anchor=self._anchor();changed=False
-        for sequence,(text,columns,body) in self.ready_documents.items():
-            current=self.messages.get(sequence)
-            if current is not None and current['text']==text and self.format_width==columns:
+        for key,(sequence,body) in self.ready_documents.items():
+            if self._current_document(key,sequence):
+                _,_,text,columns=key
+                current=self.messages[sequence]
                 self.documents[sequence]=(text,columns,body)
                 self.bodies.pop(sequence,None)
                 self.lines[sequence]=self._format(current);changed=True
         self.ready_documents.clear()
         if changed:self._index(anchor);get_app().invalidate()
 
+    def _current_document(self, key: RenderKey, sequence: int) -> bool:
+        generation,identifier,text,columns=key
+        current=self.messages.get(sequence)
+        return (generation==self.generation and columns==self.format_width and current is not None
+                and current['id']==identifier and current['text']==text)
+
     def _prepare_body(self, sequence: int, message: Json) -> None:
         if self.markdown is None:
             return
         worker=self.markdown
         text, columns = str(message['text']), self.format_width
+        key=(self.generation,str(message['id']),text,columns)
+        previous=self.pending_documents.get(sequence)
+        if previous is not None and previous!=key:
+            task=worker.tasks.pop(previous,None)
+            if task is not None:task.cancel()
+            self.pending_documents.pop(sequence,None)
         cached=self.documents.get(sequence)
         if cached and cached[:2] == (text,columns):
             return
-        key=(str(message['id']),columns)
         if key in self.markdown.tasks:
             return
         async def prepare() -> None:
             try:
                 body=await worker.body(text,str(message['id']),columns)
-                self.ready_documents[sequence]=(text,columns,body)
-                if self.document_flush is None:
-                    self.document_flush=asyncio.get_running_loop().call_later(1/30,self._apply_documents)
+                if self._current_document(key,sequence):
+                    self.ready_documents[key]=(sequence,body)
+                    if self.document_flush is None:
+                        self.document_flush=asyncio.get_running_loop().call_later(1/30,self._apply_documents)
             finally:
-                if worker.tasks.get(key) is asyncio.current_task():worker.tasks.pop(key,None)
+                if worker.tasks.get(key) is asyncio.current_task():
+                    worker.tasks.pop(key,None)
+                    if self.pending_documents.get(sequence)==key:self.pending_documents.pop(sequence,None)
         self.markdown.tasks[key]=asyncio.create_task(prepare())
+        self.pending_documents[sequence]=key
 
     @staticmethod
     def row(text: str, style: str = "") -> Row:
@@ -199,14 +244,13 @@ class ChatTranscript(UIControl):
         if previous is None or previous[0] != signature:
             self._prepare_body(sequence,message)
             document=self.documents.get(sequence)
-            if document and document[0]==message['text']:
+            if document and document[:2]==(message['text'],self.format_width):
                 body=list(document[2].rows)
                 positions=list(document[2].sources)
             else:
-                raw=message['text'].split('\n')
-                body=[self.row(line) for line in raw]
-                positions=[];offset=0
-                for line in raw:positions.append(offset);offset+=len(line)+1
+                raw=list(source_lines(message['text']))
+                body=[self.row(line.expandtabs(8)) for _,line in raw]
+                positions=[offset for offset,_ in raw]
             body.extend(self.row(f"  ↳ {file['id']}  {file['name']}  ({file['size']} 字节)") for file in message.get("attachments", []))
             positions.extend([len(message['text'])]*(len(body)-len(positions)))
             self.source_positions[sequence]=[-1,*positions,len(message['text'])+1]
@@ -220,10 +264,12 @@ class ChatTranscript(UIControl):
         anchor = self._anchor()
         changed = reset
         if reset:
+            self.generation += 1
             if self.markdown:
                 for task in tuple(self.markdown.tasks.values()):task.cancel()
                 self.markdown.tasks.clear()
             self.documents.clear();self.source_positions.clear()
+            self.pending_documents.clear()
             self.ready_documents.clear()
             if self.document_flush:self.document_flush.cancel();self.document_flush=None
             self.messages.clear(); self.order.clear(); self.lines.clear()
@@ -306,11 +352,18 @@ class ChatTranscript(UIControl):
 
     def _layout(self, width: int, height: int) -> None:
         width, height = max(1, width), max(1, height)
+        anchor = self._anchor()
         if width != self.format_width:
             self.format_width=width
+            if self.markdown:
+                for task in tuple(self.markdown.tasks.values()):task.cancel()
+                self.markdown.tasks.clear();self.pending_documents.clear()
             for sequence in self.order:
-                if self.messages[sequence].get('kind')!='approval':self._prepare_body(sequence,self.messages[sequence])
-        anchor = self._anchor()
+                if self.messages[sequence].get('kind')!='approval':
+                    self.bodies.pop(sequence,None)
+                    self.lines[sequence]=self._format(self.messages[sequence])
+            self._index(anchor)
+            anchor = self._anchor()
         if self.dirty or width != self.width:
             cache = self.wrap_cache if width == self.width else {}
             fresh: dict[int, tuple[Row, list[DisplayRow]]] = {}
