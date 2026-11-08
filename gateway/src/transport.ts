@@ -3,6 +3,9 @@ import type {DeviceSocket,HubContext} from './runtime';
 
 const interrupted=()=>Object.assign(new Error('连接已失效；原请求可继续恢复'),{code:'connection_interrupted'});
 const elapsed=()=>Object.assign(new Error('本次等待已结束；请使用原请求号继续恢复'),{code:'request_pending'});
+export const MAX_DEVICE_WIRE_BYTES=1024*1024;
+const MAX_REASSEMBLY_BYTES=8*1024*1024,MAX_FRAME_GROUPS=8,MAX_FRAMES=512;
+interface FrameGroup {parts:string[];bytes:number;sequence:number;timer:ReturnType<typeof setTimeout>}
 interface Pending {
   socket:DeviceSocket;
   device:string;
@@ -20,7 +23,7 @@ export class DeviceTransport {
   private waiters=new Map<string,Set<()=>void>>();
   private writers=new Map<DeviceSocket,Promise<void>>();
   private acks=new Map<string,{resolve:()=>void,reject:(error:Error)=>void}>();
-  private frames=new Map<string,string[]>();
+  private frames=new Map<string,FrameGroup>();
   private reconnecting=new Map<string,number>();
   constructor(private ctx:HubContext,private received:(id:string)=>Promise<void>) {}
 
@@ -57,7 +60,7 @@ export class DeviceTransport {
       ack.reject(interrupted());this.acks.delete(key);
     }
     for(const p of this.pending.values()) if(p.socket===ws) p.reject(interrupted());
-    for(const key of this.frames.keys()) if(key.startsWith(a.connection_id+':')) this.frames.delete(key);
+    for(const key of this.frames.keys()) if(key.startsWith(a.connection_id+':')) this.dropFrame(key);
     this.writers.delete(ws);
     if(a.ready) console.info(JSON.stringify({event:'connection_invalidated',device:a.device_id,
       connection:a.connection_id,reason,time:new Date().toISOString()}));
@@ -101,7 +104,10 @@ export class DeviceTransport {
   }
   /** Return business messages; transport messages never enter a business queue. */
   async message(ws:DeviceSocket,message:string):Promise<Data|undefined> {
-    let value:Data=JSON.parse(message);
+    if(message.length>MAX_DEVICE_WIRE_BYTES||new TextEncoder().encode(message).length>MAX_DEVICE_WIRE_BYTES){this.invalidate(ws,'wire_message_too_large');return;}
+    let value:Data;
+    try{value=JSON.parse(message);}catch{this.invalidate(ws,'invalid_wire_message');return;}
+    if(!value||typeof value!=='object'||Array.isArray(value)){this.invalidate(ws,'invalid_wire_message');return;}
     const a=ws.deserializeAttachment() as Data;
     if(a.failed) return;
     ws.serializeAttachment({...a,last_activity:Date.now()});
@@ -119,13 +125,26 @@ export class DeviceTransport {
       return;
     }
     if(value.type==='frame') {
+      if(typeof value.id!=='string'||value.id.length>128||typeof value.data!=='string'||!Number.isSafeInteger(value.sequence)||typeof value.last!=='boolean'){
+        this.invalidate(ws,'invalid_frame');return;
+      }
       const key=a.connection_id+':'+value.id;
-      const parts=this.frames.get(key) || [];
-      parts.push(value.data);this.frames.set(key,parts);
+      let group=this.frames.get(key);
+      if(value.sequence!==(group?.sequence??0)||!group&&this.frames.size>=MAX_FRAME_GROUPS){this.invalidate(ws,'invalid_frame_sequence');return;}
+      const bytes=new TextEncoder().encode(value.data).length;
+      const aggregate=[...this.frames.values()].reduce((sum,item)=>sum+item.bytes,0);
+      if(aggregate+bytes>MAX_REASSEMBLY_BYTES||(group?.parts.length??0)>=MAX_FRAMES){this.invalidate(ws,'frame_budget_exceeded');return;}
+      if(!group){
+        group={parts:[],bytes:0,sequence:0,timer:setTimeout(()=>this.invalidate(ws,'frame_timeout'),30_000)};
+        this.frames.set(key,group);
+      }
+      group.parts.push(value.data);group.bytes+=bytes;group.sequence++;
       if(a.transport_v2 && (value.sequence%8===7 || value.last))
         this.control(ws,{type:'frame_ack',id:value.id,sequence:value.sequence});
       if(!value.last) return;
-      this.frames.delete(key);value=JSON.parse(parts.join(''));
+      this.dropFrame(key);
+      try{value=JSON.parse(group.parts.join(''));}catch{this.invalidate(ws,'invalid_frame_payload');return;}
+      if(!value||typeof value!=='object'||Array.isArray(value)){this.invalidate(ws,'invalid_frame_payload');return;}
     }
     if(value.type==='response') {
       const p=this.pending.get(value.id);
@@ -138,6 +157,7 @@ export class DeviceTransport {
     }
     return value;
   }
+  private dropFrame(key:string):void{const group=this.frames.get(key);if(group)clearTimeout(group.timer);this.frames.delete(key);}
   async rpc(device:string,method:string,params:Data,confirmed:boolean,signal:AbortSignal,receipt?:Data,
     deadline=Date.now()+30_000):Promise<any> {
     this.active++;

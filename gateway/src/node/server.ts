@@ -13,6 +13,7 @@ import {serveApplication,authorizeChatLive} from "../application";
 import {Database, SQLiteStore, OAuthKV} from "./storage";
 import {chatBlobs} from './chat_blobs';
 import {nodeWebhookFetch} from './webhook';
+import {MAX_DEVICE_WIRE_BYTES} from '../transport';
 import type {ApplicationEnv, DeviceSocket} from "../runtime";
 
 const modulePaths:string[]=JSON.parse(process.env.BRIDGE_MODULE_PATHS || '[]');
@@ -94,12 +95,13 @@ const server = createServer(async (incoming,outgoing) => {
   } catch (error) {
     if (abort.signal.aborted) return;
     console.error("http",(error as Error).message);
-    if (!outgoing.headersSent) outgoing.writeHead(500,{"Content-Type":"application/json"});
-    outgoing.end(JSON.stringify({error:(error as Error).message}));
+    if(outgoing.headersSent){outgoing.destroy(error as Error);return;}
+    outgoing.writeHead(500,{"Content-Type":"application/json"});
+    outgoing.end(JSON.stringify({error:'request_failed'}));
   }
 });
 server.requestTimeout = 0;
-const websocket = new WebSocketServer({noServer:true,maxPayload:0});
+const websocket = new WebSocketServer({noServer:true,maxPayload:MAX_DEVICE_WIRE_BYTES});
 server.on("upgrade",(request,connection,head) => {
   void (async () => {
     const url = new URL(request.url!,publicUrl);

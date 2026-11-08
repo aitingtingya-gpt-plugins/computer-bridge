@@ -17,11 +17,9 @@ gateway/wrangler.jsonc
 .env.*
 !.env.example
 AGENTS.md
-tests/
 validation/
 data/
 gateway/data/
 scripts/check_*.py
 scripts/lock_screen_probe.py
-.github/workflows/validation.yml
 docs/*验收记录.md

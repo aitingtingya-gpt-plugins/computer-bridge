@@ -17,7 +17,7 @@ from .common import Json, save, uid
 from .network import failure_kind, proxy_for
 from .network_events import NetworkEvents
 from .service import Computer
-from .wire import Frames, Sender
+from .wire import MAX_REQUEST_BYTES, Frames, Sender
 
 log = logging.getLogger(__name__)
 
@@ -152,7 +152,12 @@ class Connection:
         try:
             async for raw in self.socket:
                 text = raw.decode() if isinstance(raw, bytes) else raw
-                frame = json.loads(text)
+                try:
+                    frame = json.loads(text)
+                except (ValueError, TypeError) as exc:
+                    raise ConnectionError("Invalid computer protocol JSON") from exc
+                if not isinstance(frame, dict):
+                    raise ConnectionError("Computer protocol message must be an object")
                 if frame.get("type") == "heartbeat_ack":
                     pending = self.heartbeat.get(frame["id"])
                     if pending and not pending.done():
@@ -219,6 +224,7 @@ class Connection:
 
 async def serve(config: Path) -> None:
     computer = Computer(config)
+    computer.tool_approvals.start()
     settings = computer.settings
     endpoint = settings["server"].rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
     endpoint += "/device/connect?id=" + settings["device_id"]
@@ -263,7 +269,7 @@ async def serve(config: Path) -> None:
         async with connect(
             endpoint,
             additional_headers={"Authorization": "Bearer " + settings["device_key"]},
-            max_size=None,
+            max_size=MAX_REQUEST_BYTES,
             proxy=proxy_for(network_settings),
             open_timeout=30,
             ping_interval=30,

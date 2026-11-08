@@ -1,6 +1,6 @@
 import {escape, type Data} from "./types";
 import {accessPanel, accessStyles, workspaceFeedbackStyles, workspaceStatus} from './access_ui';
-import {connectionBadge,connectionsScript} from './connections_ui';
+import {connectionBadge,connectionsScript,connectionStyles} from './connections_ui';
 import {updatesPanel,deviceUpdates,updatesScript,updateStyles} from './updates_ui';
 import {accountNavigation,grantPanel} from './accounts_ui';
 
@@ -57,7 +57,7 @@ export function devicesPage(computers: Data[], nonce: string, code: string, noti
     <footer class="page-footer"><form method="post"><input type="hidden" name="csrf" value="${nonce}"><button class="text-button" name="action" value="logout">退出管理</button></form></footer>${connectionsScript}${updatesScript}`;
 }
 
-export const styles = accessStyles + workspaceFeedbackStyles + updateStyles + `
+export const styles = accessStyles + workspaceFeedbackStyles + updateStyles + connectionStyles + `
 .connection-controls{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.measure-connection{border:1px solid #a6c4ba;background:white;color:#286c59;padding:3px 9px;font-size:12px}.measure-connection:disabled{opacity:.65;cursor:wait}.status.degraded{background:#fff2da;color:#92600c}.notice.warning{background:#fff2da;color:#80570e}:root{color-scheme:light;--bg:#f5f6f8;--card:#fff;--ink:#1d2639;--muted:#758096;--line:#e6e9ef;--accent:#286c59;--hover:#205847;--soft:#eaf4ef}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
 a{color:var(--accent);text-decoration:none}button,input{font:inherit}button,summary{cursor:pointer}button{border:1px solid transparent;border-radius:9px;background:var(--accent);color:white;padding:10px 17px;font-weight:600;transition:background .15s}button:hover{background:var(--hover)}button:focus-visible,summary:focus-visible,a:focus-visible{outline:3px solid #a5cabb;outline-offset:3px}button[value=deny]{background:#eef0f4;color:var(--ink);margin-left:8px}

@@ -1,6 +1,7 @@
 /** Persistent, device-owned communication. Computer execution keeps its existing transport. */
 import {sha256} from '@noble/hashes/sha2.js';
 import {Webhook} from 'standardwebhooks';
+import {byteRange,uploadMetadata,unsignedHeader,TUS_VERSION,MAX_ATTACHMENT_SIZE,MAX_PATCH_SIZE,cancelBody} from './attachment_http';
 import type {Accounts, Actor} from './accounts';
 import {authenticateDeviceIdentity,authorizeIdentity,modelActor,normalizeIdentity,principalScope,validateIdentity,type ChatIdentity,type ChatPrincipal} from './chat_identity';
 import type {KeyStore, Store} from './runtime';
@@ -25,7 +26,7 @@ export interface ChatEnvironment {
 interface Conversation {id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;writer?:string;revision?:number}
 interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model';text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;kind?:'approval';approval?:Data;approval_id?:string}
 interface AttachmentView {id:string;name:string;size:number;mime_type:string;sha256?:string}
-interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string}
+interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string;protocol?:'tus';upload_metadata?:string}
 interface Candidate {chat:string;account:string;epoch:number;caller:string;expires_at:number}
 interface Writer {id:string;chat:string;account:string;epoch:number;caller:string;connection_hash:string;event_connection:string;callback_url?:string}
 interface Subscription {id:string;chat:string;account:string;epoch:number;caller:string;connection_hash:string;event_connection?:string;url:string;secret:string;previous_secret?:string;rotation_until?:number;expires_at:number|null;cursor:number;verified_at:number}
@@ -72,6 +73,7 @@ export const chatEventDefinition={
 
 export class ChatService {
   private initialized?:Promise<void>;
+  private uploadRequests=new Set<string>();
   private pumping?:Promise<void>;
   private wake?:()=>void;
   private wakeVersion=0;
@@ -115,9 +117,12 @@ export class ChatService {
       const device=await tx.get<Data>('device:'+record.device);
       const n=++chat.sequence,stamp=now();
       message={id:'m'+n,sequence:n,role:'assistant',source:'model',kind:'approval',
-        text:'命令审批',attachments:[],created_at:stamp,saved_at:stamp,
+        text:record.tool?'工具审批':'命令审批',attachments:[],created_at:stamp,saved_at:stamp,
         approval:{id:record.id,device_id:chat.device_id,device_name:device?.display_name??device?.name??chat.device_id,
-          command:details.command,cwd:details.cwd,justification:details.justification,expires_at:record.expires_at,...state}};
+          command:record.tool?.summary??details.command,cwd:record.tool?.cwd??details.cwd,
+          justification:record.tool?.justification??details.justification,expires_at:record.expires_at,
+          ...(record.tool?{tool:record.tool.method,request_id:record.tool.request_id}:{}),
+          ...(record.projection.permission_confirmation?{permission_confirmation:true}:{}),...state}};
       await tx.put(ref,n);
     }
     chat.updated_at=now();
@@ -501,7 +506,7 @@ export class ChatService {
     });
     this.signal(chat.id);return result;
   }
-  async approvalNotice(actor:ChatPrincipal,chatId:string,approvalId:string,decision:string):Promise<Data>{
+  async approvalNotice(actor:ChatPrincipal,chatId:string,approvalId:string,decision:string,tool?:Data):Promise<Data>{
     await this.initialize();const chat=await this.chat(chatId,actor);
     const result=await this.store.transaction(async tx=>{
       await this.access(actor,chat.device,tx);
@@ -510,7 +515,9 @@ export class ChatService {
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
       const sequence=++current.sequence,stamp=now();
       const card=await tx.get<number>('chat-approval:'+chat.id+':'+approvalId);
-      const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',text:'命令审批 '+approvalId+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),attachments:[],created_at:stamp,saved_at:stamp,...(card?{approval_id:approvalId}:{})};
+      const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',
+        text:(tool?'工具审批 '+tool.method+' '+tool.device+' '+tool.request_id:'命令审批 '+approvalId)+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),
+        attachments:[],created_at:stamp,saved_at:stamp,...(card?{approval_id:approvalId}:{})};
       current.updated_at=stamp;const result={saved:true,chat_id:chat.id,message_id:message.id,decision};
       await tx.put({[messageKey(chat.id,sequence)]:message,[timingKey(chat.id,sequence)]:{saved_at:stamp,attempts:0},[noticeKey]:result});
       await this.recordChange(tx,current,[sequence]);await this.queueMessage(tx,current,message);return result;
@@ -529,10 +536,12 @@ export class ChatService {
     if(expected&&!/^[0-9a-f]{64}$/.test(expected))throw fail('invalid_chat_argument','sha256 格式不正确');
     const attachment=await this.store.transaction(async tx=>{
       await this.access(actor,chat.device,tx);
-      const d=await this.dedupe(tx,chat.id+':upload:'+principalScope(actor),args.request_key,[name,size,mime_type,expected??null]);
+      const fingerprint=[name,size,mime_type,expected??null,...(args.protocol==='tus'?['tus',args.upload_metadata??null]:[])];
+      const d=await this.dedupe(tx,chat.id+':upload:'+principalScope(actor),args.request_key,fingerprint);
       if(d.result){const a=await tx.get<Attachment>(attachmentKey(chat.id,d.result.id));if(!a)throw fail('upload_expired','上传已过期');return a;}
       const c=await tx.get<Conversation>(key(chat.id));if(!c)throw fail('chat_deleted','对话已删除');
-      const a:Attachment={id:'a'+(++c.attachments),name,size,mime_type,offset:0,chunks:0,state:'uploading',expires_at:Date.now()+86_400_000,...(expected?{expected_sha256:expected}:{})};
+      if(args.protocol==='tus'&&[...(await tx.list<Attachment>({prefix:'chat-attachment:'+chat.id+':'})).values()].filter(a=>a.state==='uploading'&&a.expires_at!>Date.now()).length>=16)throw fail('upload_limit','Too many active uploads');
+      const a:Attachment={...(args.protocol==='tus'?{protocol:'tus' as const,upload_metadata:args.upload_metadata}:{}),id:'a'+(++c.attachments),name,size,mime_type,offset:0,chunks:0,state:'uploading',expires_at:Date.now()+86_400_000,...(expected?{expected_sha256:expected}:{})};
       await tx.put({[key(chat.id)]:c,[attachmentKey(chat.id,a.id)]:a,[d.key]:{fingerprint:d.fingerprint,result:{id:a.id}}});await this.expiry(tx,'upload',chat.id+':'+a.id,a.expires_at);return a;
     });if(attachment.expires_at)await this.env.schedule(attachment.expires_at);
     return {attachment,chunk_size:CHUNK};
@@ -545,6 +554,7 @@ export class ChatService {
       await this.access(actor,chat.device,tx);
       if(!await tx.get(key(chat.id)))throw fail('chat_deleted','对话已删除');
       const a=await tx.get<Attachment>(attachmentKey(chat.id,args.attachment_id));
+      if(a?.protocol==='tus')throw fail('upload_conflict','Use the tus endpoint for this upload');
       if(!a||a.state!=='uploading')throw fail('upload_expired','上传不存在或已完成');
       if(offset+bytes.length>a.size||bytes.length<CHUNK&&offset+bytes.length!==a.size)throw fail('invalid_chat_argument','分片大小与附件大小不一致');
       const index=offset/CHUNK,checksum=hex(sha256(bytes)),hashKey=chunkKey(chat.id,a.id,index)+':hash';
@@ -563,7 +573,7 @@ export class ChatService {
     const a=await this.attachment(chat.id,args.attachment_id);if(a.state==='ready')return {attachment:{...viewAttachment(a),state:'ready'}};
     if(a.offset!==a.size)throw fail('upload_incomplete','附件尚未上传完整');
     const digest=sha256.create();let count=0;
-    for(let index=0;index<a.chunks;index++){const bytes=await this.chunk(chat.id,a.id,index);count+=bytes.length;digest.update(bytes);}
+    for(let index=0;index<a.chunks;index++){await this.access(actor,chat.device);const bytes=await this.chunk(chat.id,a.id,index);count+=bytes.length;digest.update(bytes);}
     const checksum=hex(digest.digest());if(count!==a.size||a.expected_sha256&&checksum!==a.expected_sha256)throw fail('attachment_checksum','附件大小或 SHA256 校验不一致');
     await this.store.transaction(async tx=>{await this.access(actor,chat.device,tx);const current=await tx.get<Attachment>(attachmentKey(chat.id,a.id));if(!current)throw fail('upload_expired','上传已过期');current.sha256=checksum;current.state='ready';delete current.expires_at;delete current.expected_sha256;await tx.put(attachmentKey(chat.id,a.id),current);await this.expiry(tx,'upload',chat.id+':'+a.id);});
     return {attachment:{...viewAttachment({...a,sha256:checksum}),state:'ready'}};
@@ -588,12 +598,140 @@ export class ChatService {
     }
     return {attachment:viewAttachment(a),data:to64(bytes),next_offset:offset+bytes.length,eof:offset+bytes.length>=a.size};
   }
-  async download(chatId:string,id:string,actor:ChatPrincipal):Promise<Response>{
-    const chat=await this.chat(chatId,actor),a=await this.attachment(chat.id,id,true);let index=0;
-    const stream=new ReadableStream<Uint8Array>({pull:async controller=>{
-      try{await this.chat(chat.id,actor);if(index>=a.chunks){controller.close();return;}controller.enqueue(await this.chunk(chat.id,a.id,index++));}catch(e){controller.error(e);}
-    }});
-    return new Response(stream,{headers:{'Content-Type':a.mime_type,'Content-Length':String(a.size),'Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(a.name),'Cache-Control':'no-store','X-Content-Type-Options':'nosniff'}});
+  async download(chatId:string,id:string,actor:ChatPrincipal,request?:Request):Promise<Response>{
+    const chat=await this.chat(chatId,actor),a=await this.attachment(chat.id,id,true);
+    // All completed uploads have a digest. Legacy records without one cannot advertise a strong validator.
+    const etag=a.sha256?'"sha256-'+a.sha256+'"':undefined;
+    const headers=new Headers({'Content-Type':a.mime_type,'Content-Disposition':"attachment; filename*=UTF-8''"+encodeURIComponent(a.name),'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Accept-Ranges':'bytes'});
+    if(etag)headers.set('ETag',etag);
+    const ifRange=request?.headers.get('If-Range');
+    const range=(!ifRange||etag&&ifRange===etag)?byteRange(request?.headers.get('Range')??null,a.size):null;
+    if(range===false){headers.set('Content-Range','bytes */'+a.size);return new Response(null,{status:416,headers});}
+    const start=range?range.start:0,end=range?range.end:a.size-1;let position=start;
+    headers.set('Content-Length',String(Math.max(0,end-start+1)));
+    if(range)headers.set('Content-Range',`bytes ${start}-${end}/${a.size}`);
+    const stream=request?.method==='HEAD'?null:new ReadableStream<Uint8Array>({pull:async controller=>{
+      try{
+        await this.chat(chat.id,actor);
+        if(position>end){controller.close();return;}
+        const index=Math.floor(position/CHUNK),chunk=await this.chunk(chat.id,a.id,index);
+        const bytes=chunk.subarray(position%CHUNK,Math.min(chunk.length,end-index*CHUNK+1));
+        if(!bytes.length)throw fail('attachment_incomplete','Attachment data missing');
+        position+=bytes.length;controller.enqueue(bytes);
+      }catch(e){controller.error(e);}
+    }},{highWaterMark:0});
+    return new Response(stream,{status:range?206:200,headers});
+  }
+
+  /** tus core + creation only. Each persisted prefix is independently authenticated and resumable. */
+  async tus(request:Request,chatId:string,id:string|undefined,actor:ChatPrincipal):Promise<Response>{
+    const headers=new Headers({'Tus-Resumable':TUS_VERSION,'Cache-Control':'no-store'});
+    const reply=(status:number)=>new Response(null,{status,headers});
+    let held:string|undefined;
+    try{
+      await this.initialize();const chat=await this.chat(chatId,actor);
+      if(request.method==='OPTIONS'){
+        headers.set('Tus-Version',TUS_VERSION);headers.set('Tus-Extension','creation');
+        headers.set('Tus-Max-Size',String(MAX_ATTACHMENT_SIZE));return reply(204);
+      }
+      if(request.headers.get('Tus-Resumable')!==TUS_VERSION){headers.set('Tus-Version',TUS_VERSION);return reply(412);}
+      if(!id&&request.method==='POST'){
+        const size=unsignedHeader(request.headers.get('Upload-Length'));
+        if(size===undefined||request.headers.has('Upload-Defer-Length')||request.headers.has('Upload-Concat'))return reply(400);
+        if(size>MAX_ATTACHMENT_SIZE)return reply(413);
+        // Creation-with-upload is not advertised or accepted.
+        if(Number(request.headers.get('Content-Length')??0)>0)return reply(400);
+        if(request.body){
+          const reader=request.body.getReader();let timer:ReturnType<typeof setTimeout>|undefined;
+          try{
+            const empty=async()=>{for(;;){const part=await reader.read();if(part.done)return true;if(part.value.length)return false;}};
+            if(!await Promise.race([empty(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(fail('upload_timeout','Upload stalled')),5000);})]))return reply(400);
+          }finally{clearTimeout(timer);await cancelBody(reader);}
+        }
+        let metadata:Record<string,string>;try{metadata=uploadMetadata(request.headers.get('Upload-Metadata'));}catch{return reply(400);}
+        const retryKey=request.headers.get('Idempotency-Key');
+        if(retryKey!==null&&!/^[A-Za-z0-9_.:-]{1,200}$/.test(retryKey))return reply(400);
+        const result=await this.startUpload(chat,{name:metadata.filename||'attachment',mime_type:metadata.filetype||'application/octet-stream',size,request_key:retryKey?'tus:'+retryKey:crypto.randomUUID(),protocol:'tus',upload_metadata:request.headers.get('Upload-Metadata')??undefined},actor);
+        if(!size)await this.completeUpload(chat,{attachment_id:result.attachment.id},actor);
+        headers.set('Location',new URL('/chat/uploads/'+chatId+'/'+result.attachment.id,this.env.publicUrl).href);
+        headers.set('Upload-Offset','0');return reply(201);
+      }
+      if(!id)return reply(405);
+      const a=await this.attachment(chat.id,id);
+      if(a.protocol!=='tus')return reply(404);
+      if(a.expires_at&&a.expires_at<=Date.now())return reply(410);
+      headers.set('Upload-Offset',String(a.offset));headers.set('Upload-Length',String(a.size));
+      if(a.upload_metadata!==undefined)headers.set('Upload-Metadata',a.upload_metadata);
+      // Recover a completed byte stream whose final digest transaction lost its
+      // response or failed. A standard tus client's HEAD must not report success
+      // while the finished attachment remains unusable.
+      if(request.method==='HEAD'){
+        if(a.offset===a.size&&a.state!=='ready')await this.completeUpload(chat,{attachment_id:id},actor);
+        return reply(200);
+      }
+      if(request.method!=='PATCH')return reply(405);
+      if(request.headers.get('Content-Type')!=='application/offset+octet-stream')return reply(415);
+      if(request.headers.has('Upload-Checksum')||request.headers.has('Upload-Concat')||request.headers.has('Upload-Length'))return reply(400);
+      const offset=unsignedHeader(request.headers.get('Upload-Offset'));
+      if(offset===undefined)return reply(400);
+      if(offset!==a.offset)return reply(409);
+      const length=unsignedHeader(request.headers.get('Content-Length'));
+      if(length!==undefined&&(length>MAX_PATCH_SIZE||length>a.size-offset))return reply(413);
+      if(request.headers.has('Content-Length')&&length===undefined)return reply(400);
+      const lock=chat.id+':'+id;
+      if(this.uploadRequests.has(lock))return reply(409);
+      if(this.uploadRequests.size>=8)return reply(429);
+      this.uploadRequests.add(lock);held=lock;
+      const reader=request.body?.getReader();let position=offset,total=0;
+      const deadline=Date.now()+300_000;
+      try{
+        if(reader)for(;;){
+          let timer:ReturnType<typeof setTimeout>|undefined;
+          const part=await Promise.race([reader.read(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(fail('upload_timeout','Upload stalled')),Math.max(1,Math.min(30_000,deadline-Date.now())));})]).finally(()=>clearTimeout(timer));
+          if(part.done)break;
+          if(total+part.value.length>MAX_PATCH_SIZE||position+part.value.length>a.size)return reply(413);
+          total+=part.value.length;
+          for(let cursor=0;cursor<part.value.length;){
+            const take=Math.min(CHUNK-position%CHUNK,part.value.length-cursor);
+            const bytes=part.value.subarray(cursor,cursor+take);
+            position=await this.store.transaction(async tx=>{
+              await this.access(actor,chat.device,tx);
+              if(!await tx.get(key(chat.id)))throw fail('chat_deleted','Chat deleted');
+              const current=await tx.get<Attachment>(attachmentKey(chat.id,id));
+              if(!current||current.expires_at&&current.expires_at<=Date.now())throw fail('upload_expired','Upload expired');
+              if(current.offset!==position||current.state!=='uploading')throw fail('upload_offset','Upload offset changed');
+              const index=Math.floor(position/CHUNK),prefix=position%CHUNK;
+              const merged=new Uint8Array(prefix+take);
+              if(prefix){
+                const old=this.env.blobs?await this.env.blobs.read(chat.id,id,index):from64((await tx.get<string>(chunkKey(chat.id,id,index)))!);
+                if(old.length<prefix)throw fail('attachment_incomplete','Attachment data missing');
+                merged.set(old.subarray(0,prefix));
+              }
+              merged.set(bytes,prefix);
+              // Bytes become durable before committing the visible offset. An uncommitted tail is ignored on retry.
+              if(this.env.blobs)await this.env.blobs.write(chat.id,id,index,merged);else await tx.put(chunkKey(chat.id,id,index),to64(merged));
+              current.offset+=take;current.chunks=Math.ceil(current.offset/CHUNK);current.expires_at=Date.now()+86_400_000;
+              await tx.put(attachmentKey(chat.id,id),current);await this.expiry(tx,'upload',chat.id+':'+id,current.expires_at);
+              return current.offset;
+            });
+            headers.set('Upload-Offset',String(position));cursor+=take;
+          }
+        }
+        if(length!==undefined&&length!==total)return reply(400);
+        if(position===a.size)await this.completeUpload(chat,{attachment_id:id},actor);
+        return reply(204);
+      }finally{await cancelBody(reader);}
+    }catch(error){
+      const code=(error as Data).code;
+      if(code==='upload_offset'||code==='upload_conflict'||code==='request_conflict')return reply(409);
+      if(code==='upload_limit')return reply(429);
+      if(code==='upload_timeout')return reply(408);
+      if(code==='upload_expired')return reply(410);
+      if(code==='attachment_not_found'||code==='chat_not_found'||code==='chat_deleted')return reply(404);
+      if(code==='invalid_chat_argument')return reply(400);
+      // Authentication errors remain under the gateway's normal authentication/error handler.
+      throw error;
+    }finally{if(held)this.uploadRequests.delete(held);}
   }
   private async erase(chat:Conversation,actor:ChatPrincipal):Promise<void>{
     const attachments=await this.store.transaction(async tx=>{

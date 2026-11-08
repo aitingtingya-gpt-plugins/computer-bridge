@@ -10,6 +10,7 @@ from typing import cast
 from .common import Json, uid
 
 CHUNK = 128 * 1024
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
 
 
 class Sender:
@@ -59,14 +60,45 @@ class Sender:
 
 
 class Frames:
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int = MAX_REQUEST_BYTES, max_partial: int = 8) -> None:
         self.parts: dict[str, list[str]] = {}
+        self.sizes: dict[str, int] = {}
+        self.max_bytes, self.max_partial = max_bytes, max_partial
 
     def receive(self, text: str) -> Json | None:
-        value: Json = json.loads(text)
+        if len(text) > self.max_bytes or len(text.encode("utf-8")) > self.max_bytes:
+            raise ConnectionError("Computer request exceeds bounded message limit")
+        try:
+            value: Json = json.loads(text)
+        except (ValueError, TypeError) as exc:
+            raise ConnectionError("Invalid computer request JSON") from exc
+        if not isinstance(value, dict):
+            raise ConnectionError("Computer request must be an object")
         if value.get("type") != "frame":
             return value
-        self.parts.setdefault(value["id"], []).append(value["data"])
+        identity, sequence, data = value.get("id"), value.get("sequence"), value.get("data")
+        if (not isinstance(identity, str) or not 1 <= len(identity) <= 128 or type(sequence) is not int
+                or not isinstance(data, str) or type(value.get("last")) is not bool):
+            raise ConnectionError("Invalid computer message frame")
+        parts = self.parts.get(identity, [])
+        if sequence != len(parts):
+            raise ConnectionError("Computer message frame is out of order")
+        if identity not in self.parts and len(self.parts) >= self.max_partial:
+            raise ConnectionError("Too many unfinished computer messages")
+        size = self.sizes.get(identity, 0) + len(data.encode("utf-8"))
+        if size > self.max_bytes:
+            self.parts.pop(identity, None)
+            self.sizes.pop(identity, None)
+            raise ConnectionError("Computer request exceeds bounded message limit; use file transfer")
+        self.parts.setdefault(identity, parts).append(data)
+        self.sizes[identity] = size
         if not value["last"]:
             return None
-        return cast(Json, json.loads("".join(self.parts.pop(value["id"]))))
+        self.sizes.pop(identity, None)
+        try:
+            result = json.loads("".join(self.parts.pop(identity)))
+        except (ValueError, TypeError) as exc:
+            raise ConnectionError("Invalid reassembled computer request") from exc
+        if not isinstance(result, dict):
+            raise ConnectionError("Computer request must be an object")
+        return cast(Json, result)

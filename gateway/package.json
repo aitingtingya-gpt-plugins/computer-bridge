@@ -1,6 +1,6 @@
 {
   "name": "computer-bridge-gateway",
-  "version": "0.2.5-beta",
+  "version": "0.2.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,16 +9,17 @@
     "check": "tsc --noEmit",
     "build": "node build.mjs",
     "start": "node --env-file=.env build/launcher.mjs",
-    "prebuild": "node build-chat.mjs"
+    "prebuild": "node build-transfer-client.mjs && node build-chat.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^1.2.4",
     "@modelcontextprotocol/server": "^2.3.1",
     "@noble/hashes": "2.4.0",
-    "fflate": "0.8.2",
+    "fflate": "0.8.3",
     "ipaddr.js": "2.5.0",
     "semver": "7.8.5",
     "standardwebhooks": "1.1.1",
+    "tus-js-client": "4.3.1",
     "ws": "8.21.0",
     "zod": "^4.6.7"
   },

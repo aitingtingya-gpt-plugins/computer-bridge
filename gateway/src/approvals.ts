@@ -14,11 +14,13 @@ const canonical = (value: any): any => Array.isArray(value) ? value.map(canonica
 
 export class CommandApprovals {
   private flushing = new Map<string, Promise<void>>()
+  private deliveringTools = new Map<string, Promise<Data>>()
   constructor(private store: Store,
     private rpc: (device: string, method: string, args: Data) => Promise<Data>,
     private schedule?: (work: Promise<void>) => void,
     private changed?: (device: string, records: Data[]) => Promise<void>,
-    private projectCard?: (tx: KeyStore, record: Data, details?: Data) => Promise<void>) {}
+    private projectCard?: (tx: KeyStore, record: Data, details?: Data) => Promise<void>,
+    private executeTool?: (record: Data) => Promise<Data>) {}
 
   private async notify(records:Data[]):Promise<void>{
     const devices=new Map<string,Data[]>();
@@ -34,6 +36,7 @@ export class CommandApprovals {
       account: projection.account || 'u1', account_epoch: projection.account_epoch ?? 0,
       revision: details.revision, expires_at: details.expires_at * 1000,
       state: details.state, channel: projection.approval_channel || 'host', projection,
+      ...(details.tool ? {tool: details.tool} : {}),
       ...(projection.approval_channel === 'chat' && projection.approval_chat_id ? {chat_id: projection.approval_chat_id} : {})}
     let updated = false
     const saved = await this.store.transaction(async tx => {
@@ -77,12 +80,15 @@ export class CommandApprovals {
   async details(id: string, caller?: string): Promise<Data> {
     await this.expire()
     let record = await this.record(id, caller)
+    if (record.tool) return {...record.tool, id, state:record.state, decision:record.decision,
+      expires_at:record.expires_at / 1000, channel:record.channel, delivery_pending:!!record.delivery_pending}
     const details = await this.rpc(record.device, 'computer.approval_details',
       {session: record.session, operation: record.operation})
     if (details.id !== id || details.digest !== record.digest) throw new Error('审批详情不匹配')
     record = await this.register(details, record.projection)
     return {...details, state: record.state, decision: record.decision || details.decision,
-      channel: record.channel || 'host', delivery_pending: !!record.delivery_pending}
+      channel: record.channel || 'host', delivery_pending: !!record.delivery_pending,
+      ...(record.projection.permission_confirmation ? {permission_confirmation:true} : {})}
   }
 
   async ticket(id: string, caller: string, method: string, args: Data): Promise<string> {
@@ -158,6 +164,13 @@ export class CommandApprovals {
   }
 
   private async deliver(record: Data): Promise<Data> {
+    if (record.tool) {
+      const active=this.deliveringTools.get(record.id)
+      if (active) return active
+      const work=this.deliverTool(record.id)
+      this.deliveringTools.set(record.id, work)
+      try {return await work} finally {this.deliveringTools.delete(record.id)}
+    }
     if (!record.delivery_pending) return this.rpc(record.device, 'computer.wait',
       {session: record.session, operation: record.operation, seconds: 0})
     const details = await this.rpc(record.device, 'computer.approval_details',
@@ -174,18 +187,53 @@ export class CommandApprovals {
         {session: record.session, operation: record.operation, approval_id: record.id,
           digest: record.digest, decision, _caller: record.caller})
     }
+    await this.settle(record, details.state === 'expired' || details.state === 'invalidated' ? details.state : undefined)
+    return result
+  }
+
+  private async deliverTool(id:string):Promise<Data> {
+    const record=await this.store.transaction(async tx=>{
+      const current=(await tx.get<Data>('command-approval:'+id))!
+      if(current.delivery_pending && (current.delivery_decision || current.decision)==='allowed-once')
+        await this.authorize(tx,current)
+      return current
+    })
+    const result=await this.executeTool!(record)
+    if(record.delivery_pending)await this.settle(record,result.approval_state==='invalidated'?'invalidated':undefined)
+    return result
+  }
+
+  private async settle(record:Data,state?:string):Promise<void> {
     await this.store.transaction(async tx => {
       const key = 'command-approval:' + record.id
       const current = await tx.get<Data>(key)
       if (current?.decision === record.decision) {
-        const updated = {...current, delivery_pending: false,
-          ...(details.state === 'expired' || details.state === 'invalidated' ? {state: details.state} : {})}
+        const updated = {...current, delivery_pending: false, ...(state ? {state} : {})}
         await this.projectCard?.(tx, updated)
         await tx.put(key, updated)
       }
     })
     await this.notify([record])
-    return result
+  }
+
+  async invalidateTools(device:string,revision:number):Promise<void> {
+    const changed=await this.store.transaction(async tx=>{
+      const result:Data[]=[]
+      for(const [key,record] of await tx.list<Data>({prefix:'command-approval:'})){
+        if(record.device!==device || record.revision===revision || !record.tool || record.state!=='pending')continue
+        const updated={...record,state:'invalidated',decision:'cancelled',delivery_pending:true}
+        await this.projectCard?.(tx,updated)
+        await tx.put(key,updated)
+        result.push(updated)
+      }
+      return result
+    })
+    await this.notify(changed)
+    if(changed.length){
+      const delivery=this.flush(device)
+      if(this.schedule)this.schedule(delivery)
+      else void delivery
+    }
   }
 
   /** Revocation changes only unapproved commands; previously accepted work keeps its lifecycle. */

@@ -1,3 +1,6 @@
+import {exportChat} from './export.mjs';
+import './uploads.mjs';
+window.bridgeChatExport=exportChat;
 import {renderMessage} from './core.mjs';
 let sheet,timer;const queue=[],cache=new Map();
 function show(node,rendered){

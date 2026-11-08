@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
+import heapq
+import itertools
 import json
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from types import FunctionType
 from typing import Any
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline import StateInline
 from markdown_it.token import Token
-from mdit_py_plugins.amsmath import amsmath_plugin
+from mdit_py_plugins.amsmath import amsmath_block, amsmath_plugin
 from mdit_py_plugins.texmath import texmath_plugin
 from prompt_toolkit.formatted_text import PygmentsTokens, to_formatted_text
 from pygments import lex  # type: ignore[import-untyped]
@@ -22,7 +26,12 @@ from pygments.lexers import TextLexer, get_lexer_by_name  # type: ignore[import-
 from pygments.util import ClassNotFound  # type: ignore[import-untyped]
 
 from .chat_cells import display_width, graphemes, split_lines
-from .chat_math import formula as render_formula
+from .chat_math import MathResult
+from .chat_math_compile import MathCompiler
+from .chat_math_layout import layout as layout_math
+
+_standalone_compiler = MathCompiler()
+atexit.register(_standalone_compiler.close)
 
 Fragment = tuple[str, str, tuple[str, str] | None]
 Row = list[Fragment]
@@ -44,7 +53,9 @@ def width(text: str) -> int:
 
 
 def formula(tex: str) -> tuple[str | None, str]:
-    result = render_formula(tex)
+    document = _standalone_compiler.compile("$$\n" + tex + "\n$$", "formula")
+    entry = document["formulas"][0]
+    result = layout_math(entry["tree"]) if not entry.get("error") else MathResult(None, entry["error"], "invalid")
     return result.text, result.reason
 
 
@@ -56,6 +67,11 @@ def parser() -> MarkdownIt:
         .use(texmath_plugin, delimiters="brackets")
         .use(amsmath_plugin)
     )
+    # Match the shared compiler's named environments, including custom ones.
+    # The dependency's original function and global environment list stay intact.
+    namespace = {**amsmath_block.__globals__, "RE_OPEN": r"\\begin\{([A-Za-z][A-Za-z0-9]*)(\*?)\}"}
+    environment_rule = FunctionType(amsmath_block.__code__, namespace)
+    md.block.ruler.at("amsmath", environment_rule)
 
     def unclosed(state: StateInline, silent: bool) -> bool:
         rest = state.src[state.pos :]
@@ -86,7 +102,12 @@ def has_math(text: str) -> bool:
     )
 
 
-def render_body(text: str, identifier: str, columns: int) -> Body:
+def render_body(text: str, identifier: str, columns: int, document: dict[str, Any] | None = None) -> Body:
+    if document is None:
+        try:
+            document = _standalone_compiler.compile(text, identifier) if has_math(text) else {"formulas": []}
+        except (OSError, ValueError, RuntimeError) as error:
+            document = {"formulas": [], "error": str(error)}
     rows: list[Row] = []
     sources: list[int] = []
     formulas: list[str] = []
@@ -118,7 +139,7 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
 
     def content(row: Row, position: int) -> None:
         leading = prefix()
-        append(([("", leading, None)] if leading else []) + row, position)
+        append(([("class:md.quote" if quote else "", leading, None)] if leading else []) + row, position)
         if items:
             items[-1] = items[-1][0], False
 
@@ -140,7 +161,13 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
     ) -> list[tuple[Row, int]]:
         if record:
             formulas.append(tex)
-        result = render_formula(tex)
+        entries = [entry for entry in document.get("formulas", []) if entry["tex"].strip() == tex.strip()]
+        if entries:
+            entry = min(entries, key=lambda item: abs(item["start"] - position))
+            result = (MathResult(None, entry["error"], "invalid") if entry.get("error")
+                      else layout_math(entry["tree"]))
+        else:
+            result = MathResult(None, str(document.get("error") or "此公式未取得可靠的数学编译结果"), "unsupported")
         if result.text is None or any(
             width(line) > available for line in result.text.split("\n")
         ):
@@ -158,10 +185,11 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
                     position,
                 ),
             ]
-        rendered = [
+        styled = getattr(result, "rows", ())
+        rendered = ([(list(row), position) for row in styled] if styled else [
             (text_row(line, "class:md.math"), position)
             for line in result.text.split("\n")
-        ]
+        ])
         if not inline:
             rendered.append(
                 (
@@ -205,7 +233,7 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
             location = point(token, cursor)
             if kind in {"strong_open", "em_open", "s_open"}:
                 styles.append(
-                    {"strong_open": "bold", "em_open": "italic", "s_open": "strike"}[
+                    {"strong_open": "class:md.strong bold", "em_open": "italic", "s_open": "strike"}[
                         kind
                     ]
                 )
@@ -421,7 +449,7 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
             available = max(1, columns - width(prefix()))
             for row, position in inline_rows(token, available):
                 styled = [
-                    ("class:md.heading " + style if heading else style, value, action)
+                    (("class:md.heading " if heading else "class:md.quote " if quote else "") + style, value, action)
                     for style, value, action in row
                 ]
                 content(styled, position)
@@ -494,21 +522,56 @@ def render_body(text: str, identifier: str, columns: int) -> Body:
 class MarkdownWorker:
     """One background worker per TUI; drawing never parses or typesets messages."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings: dict[str, Any] | None = None) -> None:
         self.executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="bridge-markdown"
         )
         self.tasks: dict[tuple[int, str, str, int], asyncio.Task[None]] = {}
+        self.compiler = MathCompiler(settings)
+        self.queue: list[tuple[int, int, str, str, int, asyncio.Future[Body]]] = []
+        self.sequence = itertools.count()
+        self.runner: asyncio.Task[None] | None = None
 
-    async def body(self, text: str, identifier: str, columns: int) -> Body:
-        return await asyncio.get_running_loop().run_in_executor(
-            self.executor, render_body, text, identifier, columns
-        )
+    def _body(self, text: str, identifier: str, columns: int) -> Body:
+        try:
+            document = self.compiler.compile(text, identifier) if has_math(text) else {"formulas": []}
+        except (OSError, ValueError, RuntimeError) as error:
+            document = {"formulas": [], "error": str(error)}
+        return render_body(text, identifier, columns, document)
+
+    async def body(self, text: str, identifier: str, columns: int, *, priority: int = 0) -> Body:
+        future: asyncio.Future[Body] = asyncio.get_running_loop().create_future()
+        heapq.heappush(self.queue, (priority, next(self.sequence), text, identifier, columns, future))
+        if self.runner is None or self.runner.done():
+            self.runner = asyncio.create_task(self._drain())
+        return await future
+
+    async def _drain(self) -> None:
+        while self.queue:
+            _, _, text, identifier, columns, future = heapq.heappop(self.queue)
+            if future.cancelled():
+                continue
+            try:
+                body = await asyncio.get_running_loop().run_in_executor(
+                    self.executor, self._body, text, identifier, columns
+                )
+            except Exception as error:
+                if not future.done():
+                    future.set_exception(error)
+            else:
+                if not future.done():
+                    future.set_result(body)
 
     def close(self) -> None:
         for task in self.tasks.values():
             task.cancel()
+        if self.runner:
+            self.runner.cancel()
+        for *_, future in self.queue:
+            future.cancel()
+        self.queue.clear()
         self.executor.shutdown(wait=True, cancel_futures=True)
+        self.compiler.close()
 
 
 async def preview(

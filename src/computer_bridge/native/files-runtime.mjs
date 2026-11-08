@@ -5278,7 +5278,9 @@ async function execute({ operation, path, args }) {
   let result;
   if (operation === "read") {
     const offset = args.offset ?? 0;
-    const length = args.length ?? Math.max(0, before.size - offset);
+    const length = args.length ?? 256 * 1024;
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(length) || length < 1 || length > 1024 * 1024)
+      throw Object.assign(new Error("Use a 1..1048576 byte read window or direct file transfer"), { code: "read_range" });
     const bytes = await fs.readByteRange(target, { offset, length });
     const sample = offset === 0 ? bytes.subarray(0, 8192) : await fs.readByteRange(target, { offset: 0, length: 8192 });
     result = {

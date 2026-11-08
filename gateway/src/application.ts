@@ -177,9 +177,9 @@ async function commandApproval(request: Request, env: ApplicationEnv): Promise<R
     return new Response(denied.body,{status:response.status,headers:denied.headers});
   }
   const pending=details.state==='pending' && details.expires_at*1000>Date.now();
-  const rendered=page('命令审批',`<section class="auth-card">${error?'<p role="alert">'+escape(error)+'</p>':''}
-    <p>设备 ${escape(details.device)}</p><p>工作目录 ${escape(details.cwd)}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escape(details.command)}</pre>
-    <p>申请理由 ${escape(details.justification || '')}</p><p>本次命令以当前登录用户权限在工作区沙盒外运行，授权包含其子进程及后续交互输入。</p>
+  const rendered=page(details.method?'工具审批':'命令审批',`<section class="auth-card">${error?'<p role="alert">'+escape(error)+'</p>':''}
+    <p>设备 ${escape(details.device)}</p><p>工作目录 ${escape(details.cwd)}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escape(details.summary??details.command)}</pre>
+    <p>申请理由 ${escape(details.justification || '')}</p><p>${details.method?'仅批准这一次工具调用，工作区限制保持不变。':(details.permission_confirmation?'本次同时申请使用命令工具。':'')+'本次命令以当前登录用户权限在工作区沙盒外运行，授权包含其子进程及后续交互输入。'}</p>
     <p>状态 ${escape(details.state)} · 有效期至 ${escape(new Date(details.expires_at*1000).toISOString())}</p>
     ${pending?'<form method="post"><input type="hidden" name="csrf" value="'+escape(actor.nonce)+'"><button name="decision" value="allowed-once">接受</button> <button name="decision" value="rejected">拒绝</button> <button name="decision" value="cancelled">取消</button></form>':''}</section>`);
   return error?new Response(rendered.body,{status:errorStatus,headers:rendered.headers}):rendered;
@@ -204,7 +204,7 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
 }
 
 const chatActions=new Set(['list','create','get','history','sync','timing','send','rename','delete','upload-start','upload-chunk',
-  'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide']);
+  'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide','device-access','device-access-save']);
 
 /** Native device credentials are supplied in headers, never in a URL or browser cookie. */
 function nativeChatCredentials(request:Request):Data|null {
@@ -292,9 +292,22 @@ async function chat(request:Request,env:ApplicationEnv):Promise<Response> {
     return page('连接终端聊天',chatBindingPage(actor,value,actor.nonce));
   }
   if(request.method==='POST') return Response.redirect(env.PUBLIC_URL+url.pathname+url.search,303);
-  const response=await control(env,'list',{},actor);
+  const response=await control(env,'chat-devices',{},actor);
   const {computers}=await response.json<Data>();
   return page('聊天',chatPage(actor,computers || [],url.searchParams.get('device') || '',url.searchParams.get('id') || ''),undefined,'management-page chat-page');
+}
+
+/** Forward upload bytes without materializing them in JSON. Strip untrusted internal identity. */
+async function chatUpload(request:Request,env:ApplicationEnv):Promise<Response> {
+  if(!/^\/chat\/uploads\/t[1-9][0-9]*(?:\/a[1-9][0-9]*)?$/.test(new URL(request.url).pathname))return json({error:'invalid_upload'},404);
+  const headers=new Headers(request.headers);
+  headers.delete('x-computer-bridge-account');headers.delete('x-computer-bridge-epoch');
+  if(!nativeChatCredentials(request) && !headers.get('authorization')?.startsWith('Bearer ')) {
+    const actor=await identity(request,env);if(!actor)return json({error:'login_required'},401);
+    if(!['HEAD','OPTIONS'].includes(request.method) && (headers.get('x-csrf-token')!==actor.nonce || headers.has('origin') && headers.get('origin')!==new URL(env.PUBLIC_URL).origin))return json({error:'invalid_form'},403);
+    headers.set('x-computer-bridge-account',actor.id);headers.set('x-computer-bridge-epoch',String(actor.epoch));
+  }
+  return env.service(new Request(request,{headers}));
 }
 
 async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response> {
@@ -304,14 +317,15 @@ async function chatDownload(request:Request,env:ApplicationEnv):Promise<Response
   if(!match)return json({error:'invalid_attachment'},400);
   const authorization=request.headers.get('authorization');
   const native=nativeChatCredentials(request);
+  const download_request={method:request.method,range:request.headers.get('range'),if_range:request.headers.get('if-range')};
   let response:Response;
-  if(native)response=await control(env,'chat-native-download',{...native,chat_id:match[1],attachment_id:match[2]});
+  if(native)response=await control(env,'chat-native-download',{...native,chat_id:match[1],attachment_id:match[2],download_request});
   else if(authorization?.startsWith('Bearer ')) response=await control(env,'chat-credential-download',{
-    credential:authorization.slice(7),chat_id:match[1],attachment_id:match[2]});
+    credential:authorization.slice(7),chat_id:match[1],attachment_id:match[2],download_request});
   else {
     const actor=await identity(request,env);
     if(!actor)return Response.redirect(env.PUBLIC_URL+'/chat',303);
-    response=await control(env,'chat-download',{chat_id:match[1],attachment_id:match[2]},actor);
+    response=await control(env,'chat-download',{chat_id:match[1],attachment_id:match[2],download_request},actor);
   }
   const headers=new Headers(response.headers);
   headers.set('X-Content-Type-Options','nosniff');
@@ -396,6 +410,8 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
   if (url.pathname === "/device/connect") return env.service(request);
   if(url.pathname.startsWith('/device/update-asset/')) return env.service(request);
   if(url.pathname.startsWith('/device/bootstrap')) return env.service(request);
+  if(url.pathname.startsWith('/chat/uploads/'))return chatUpload(request,env);
+  if(url.pathname.startsWith('/transfers/'))return env.service(request);
   if (url.pathname.startsWith('/download/')) return download(request,env);
   if (url.pathname === "/health") return json({service: "computer-bridge", version: VERSION,modules:installedModules.map(module=>({id:module.id,version:module.version}))});
   if (url.pathname === "/") return page("Computer Bridge", '<a href="/manage">设备管理</a> · <a href="/chat">聊天</a>');

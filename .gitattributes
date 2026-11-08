@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# Generated JavaScript includes literal dependency strings and license text.
+# Preserve the exact built bytes and do not lint whitespace inside those strings.
+src/computer_bridge/native/chat-math*.mjs -text !eol -whitespace

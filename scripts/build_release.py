@@ -55,10 +55,19 @@ def main() -> None:
     )
     for name in ("pyproject.toml", "constraints.txt", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         shutil.copyfile(ROOT / name, client / name)
+    (client / 'scripts').mkdir()
+    shutil.copyfile(ROOT / 'scripts/transfer_file.py', client / 'scripts/transfer_file.py')
+    (client / 'docs').mkdir()
+    for name in ('file-transfer.md', 'attachment-http.md'):
+        shutil.copyfile(ROOT / 'docs' / name, client / 'docs' / name)
     client_zip = output / f"computer-bridge-client-{version}.zip"
     archive(client, client_zip)
     server = stage / "server"
     shutil.copytree(ROOT / "gateway/build", server / "build")
+    shutil.copyfile(ROOT / 'scripts/transfer_file.py', server / 'transfer_file.py')
+    (server / 'docs').mkdir()
+    for name in ('file-transfer.md', 'attachment-http.md'):
+        shutil.copyfile(ROOT / 'docs' / name, server / 'docs' / name)
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
         shutil.copyfile(ROOT / name, server / name)
     package = {

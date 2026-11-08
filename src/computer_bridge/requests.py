@@ -45,6 +45,8 @@ class Requests:
         columns = {row["name"] for row in self.db.execute("PRAGMA table_info(requests)")}
         if "operation_id" not in columns:
             self.db.execute("ALTER TABLE requests ADD COLUMN operation_id TEXT")
+        if "transfer_args" not in columns:
+            self.db.execute("ALTER TABLE requests ADD COLUMN transfer_args TEXT")
         self.db.execute("UPDATE requests SET state='unknown' WHERE state='running'")
         self.db.commit()
         self.tasks: dict[str, asyncio.Task[Json]] = {}
@@ -75,8 +77,8 @@ class Requests:
                 return await asyncio.shield(self.tasks[identity])
             return await self.result(identity)
         self.db.execute(
-            "INSERT INTO requests(id,fingerprint,method,state,created) VALUES(?,?,?,'running',?)",
-            (identity, fingerprint, request["method"], time.time()),
+            "INSERT INTO requests(id,fingerprint,method,state,created,transfer_args) VALUES(?,?,?,'running',?,?)",
+            (identity, fingerprint, request["method"], time.time(), self.transfer_recipe(request)),
         )
         self.db.commit()
 
@@ -93,7 +95,7 @@ class Requests:
             finally:
                 _operation_binding.reset(token)
             await asyncio.to_thread(save, self.directory / (identity + ".json"), response)
-            if self.readonly(request) and "result" in response:
+            if not request.get("retain_result") and self.readonly(request) and "result" in response:
                 parameters = dict(request["params"])
                 parameters.pop("_access", None)
                 if request["method"] == "computer.files" and parameters["operation"] == "read":
@@ -120,6 +122,18 @@ class Requests:
         return await asyncio.shield(task)
 
     @staticmethod
+    def transfer_recipe(request: Json) -> str | None:
+        args = request.get("params", {})
+        if (request["method"] != "computer.transfer" or args.get("action") not in {"upload_begin", "download_begin"}
+                or not args.get("request_key")):
+            return None
+        # No data blocks or approval claims in this recipe. The transfer's own
+        # fsynced journal must prove an ask-mode approval after a restart.
+        return json.dumps({key: args[key] for key in (
+            "session", "action", "path", "size", "sha256", "overwrite", "request_key", "_tool_revision"
+        ) if key in args})
+
+    @staticmethod
     def readonly(request: Json) -> bool:
         method, args = request["method"], request["params"]
         return (
@@ -135,16 +149,28 @@ class Requests:
                 "computer.present",
             }
             or (method == "computer.files" and args["operation"] in {"read", "list", "glob", "search"})
+            or (method == "computer.transfer" and args["action"] in {"download_read", "download_status", "upload_status"})
             or method == "computer.wait"
             and not args.get("consume")
         )
 
     async def result(self, identity: str) -> Json:
         row = self.db.execute(
-            "SELECT method,state,completed,operation_id FROM requests WHERE id=?", (identity,)
+            "SELECT method,state,created,completed,operation_id,transfer_args FROM requests WHERE id=?", (identity,)
         ).fetchone()
         if row is None:
             raise Error("request_missing", "电脑尚未收到这个请求，可使用原 request_key 重试原调用")
+        if (row["state"] == "unknown" and row["transfer_args"] is not None
+                and row["created"] >= time.time() - 86400):
+            # This is the only non-command restart recipe. Begin has a stable
+            # identity and immutable parameters, and cannot recreate ask-mode
+            # approval if no original transfer journal survived.
+            response = {"result": await self.read("computer.transfer", json.loads(row["transfer_args"]))}
+            self.validate("computer.transfer", response)
+            await asyncio.to_thread(save, self.directory / (identity + ".json"), response)
+            self.db.execute("UPDATE requests SET state='completed',completed=? WHERE id=?", (time.time(), identity))
+            self.db.commit()
+            return response
         if row["state"] == "unknown" and row["operation_id"]:
             operation = self.directory.parent / "operations" / row["operation_id"]
             if (operation / "result.json").is_file():

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from . import __version__
-from .access import Access, reclaim_grants, validate_access
+from .access import Access, check_write, reclaim_grants, validate_access
 from .adapters import Registry
 from .common import Error, Json, save, uid
 from .files import LocalFiles
@@ -21,8 +21,15 @@ from .modules import Modules
 from .operations import Operations
 from .power import Power
 from .requests import Requests
+from .tool_approvals import ToolApprovals
+from .transfers import Transfers
 from .update_control import UpdateControl
-from .workspace_paths import create_directories, inspect_access, missing_directories, usable_roots
+from .workspace_paths import (
+    create_directories,
+    inspect_access,
+    missing_directories,
+    usable_roots,
+)
 
 
 class Computer:
@@ -31,6 +38,7 @@ class Computer:
         self.settings = json.loads(config.read_text(encoding="utf-8"))
         self.directory = config.parent
         self.requests = Requests(self.directory / "requests", self.execute, self.validate_receipt)
+        self.tool_approvals = ToolApprovals(self.directory / "tool-requests", self.requests)
         self.session_file = self.directory / "workspaces.json"
         self.sessions: Json = json.loads(self.session_file.read_text(encoding="utf-8")) if self.session_file.exists() else {}
         self.operations = Operations(self.directory / "operations")
@@ -43,10 +51,16 @@ class Computer:
         self.access = Access(
             self.settings.get("access", {"full_access": True, "workspaces": [], "revision": 0})
         )
+        self.transfers = Transfers(self.directory / "transfers", self.transfer_path,
+                                   revision=lambda: self.access.value["revision"],
+                                   permission=self.transfer_permission)
+        self.transfers.reap()
         self.access_lock = asyncio.Lock()
         self.power = Power(self.settings.get("lock_mode", {"enabled": True, "revision": 0}))
 
     def validate_receipt(self, method: str, response: Json) -> None:
+        if method == "computer.transfer" and "result" in response:
+            self.transfers.validate_receipt(response["result"])
         if method in {"computer.exec", "computer.web", "computer.wait"}:
             identity = response.get("result", {}).get("operation")
             if identity and not (self.operations.directory / identity / "metadata.json").exists():
@@ -66,7 +80,7 @@ class Computer:
             "lock_mode": self.power.status(),
             "request_protocol": 1,
             "protocol": {"min": 1, "max": 1},
-            "capabilities": ["request_recovery", "module_registry", "transport_v2", "command_approval_v1"]
+            "capabilities": ["request_recovery", "module_registry", "transport_v2", "command_approval_v1", "tool_permissions_v1", "resumable_file_transfer_v1"]
             + (["updates_v1"] if self.updates.supported() else []),
             "module_versions": self.modules.status(),
             "install_id": os.environ.get("COMPUTER_BRIDGE_INSTALL_ID"),
@@ -77,10 +91,36 @@ class Computer:
             raise Error("session_missing", "请先在所选电脑打开工作目录")
         return Path(self.sessions[session]["path"])
 
+    def transfer_path(self, session: str, value: str, write: bool) -> Path:
+        root = self.root(session)
+        roots = self.access.roots(self.sessions[session])
+        path = LocalFiles(root).path(value)
+        if write:
+            check_write(path, roots)
+        return path
+
+    def transfer_permission(self, approved: bool) -> None:
+        policies = self.access.value.get("tool_permissions", {})
+        modes = [policies.get(name, "allow") for name in ("computer.files", "computer.transfer")]
+        if "deny" in modes:
+            raise Error("tool_forbidden", "这台电脑禁止文件传输")
+        if "ask" in modes and not approved:
+            raise Error("tool_approval_required", "开始该文件传输需要确认")
+
     def module(self, name: str) -> Any:
         return self.modules.get(name)
 
-    async def execute(self, method: str, args: Json, human_confirm: Any = None) -> Json:
+    async def execute(self, method: str, args: Json, human_confirm: Any = None, *, _tool_approved: bool = False) -> Json:
+        if method == "computer.tool_prepare":
+            return self.tool_approvals.prepare(args)
+        if method == "computer.tool_decide":
+            async def approved(original: Json) -> Json:
+                async def confirm(message: str) -> bool:
+                    return original["confirmed"] or await human_confirm(message)
+                return await self.execute(original["method"], {
+                    **original["params"], "_tool_revision": original["revision"],
+                }, confirm, _tool_approved=True)
+            return await self.tool_approvals.decide(args, approved)
         if method == "computer.configure_power":
             setting = args["lock_mode"]
             if setting["revision"] < self.power.setting["revision"]:
@@ -89,7 +129,18 @@ class Computer:
                 self.settings["lock_mode"] = setting
                 save(self.config, self.settings)
             return self.power.apply(setting)
+        if method == "computer.transfer":
+            # Long checksum work must not hold the async configuration lock.
+            # Each bounded I/O operation and commit rechecks the same revision.
+            async with self.access_lock:
+                await self.request_access(args)
+                args = {**args, "_tool_revision": self.access.value["revision"]}
+            result = await self._execute(method, args, human_confirm, transfer_approved=_tool_approved)
+            return await self.attach_guidance(result, args)
         if method in {"computer.wait", "computer.input", "computer.stop", "computer.release"}:
+            if "_tool_revision" in args:
+                async with self.access_lock:
+                    await self.request_access(args)
             result = await self._execute(method, args, human_confirm)
             return await self.attach_guidance(result, args)
         async with self.access_lock:
@@ -100,9 +151,7 @@ class Computer:
                 return {"access": checked, "missing": missing_directories(checked)}
             if method == "computer.create_workspace_directories":
                 return {"access": await asyncio.to_thread(create_directories, args["access"])}
-            incoming = args.get("_access")
-            if incoming and incoming["revision"] > self.access.value["revision"]:
-                await self.configure(incoming)
+            await self.request_access(args)
             result = await self._execute(method, args, human_confirm)
             if method == "computer.open":
                 args = {**args, "session": result["session"]}
@@ -111,6 +160,13 @@ class Computer:
         # A command waits for itself after releasing the device configuration lock.
         result = await self.operations.wait(args["session"], result["operation"], 1, consume=False)
         return await self.attach_guidance(result, args)
+
+    async def request_access(self, args: Json) -> None:
+        incoming = args.get("_access")
+        if incoming and incoming["revision"] > self.access.value["revision"]:
+            await self.configure(incoming)
+        if "_tool_revision" in args and args["_tool_revision"] != self.access.value["revision"]:
+            raise Error("approval_invalidated", "电脑权限已变化，原工具没有执行")
 
     async def attach_guidance(self, result: Json, args: Json) -> Json:
         if "_guidance_stamps" not in args:
@@ -137,14 +193,19 @@ class Computer:
                 or ({w["path"], *w["additional"]} - {new[w["id"]]["path"], *new[w["id"]]["additional"]})
             }
             affected.update(k for k, s in self.sessions.items() if s.get("workspace") in changed)
+        def apply_access() -> None:
+            with self.transfers.permission_lock:
+                self.access = Access(updated)
+                self.settings["access"] = updated
+                save(self.config, self.settings)
+        # Publish revocation before waiting for command shutdown or cleanup.
+        await asyncio.to_thread(apply_access)
         for identity, operation in list(self.operations.entries.items()):
             if operation.state == "awaiting_approval" and updated["revision"] != old["revision"]:
                 await self.operations.stop(operation.session, identity)
             if operation.kind == "command" and operation.state == "running" and operation.session in affected:
                 await self.operations.stop(operation.session, identity)
-        self.access = Access(updated)
-        self.settings["access"] = updated
-        save(self.config, self.settings)
+        await asyncio.to_thread(self.transfers.reap)
         await self.reclaim_grants()
         return {"applied": True, "revision": updated["revision"], "access": updated}
 
@@ -163,7 +224,7 @@ class Computer:
                 active.add(json.loads(path.read_text(encoding="utf-8"))["grant_key"])
         await reclaim_grants(self.operations.grant_base, keep, active, self.operations.node_path)
 
-    async def _execute(self, method: str, args: Json, human_confirm: Any = None) -> Json:
+    async def _execute(self, method: str, args: Json, human_confirm: Any = None, *, transfer_approved: bool = False) -> Json:
         if method == "computer.info":
             return self.info()
         if method == "computer.workspaces":
@@ -191,6 +252,24 @@ class Computer:
             if method in {"computer.wait", "computer.input", "computer.stop", "computer.release"}
             else self.access.roots(self.sessions[session])
         )
+        if method == "computer.transfer":
+            action = args.get("action")
+            fields = {
+                "upload_begin": ("path", "size", "sha256", "overwrite", "request_key"),
+                "upload_status": ("transfer_id",),
+                "upload_write": ("transfer_id", "offset", "data_base64"),
+                "upload_commit": ("transfer_id",),
+                "upload_cancel": ("transfer_id",),
+                "download_begin": ("path", "request_key"),
+                "download_status": ("transfer_id",),
+                "download_read": ("transfer_id", "offset", "length", "etag"),
+                "download_cancel": ("transfer_id",),
+            }
+            if action not in fields:
+                raise Error("transfer_action", "Unknown transfer action")
+            extra = {"permission_approved": transfer_approved, "expected_revision": args.get("_tool_revision")} if action.endswith("_begin") else {}
+            return await asyncio.to_thread(getattr(self.transfers, action), session,
+                **{key: args[key] for key in fields[action] if key in args}, **extra)
         if method in {"computer.skills", "computer.agents"}:
             entry = self.sessions[session].get("workspace")
             extra = usable_roots(self.access.workspace(entry))[1:] if entry else []
@@ -315,6 +394,7 @@ class Computer:
         raise Error("computer_method", method)
 
     async def close(self) -> None:
+        self.tool_approvals.close()
         await self.requests.close()
         await self.power.close()
         await self.operations.close()

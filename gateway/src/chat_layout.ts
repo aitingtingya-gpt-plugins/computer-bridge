@@ -17,10 +17,9 @@ export const chatLayoutStyles=String.raw`
 .chat-sidebar-heading{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.chat-sidebar-heading label{font-size:12px;color:var(--muted);margin:0}
 .chat-icon-button{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:30px;height:30px;padding:0;background:transparent;border:1px solid var(--line);color:var(--accent);font-size:22px;line-height:1;border-radius:7px}.chat-icon-button:hover{background:var(--soft);color:var(--accent)}
 .chat-thread{display:flex;flex-direction:column;min-height:0;min-width:0;overflow:hidden}
-.chat-thread-header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 20px;border-bottom:1px solid var(--line);flex-shrink:0}
-.chat-thread-title{display:flex;align-items:center;gap:12px;min-width:0}.chat-thread-title>div{min-width:0}.chat-thread-title .muted{font-size:12px}
-.chat-thread-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}.chat-thread-actions>button{font-size:12px;padding:7px 10px;white-space:nowrap}
-.chat-connection{display:flex;align-items:center;justify-content:space-between;padding:6px 20px;background:#fcfdfc;gap:12px;font-size:12px;border-bottom:1px solid var(--line);flex-shrink:0}.chat-connection .muted{font-size:11px}
+.chat-device-row{display:flex;align-items:center;gap:8px;min-width:0}.chat-device-row select{min-width:0;flex:1}.chat-device-row .connection-quality{flex:none;font-size:11px;max-width:48%;overflow-wrap:anywhere}
+.chat-message-pane{position:relative;display:flex;flex:1;min-height:0;min-width:0}
+#chat-sidebar-open{position:absolute;top:6px;left:6px;z-index:2;width:44px;height:44px;background:var(--bg);box-shadow:0 2px 6px #12281d16}
 .chat-messages{flex:1;overflow:auto;min-height:0;padding:20px;overscroll-behavior:contain;overflow-anchor:none}
 .chat-message{width:fit-content;max-width:94%}.chat-message-body{line-height:1.7}
 .chat-compose{height:var(--compose-height);flex:0 0 var(--compose-height);min-height:0;padding:8px 20px 12px;display:flex;flex-direction:column;gap:8px}
@@ -34,7 +33,7 @@ export const chatLayoutStyles=String.raw`
 .chat-resize-compose{height:8px;cursor:row-resize;border-block:1px solid var(--line)}.chat-resize-compose::after{height:2px;width:36px;left:calc(50% - 18px);top:2px}
 .chat-layout[data-collapsed=true]{grid-template-columns:minmax(0,1fr)}
 .chat-layout[data-collapsed=true]>.chat-sidebar,.chat-layout[data-collapsed=true]>.chat-resize-side{display:none}
-.chat-layout[data-collapsed=false] #chat-sidebar-open{display:none}
+.chat-layout:not([data-collapsed=true]) #chat-sidebar-open{display:none}
 .chat-sidebar-backdrop{position:absolute;inset:0;z-index:3;background:#163b3640;border:0;border-radius:0;padding:0}.chat-sidebar-backdrop:hover{background:#163b3640}
 .chat-resume button{white-space:nowrap;flex-shrink:0}.chat-list-heading{margin-top:20px}
 @media ${compactMedia}{
@@ -44,10 +43,8 @@ export const chatLayoutStyles=String.raw`
  .chat-page #chat-notice{max-height:18dvh;overflow:auto}
  .chat-layout,.chat-layout[data-collapsed=false]{grid-template-columns:minmax(0,1fr);border-radius:9px}.chat-layout>.chat-resize-side{display:none}
  .chat-layout>.chat-sidebar{display:none;position:absolute;z-index:4;top:0;bottom:0;left:0;width:min(320px,calc(100% - 48px));box-shadow:8px 0 32px #163b3620}
- .chat-layout[data-drawer=true]>.chat-sidebar{display:block}.chat-layout #chat-sidebar-open,.chat-layout[data-collapsed=false] #chat-sidebar-open{display:inline-flex}
- .chat-icon-button{width:44px;height:44px}.chat-thread-header{padding:6px 10px;gap:6px;flex-wrap:nowrap}.chat-thread-title{gap:6px;flex:1;overflow:hidden}.chat-heading{font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.chat-thread-title .muted{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
- .chat-thread-actions{gap:4px}.chat-thread-actions>button{padding:6px 8px;font-size:11px}.chat-thread-actions summary{display:flex;align-items:center;justify-content:center}
- .chat-connection{padding:3px 10px;min-height:26px}.chat-connection #chat-refresh{display:none}.chat-messages{padding:12px 10px}.chat-message{max-width:100%}.chat-compose{padding:6px 10px 8px;gap:6px}.chat-compose textarea{line-height:1.5}
+ .chat-layout[data-drawer=true]>.chat-sidebar{display:block}.chat-layout:not([data-drawer=true]) #chat-sidebar-open{display:inline-flex}.chat-layout[data-drawer=true] #chat-sidebar-open{display:none}
+ .chat-icon-button{width:44px;height:44px} .chat-messages{padding:12px 10px}.chat-message{max-width:100%}.chat-compose{padding:6px 10px 8px;gap:6px}.chat-compose textarea{line-height:1.5}
  .chat-compose-actions{gap:8px}.chat-compose-actions>div{gap:6px}.chat-compose-actions button{min-height:44px}.chat-compose #chat-upload-status{max-width:100px}
  .chat-attachments{max-height:var(--chat-attachment-height,64px)}
  .chat-resize-compose{height:12px}.chat-resize-compose::after{top:4px}.chat-sidebar-heading label{font-size:14px}.chat-resume button,.chat-list-heading button{min-height:44px}
@@ -73,20 +70,24 @@ export const chatLayoutScript=String.raw`<script>
  function restore(anchor){
   if(!anchor||anchor.generation!==window.bridgeChatView.generation())return;
   if(anchor.bottom)messages.scrollTop=messages.scrollHeight;
-  else{const node=window.bridgeChatView.byId(anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}
+  else{const node=window.bridgeChatView.byId(anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}remember();
  }
- window.bridgeChatLayout={capture:remember,restore,isCompact:()=>narrow.matches};
+ // Browser image decode, font layout and expandable approvals can resize earlier rows after insertion.
+ const contentObserver=new ResizeObserver(()=>{if(!restoring && !stopped && reading && Math.abs(reading.top-messages.scrollTop)<1)restore(reading);});
+ function watch(node){contentObserver.observe(node);}
+ function capture(){if(reading?.generation===window.bridgeChatView.generation() && Math.abs(reading.top-messages.scrollTop)<1)restore(reading);return remember();}
+ window.bridgeChatLayout={capture,restore,isCompact:()=>narrow.matches,watch,unwatch:()=>contentObserver.disconnect()};
  function attr(node,name,value){value=String(value);if(node.getAttribute(name)!==value)node.setAttribute(name,value);}
  function style(name,value){if(layout.style.getPropertyValue(name)!==value)layout.style.setProperty(name,value);}
  function apply(){
-  applyFrame=0;if(stopped)return;const anchor=reading;restoring=true;
+  applyFrame=0;if(stopped)return;const anchor=reading&&Math.abs(reading.top-messages.scrollTop)>1?remember():reading;restoring=true;
   if(narrow.matches&&viewport&&Math.abs(viewport.scale-1)>=.01){restoring=false;return;}
-  // Read geometry before changing widths/heights. A wrapped header triggers the next observer frame.
+  // Read current geometry before updating the two resizable panes.
   const compact=narrow.matches,editable=document.activeElement?.matches('input,textarea,[contenteditable=true]');
   const visibleHeight=viewport?.height || innerHeight;
   const keyboard=compact&&editable&&(visibleHeight<innerHeight-80||visibleHeight<420);
   const maxWidth=Math.max(200,Math.min(480,layout.clientWidth-368)),width=clamp(prefs.width,200,maxWidth);
-  const fixed=thread.querySelector('.chat-thread-header').offsetHeight+thread.querySelector('.chat-connection').offsetHeight+composeHandle.offsetHeight;
+  const fixed=composeHandle.offsetHeight;
   const attached=$('chat-attachments'),computed=getComputedStyle(composer),hasAttachments=attached.childElementCount>0;
   const attachmentHeight=compact?Math.min(64,Math.max(30,(thread.clientHeight-fixed)*.2)):64;
   const minHeight=Math.ceil(parseFloat(computed.paddingTop)+parseFloat(computed.paddingBottom)+30+composer.querySelector('.chat-compose-actions').offsetHeight+parseFloat(computed.gap)*(hasAttachments?2:1)+(hasAttachments?Math.min(attached.scrollHeight,attachmentHeight):0));
@@ -98,10 +99,10 @@ export const chatLayoutScript=String.raw`<script>
   style('--sidebar-width',width+'px');style('--compose-height',height+'px');attr(layout,'data-collapsed',prefs.collapsed);attr(layout,'data-drawer',drawer&&narrow.matches);
   const inert=narrow.matches?!drawer:prefs.collapsed;if(sidebar.inert!==inert)sidebar.inert=inert;attr(sidebar,'aria-hidden',inert);backdrop.hidden=!narrow.matches||!drawer;attr(open,'aria-expanded',!inert);
   for(const [handle,value,min,max] of [[sideHandle,width,200,maxWidth],[composeHandle,height,minHeight,maxHeight]]){attr(handle,'aria-valuenow',Math.round(value));attr(handle,'aria-valuemin',min);attr(handle,'aria-valuemax',Math.round(max));}
-  cancelAnimationFrame(restoreFrame);restoreFrame=requestAnimationFrame(()=>{restoreFrame=0;restore(anchor);restoring=false;remember();});
+  const layoutTop=messages.scrollTop;cancelAnimationFrame(restoreFrame);restoreFrame=requestAnimationFrame(()=>{restoreFrame=0;if(Math.abs(messages.scrollTop-layoutTop)<1)restore(anchor);restoring=false;remember();});
  }
  function schedule(){if(!stopped&&!applyFrame)applyFrame=requestAnimationFrame(apply);}
- messages.addEventListener('scroll',()=>{if(!restoring&&!scrollFrame)scrollFrame=requestAnimationFrame(()=>{scrollFrame=0;if(!restoring)remember();});},{passive:true});
+ messages.addEventListener('scroll',()=>{if(!restoring&&!scrollFrame)scrollFrame=requestAnimationFrame(()=>{scrollFrame=0;if(!restoring && (!reading || Math.abs(reading.top-messages.scrollTop)>=1))remember();});},{passive:true});
  function toggle(show){remember();if(narrow.matches)drawer=show;else{prefs.collapsed=!show;save();}schedule();if(show&&narrow.matches)requestAnimationFrame(()=>close.focus({preventScroll:true}));else if(!show)requestAnimationFrame(()=>open.focus({preventScroll:true}));}
  open.addEventListener('click',()=>toggle(true));close.addEventListener('click',()=>toggle(false));backdrop.addEventListener('click',()=>toggle(false));
  sidebar.addEventListener('keydown',event=>{
@@ -126,10 +127,10 @@ export const chatLayoutScript=String.raw`<script>
  window.addEventListener('bridge-chat-opened',()=>{if(narrow.matches&&drawer)toggle(false);});
  viewport?.addEventListener('resize',schedule);viewport?.addEventListener('scroll',schedule);
  window.addEventListener('resize',schedule);document.addEventListener('focusin',schedule);document.addEventListener('focusout',schedule);
- const observed=[layout,thread.querySelector('.chat-thread-header'),thread.querySelector('.chat-connection'),$('chat-attachments'),composer.querySelector('.chat-compose-actions')];
+ const observed=[layout,$('chat-attachments'),composer.querySelector('.chat-compose-actions')];
  const observer=new ResizeObserver(schedule);for(const node of observed)observer.observe(node);
- window.addEventListener('pagehide',()=>{stopped=true;observer.disconnect();cancelAnimationFrame(applyFrame);cancelAnimationFrame(restoreFrame);cancelAnimationFrame(scrollFrame);applyFrame=restoreFrame=scrollFrame=0;});
- window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;for(const node of observed)observer.observe(node);schedule();}});
+ window.addEventListener('pagehide',()=>{stopped=true;observer.disconnect();contentObserver.disconnect();cancelAnimationFrame(applyFrame);cancelAnimationFrame(restoreFrame);cancelAnimationFrame(scrollFrame);applyFrame=restoreFrame=scrollFrame=0;});
+ window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;for(const node of window.bridgeChatView.nodes())watch(node);for(const node of observed)observer.observe(node);schedule();}});
  remember();schedule();
 })();
 </script>`;

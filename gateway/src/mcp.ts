@@ -3,10 +3,18 @@ import {McpServer, createMcpHandler, inputRequired, isLegacyRequest,
 import {z} from "zod";
 import type {ComputerHubCore} from "./hub";
 import type {Data} from "./types";
-import {toolSpecs,serverInstructions,helpText,promptText} from "./contracts";
+import {toolSpecs,serverInstructions,helpText,promptText,approvalRouting} from "./contracts";
 import {VERSION} from './releases';
 import {commandDecision} from './approvals';
 import {chatToolSpecs,chatInstructions} from './chat_contracts';
+import {hasToolPermission} from './tool_permissions';
+import {admitMcpRequest} from './mcp_body';
+
+// Admission must happen before parsing JSON on the gateway. Large file bytes
+// belong to /transfers/, never an unbounded MCP request/response envelope.
+const MAX_MCP_BODY=2*1024*1024;
+
+const toolResult=(result:Data)=>({content:result.type==='image'?[result as any]:[{type:'text' as const,text:JSON.stringify(result)}]});
 
 export function handler(hub: ComputerHubCore) {
   const factory = ({era}: {era: "modern" | "legacy"}) => {
@@ -26,7 +34,10 @@ export function handler(hub: ComputerHubCore) {
         }
       });
     for (const [name, description, schema] of [...toolSpecs,...chatToolSpecs]) {
-      server.registerTool(name, {description, inputSchema: schema as z.ZodObject<any>, annotations: {
+      const inputSchema=hasToolPermission(name) && name!=='computer.exec' ? (schema as z.ZodObject<any>).extend({
+        ...approvalRouting,...(name==='computer.lock_mode'?{request_key:z.string().optional()}:{}),
+      }) : schema as z.ZodObject<any>;
+      server.registerTool(name, {description, inputSchema, annotations: {
         readOnlyHint: ["computer.recover", "computer.list", "computer.workspaces", "computer.image", "computer.skills", "computer.agents", "computer.jobs", "computer.modules", "computer.module_tools","chat.list","chat.history"].includes(name),
         openWorldHint: name === "computer.exec",
       }}, async (args: any, ctx: ServerContext) => {
@@ -41,9 +52,10 @@ export function handler(hub: ComputerHubCore) {
             if(answer && ['accept','decline','cancel'].includes(answer.action)) {
               const decision=commandDecision(answer.action);
               const result=await hub.approvalResult(record.id,decision,caller,actor);
-              return {content:[{type:'text',text:JSON.stringify(result)}]};
+              return toolResult(result);
             }
           }
+          await hub.checkToolPermission(name,args,actor);
           let confirmed = false;
           const confirmation = name === "computer.module_call"
             ? (await hub.modules.require(args.module)).confirmation(args.action) : undefined;
@@ -75,8 +87,11 @@ export function handler(hub: ComputerHubCore) {
             if(supportsForm) {
               const details=await hub.approvals.details(result.approval.id,caller);
               const params={mode:'form' as const,
-                message:'批准本次命令以当前登录用户权限在工作区沙盒外运行。授权包含子进程及后续交互输入。\n'
-                  +'设备 '+details.device+'\n目录 '+details.cwd+'\n命令\n'+details.command+'\n理由 '+details.justification,
+                message:details.method
+                  ? '批准本次工具调用。\n设备 '+details.device+'\n'+details.summary
+                  : (details.permission_confirmation?'此电脑要求确认本次工具使用。\n':'')
+                    +'批准本次命令以当前登录用户权限在工作区沙盒外运行。授权包含子进程及后续交互输入。\n'
+                    +'设备 '+details.device+'\n目录 '+details.cwd+'\n命令\n'+details.command+'\n理由 '+details.justification,
                 requestedSchema:{type:'object' as const,properties:{}}};
               if(era==='modern') {
                 const ticket=commandTicket !== undefined ? commandTicket :
@@ -87,12 +102,10 @@ export function handler(hub: ComputerHubCore) {
               const answer=await ctx.mcpReq.elicitInput(params);
               const decision=commandDecision(answer.action);
               const completed=await hub.approvalResult(result.approval.id,decision,caller,actor);
-              return {content:[{type:'text',text:JSON.stringify(completed)}]};
+              return toolResult(completed);
             }
           }
-          if (name === "computer.image") return {content: [result as any]};
-          if(name==='chat.attachment' && args.operation==='image')return {content:[result as any]};
-          return {content: [{type: "text", text: JSON.stringify(result)}]};
+          return toolResult(result);
         } catch (error) {
           return {isError: true, content: [{type: "text", text: JSON.stringify({error: {
             code: (error as any).code || "computer_error", message: String((error as Error).message),
@@ -110,12 +123,15 @@ export function handler(hub: ComputerHubCore) {
     }));
     return server;
   };
-  const modern = createMcpHandler(factory, {legacy: "reject", responseMode: "auto", maxRequestBodySize: Number.MAX_SAFE_INTEGER});
+  const modern = createMcpHandler(factory, {legacy: "reject", responseMode: "auto", maxRequestBodySize: MAX_MCP_BODY});
   const sessions = new Map<string, {transport:WebStandardStreamableHTTPServerTransport;caller:string;account:string}>();
   return {async fetch(request: Request): Promise<Response> {
+    const admitted=await admitMcpRequest(request);
+    if(admitted instanceof Response)return admitted;
+    request=admitted;
     const caller=request.headers.get('x-computer-bridge-caller') || '';
     const authInfo={token:'',clientId:caller,scopes:['computer'],extra:{bridgeCaller:caller,bridgeAccount:request.headers.get('x-computer-bridge-account'),bridgeEpoch:Number(request.headers.get('x-computer-bridge-epoch'))}};
-    if (!await isLegacyRequest(request, undefined, {maxRequestBodySize: Number.MAX_SAFE_INTEGER})) {
+    if (!await isLegacyRequest(request, undefined, {maxRequestBodySize: MAX_MCP_BODY})) {
       return modern.fetch(request,{authInfo});
     }
     const identity = request.headers.get("mcp-session-id");
@@ -127,7 +143,7 @@ export function handler(hub: ComputerHubCore) {
       transport = new WebStandardStreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
         enableJsonResponse: true,
-        maxRequestBodySize: Number.MAX_SAFE_INTEGER,
+        maxRequestBodySize: MAX_MCP_BODY,
         onsessioninitialized: id => {sessions.set(id,{transport:transport!,caller,account:authInfo.extra.bridgeAccount || ''});},
         onsessionclosed: id => {sessions.delete(id);},
       });

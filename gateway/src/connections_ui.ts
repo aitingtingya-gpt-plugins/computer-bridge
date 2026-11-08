@@ -1,39 +1,57 @@
 import {escape,type Data} from './types';
 
+export type ConnectionTone='good'|'warning'|'poor'|'offline';
+
+/** Device RTT quality is separate from the chat/model connection state. */
+export function connectionTone(device:Data):ConnectionTone {
+  if(device.connection_state==='recovering' || device.connection_state==='degraded')return 'warning';
+  if(device.online===false || device.connection_state==='offline')return 'offline';
+  if(device.online!==true || device.latency_state!=='ok' || typeof device.latency_ms!=='number' || !Number.isFinite(device.latency_ms))return 'warning';
+  return device.latency_ms<200?'good':device.latency_ms<500?'warning':'poor';
+}
+
 export function connectionLabel(device:Data):string {
   if(device.connection_state==='recovering') return '恢复中';
-  if(!device.online) return '离线';
-  if(device.latency_state==='ok') return `在线 · ${device.latency_ms<1?'<1':device.latency_ms} ms`;
+  if(device.online===false || device.connection_state==='offline') return '离线';
+  if(device.online!==true)return '状态未知';
+  if(device.latency_state==='ok' && typeof device.latency_ms==='number' && Number.isFinite(device.latency_ms)) return `在线 · ${device.latency_ms<1?'<1':device.latency_ms} ms`;
   return device.latency_state==='timeout'?'在线 · 探测超时':'在线 · 延迟未测得';
 }
 
 export function connectionBadge(device:Data):string {
-  return `<span class="connection-controls"><span data-connection="${escape(device.id)}" class="status ${device.online?(device.latency_state==='ok'?'online':'degraded'):'offline'}"
+  return `<span class="connection-controls"><span data-connection="${escape(device.id)}" class="status connection-quality" data-quality="${connectionTone(device)}" data-checked-at="${escape(device.latency_checked_at || '')}"
     title="服务端与电脑的连接往返延迟"><i></i><span>${escape(connectionLabel(device))}</span></span><button type="button" class="measure-connection" data-measure="${escape(device.id)}">测速</button></span>`;
 }
 
+export const connectionStyles=`
+.connection-quality[data-quality=good]{color:#2d8164}.connection-quality[data-quality=warning]{color:#92600c}.connection-quality[data-quality=poor]{color:#b4473c}.connection-quality[data-quality=offline]{color:#8991a1}
+.status.connection-quality[data-quality=good]{background:#edf7f1}.status.connection-quality[data-quality=warning]{background:#fff2da}.status.connection-quality[data-quality=poor]{background:#fff0ed}.status.connection-quality[data-quality=offline]{background:#f2f3f6}
+`;
+
+/** Share the same classification and labels with each browser view. */
+export const connectionPresentationScript=`<script>
+(()=>{
+  const tone=${connectionTone.toString()},label=${connectionLabel.toString()};
+  function render(node,d){
+    if(node.dataset.checkedAt && d.latency_checked_at && node.dataset.checkedAt>d.latency_checked_at)return;
+    node.classList.add('connection-quality');node.dataset.quality=tone(d);
+    const text=node.querySelector('span') || node;text.textContent=label(d);
+    if(d.latency_checked_at)node.dataset.checkedAt=d.latency_checked_at;
+    node.title='服务端与电脑的连接往返延迟'+(d.latency_checked_at?' · 最近检测 '+new Date(d.latency_checked_at).toLocaleTimeString():'');
+  }
+  window.bridgeConnection={tone,label,render};
+})();
+</script>`;
+
 /** Refresh only connection text. No card replacement, form writes or background-page polling. */
-export const connectionsScript=`<script>
+export const connectionsScript=connectionPresentationScript+`<script>
 (()=>{
   let timer=null,request=null,stopped=false;const manual=new Map();
-  function label(d){
-    if(d.connection_state==='recovering')return '恢复中';
-    if(!d.online)return '离线';
-    if(d.latency_state==='ok')return '在线 · '+(d.latency_ms<1?'<1':d.latency_ms)+' ms';
-    return d.latency_state==='timeout'?'在线 · 探测超时':'在线 · 延迟未测得';
-  }
+  const render=window.bridgeConnection.render;
   function unavailable(text){
     document.querySelectorAll('[data-connection]').forEach(node=>{
-      node.classList.remove('online','offline');node.classList.add('degraded');node.querySelector('span').textContent=text;
+      node.dataset.quality='warning';node.querySelector('span').textContent=text;
     });
-  }
-  function render(node,d){
-    if(node.dataset.checkedAt && node.dataset.checkedAt>d.latency_checked_at)return;
-    node.classList.toggle('online',d.online && d.latency_state==='ok');
-    node.classList.toggle('offline',!d.online && d.connection_state!=='recovering');
-    node.classList.toggle('degraded',d.online && d.latency_state!=='ok' || d.connection_state==='recovering');
-    node.querySelector('span').textContent=label(d);node.dataset.checkedAt=d.latency_checked_at;
-    node.title='连接往返延迟 · 最近检测 '+new Date(d.latency_checked_at).toLocaleTimeString();
   }
   document.querySelectorAll('[data-measure]').forEach(button=>button.addEventListener('click',async event=>{
     event.preventDefault();event.stopPropagation();
@@ -45,7 +63,7 @@ export const connectionsScript=`<script>
         {signal:active.signal,cache:'no-store'});
       if(!reply.ok)throw new Error(reply.status===401?'登录已过期':'测速失败');
       const data=await reply.json();if(!active.signal.aborted && !document.hidden)render(node,data.computers[0]);
-    }catch(error){if(!active.signal.aborted){node.classList.remove('online','offline');node.classList.add('degraded');node.querySelector('span').textContent=error.message;}}
+    }catch(error){if(!active.signal.aborted){node.dataset.quality='warning';node.querySelector('span').textContent=error.message;}}
     finally{manual.delete(id);button.disabled=false;button.textContent='测速';}
   }));
   async function update(){

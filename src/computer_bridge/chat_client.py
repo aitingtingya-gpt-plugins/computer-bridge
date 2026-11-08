@@ -12,16 +12,17 @@ import secrets
 import time
 import webbrowser
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from pathlib import Path, PureWindowsPath
 from types import TracebackType
-from typing import Self
+from typing import BinaryIO, Self
 from urllib.parse import urlencode
 
 import httpx2
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.exceptions import InvalidStatus
 
+from .chat_attachments import AttachmentSource, DroppedAttachment
 from .common import Error, Json, save
 from .network import http_client, proxy_for
 
@@ -64,13 +65,14 @@ class ChatClient:
         return {"Authorization": "Bearer " + str(self.credential)}
 
     async def _post(self, path: str, body: Json, *, authenticated: bool = True,
-                    headers: dict[str, str] | None = None) -> Json:
+                    headers: dict[str, str] | None = None, auth_identity: str | None = None) -> Json:
+        request_identity = (auth_identity or self.identity) if authenticated else None
         headers = headers if headers is not None else self.headers() if authenticated else {}
         response = await self.http.post(self.server + path, json=body, headers=headers)
-        if response.status_code >= 500:
+        if response.status_code >= 500 or response.status_code == 429:
             response.raise_for_status()
         if response.headers.get("content-type", "").startswith("application/json"):
-            result = response.json()
+            result: Json = response.json()
             if not response.is_success or "error" in result:
                 error = result.get("error", {})
                 if isinstance(error, dict):
@@ -78,7 +80,8 @@ class ChatClient:
                     message = str(error.get("message", "聊天请求失败"))
                 else:
                     code, message = str(result.get("code", "chat_error")), str(error)
-                if response.status_code == 401 and authenticated:
+                if (response.status_code == 401 and authenticated and request_identity == self.identity
+                        and headers == self.headers()):
                     if self.mode == "account":
                         self.credential_file.unlink(missing_ok=True)
                         self.credential = None
@@ -91,10 +94,14 @@ class ChatClient:
         response.raise_for_status()
         raise Error("chat_response", "服务器没有返回聊天数据，请确认服务器已安装聊天功能。")
 
-    async def action(self, action: str, **parameters: object) -> Json:
+    async def action(self, action: str, /, **parameters: object) -> Json:
         if not self.authenticated:
             raise Error("chat_login_required", "聊天身份不可用；账号模式可使用 /login 重新登录。")
         return await self._post("/chat/api/" + action, parameters)
+
+    async def send_snapshot(self, body: Json, *, identity: str, headers: dict[str, str]) -> Json:
+        """Send under the captured identity, even if the visible TUI changed."""
+        return await self._post("/chat/api/send", body, headers=headers, auth_identity=identity)
 
     @asynccontextmanager
     async def live(self, chat_id: str) -> AsyncIterator[ClientConnection]:
@@ -178,11 +185,18 @@ class ChatClient:
             await asyncio.sleep(2)
         raise Error("chat_login_expired", "账号登录已过期，请重新使用 /login。")
 
-    async def upload(self, chat_id: str, path: Path, progress: Callable[[int, int], None] | None = None) -> Json:
-        path = path.expanduser().resolve(strict=True)
-        if not path.is_file():
-            raise Error("chat_attachment", "附件必须是文件。")
-        with path.open("rb") as source:
+    async def upload(self, chat_id: str, file: AttachmentSource,
+                     progress: Callable[[int, int], None] | None = None) -> Json:
+        opened: AbstractContextManager[BinaryIO]
+        if isinstance(file, DroppedAttachment):
+            name, opened = file.name, nullcontext(file.stream)
+        else:
+            file = file.expanduser().resolve(strict=True)
+            if not file.is_file():
+                raise Error("chat_attachment", "附件必须是文件。")
+            name, opened = file.name, file.open("rb")
+        with opened as source:
+            source.seek(0)
             before = os.fstat(source.fileno())
             def checksum() -> str:
                 digest = hashlib.sha256()
@@ -191,8 +205,8 @@ class ChatClient:
                 return digest.hexdigest()
             digest = await asyncio.to_thread(checksum)
             source.seek(0)
-            started = await self.action("upload-start", chat_id=chat_id, name=path.name,
-                mime_type=mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            started = await self.action("upload-start", chat_id=chat_id, name=name,
+                mime_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
                 size=before.st_size, sha256=digest, request_key=secrets.token_hex(12))
             attachment = started["attachment"]
             offset = int(attachment["offset"])
@@ -211,7 +225,8 @@ class ChatClient:
             after = os.fstat(source.fileno())
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise Error("file_changed", "上传期间文件发生变化，请重新添加附件。")
-        return (await self.action("upload-complete", chat_id=chat_id, attachment_id=attachment["id"]))["attachment"]
+        completed: Json = (await self.action("upload-complete", chat_id=chat_id, attachment_id=attachment["id"]))["attachment"]
+        return completed
 
     async def download(self, chat_id: str, attachment_id: str, destination: Path | None = None) -> Path:
         attachment = (await self.action("attachment", chat_id=chat_id, attachment_id=attachment_id))["attachment"]

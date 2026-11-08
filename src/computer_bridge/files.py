@@ -13,6 +13,9 @@ from .common import Error, Json, uid
 from .file_results import mutation_info, read_original
 from .native_files import file_call, media_call
 
+MAX_INLINE_FIELD = 1024 * 1024
+MAX_INLINE_BASE64 = 4 * ((MAX_INLINE_FIELD + 2) // 3)
+
 
 class LocalFiles:
     def __init__(
@@ -35,6 +38,15 @@ class LocalFiles:
         return str(path.relative_to(self.root)) if path.is_relative_to(self.root) else str(path)
 
     def apply(self, operation: str, args: Json) -> Json:
+        # A legacy tool call is a small edit, not a bulk file transport. Reject
+        # before UTF-8/Base64 conversion or crossing the native JSON boundary.
+        for key in ("text", "base64", "old", "new", "patch"):
+            value = args.get(key)
+            limit = MAX_INLINE_BASE64 if key == "base64" else MAX_INLINE_FIELD
+            if value is not None and (not isinstance(value, str) or len(value) > limit):
+                raise Error("file_payload_limit", "每次最多 1 MiB 原始文件内容；大文件请使用文件传输")
+            if isinstance(value, str) and len(value.encode("utf-8")) > limit:
+                raise Error("file_payload_limit", "每次最多 1 MiB 原始文件内容；大文件请使用文件传输")
         path = self.path(args.get("path", "."))
         if operation in {"list", "glob", "search"}:
             result = file_call(operation, path, args, self.node_path)
@@ -59,6 +71,8 @@ class LocalFiles:
             data = (
                 base64.b64decode(args["base64"], validate=True) if "base64" in args else args["text"].encode()
             )
+            if len(data) > MAX_INLINE_FIELD:
+                raise Error("file_payload_limit", "每次最多 1 MiB 原始文件内容；大文件请使用文件传输")
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary = path.with_name(path.name + "." + uid("writing"))
             try:
@@ -79,10 +93,13 @@ class LocalFiles:
             import tempfile
 
             # Apply relative to the selected directory, without discovering a parent repository.
+            # Disable Git checkout newline conversion for this invocation only. A patch
+            # changes the supplied bytes, not the user's global Git configuration.
             # The actual Git process still runs under the existing kernel write policy.
             with tempfile.TemporaryDirectory(prefix="bridge-patch-") as patch_directory:
                 argv = command_argv(
-                    ["git", "--git-dir=" + str(Path(patch_directory) / "no-repository"),
+                    ["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+                     "--git-dir=" + str(Path(patch_directory) / "no-repository"),
                      "apply", "--no-index", "--whitespace=nowarn", "--numstat", "-z", "--apply", "-"],
                     self.roots,
                     Path(patch_directory),

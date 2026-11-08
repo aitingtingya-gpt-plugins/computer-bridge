@@ -81,6 +81,7 @@ def inspect_access(value: Json) -> Json:
         "full_access": bool(value["full_access"]),
         "workspaces": workspaces,
         "revision": int(value.get("revision", 0)),
+        **({"tool_permissions": value["tool_permissions"]} if "tool_permissions" in value else {}),
     }
 
 

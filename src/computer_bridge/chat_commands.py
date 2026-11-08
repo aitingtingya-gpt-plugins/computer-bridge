@@ -25,26 +25,31 @@ class Command:
 COMMANDS = (
     Command("/resume", "[对话 ID]", "按名称选择历史对话"),
     Command("/new", "[标题]", "新建对话"),
-    Command("/attach", "文件路径", "添加附件，支持含空格的路径", True),
-    Command("/unattach", "", "清空待发送附件"),
     Command("/computers", "", "选择新对话使用的电脑"),
+    Command("/permissions", "", "管理这台电脑的完全访问和工具权限"),
+    Command("/workspaces", "", "管理这台电脑的工作区"),
     Command("/login", "", "登录账号，访问账号授权的电脑"),
     Command("/logout", "", "返回本机身份"),
+    Command("/delete", "", "删除当前对话及其服务器附件"),
     Command("/title", "新标题", "修改当前对话标题", True),
-    Command("/history", "", "读取更早的消息"),
+    Command("/theme", "", "选择终端主题"),
+    Command("/export", "", "下载完整会话与附件为 ZIP"),
     Command("/math", "[消息 ID]", "选择科研公式并打开本机完整排版"),
     Command("/read", "附件 ID", "查看文本附件，例如 a1", True),
     Command("/download", "附件 ID [路径]", "下载附件并校验 SHA256", True),
     Command("/connect", "", "获取连接 ID 和模型连接步骤"),
-    Command("/timing", "[消息 ID]", "查看消息投递分段耗时"),
-    Command("/retry", "", "确认上一条消息的发送结果"),
     Command("/help", "", "显示命令帮助"),
     Command("/quit", "", "退出终端，保留模型连接"),
 )
 BY_NAME = {command.name: command for command in COMMANDS}
 HELP = "\n".join(command.usage + "  ·  " + command.description for command in COMMANDS) + (
     "\n\n/ 命令菜单 · ↑/↓ 选择 · Tab 补全 · Enter 使用 · Esc 关闭"
-    "\nEnter 发送 · Alt+Enter 换行 · PageUp/PageDown 滚动 · Ctrl+Q 退出\n"
+    "\n弹窗按底部提示操作 · Tab/Shift+Tab 切换焦点 · Esc 关闭提示或取消表单"
+    "\n表单 ↑/↓ 切字段；多行框内移动光标，首末显示行切出 · ←/→ 编辑文字或切换按钮"
+    "\nEnter 发送 · Shift+Enter 换行（Ctrl+J 备用）· Ctrl+Y 粘贴系统剪贴板文件/图片/文字"
+    "\nShift+方向键 选择文字（↑/↓ 按可视行）· F4 清空输入框（Mac 可能需 Fn+F4，可撤销）"
+    "\n右键打开系统复制／粘贴菜单 · Windows 有选区时 Ctrl+C · Mac 按 F2 使用原生 ⌘C 复制"
+    "\nPageUp/PageDown 滚动 · Ctrl+Q 退出\n"
 )
 
 

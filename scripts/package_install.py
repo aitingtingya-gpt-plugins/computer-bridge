@@ -16,6 +16,7 @@ OUT = ROOT / f"dist/computer-bridge-{VERSION}-install.zip"
 
 
 def main() -> None:
+    subprocess.run(["node", "build-transfer-client.mjs"], cwd=ROOT / "gateway", check=True)
     if STAGE.exists():
         shutil.rmtree(STAGE)
     folder = STAGE / f"computer-bridge-{VERSION}"
@@ -24,8 +25,10 @@ def main() -> None:
     shutil.copyfile(ROOT / "适配协议.md", folder / "适配协议.md")
     shutil.copyfile(ROOT / "docs/更新与模块协议.md", folder / "更新与模块协议.md")
     (folder / 'docs').mkdir()
-    for name in ('chat.md','chat-terminal.md'):
+    for name in ('chat.md','chat-terminal.md','file-transfer.md','attachment-http.md'):
         shutil.copyfile(ROOT / 'docs' / name, folder / 'docs' / name)
+    (folder / 'scripts').mkdir()
+    shutil.copyfile(ROOT / 'scripts/transfer_file.py', folder / 'scripts/transfer_file.py')
     for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
         shutil.copyfile(ROOT / name, folder / name)
     for system in ("windows", "macos"):
@@ -54,10 +57,12 @@ def main() -> None:
     server = folder / "server"
     shutil.copytree(ROOT / "gateway/src", server / "src", ignore=shutil.ignore_patterns("index-work-tree.ts"))
     shutil.copytree(ROOT / "gateway/licenses", server / "licenses")
+    shutil.copyfile(ROOT / 'scripts/transfer_file.py', server / 'transfer_file.py')
     for name in (
         "build.mjs",
         "licenses.mjs",
         "build-chat.mjs",
+        "build-transfer-client.mjs",
         "LICENSE",
         "tsconfig.json",
         ".env.example",
@@ -71,6 +76,7 @@ def main() -> None:
     lock = json.loads((ROOT / "gateway/package-lock.json").read_text(encoding="utf-8"))
     package["name"] = "computer-bridge-server"
     package["scripts"] = {
+        "prebuild": "node build-transfer-client.mjs",
         "build": "node build.mjs",
         "start": "node --env-file=.env build/launcher.mjs",
         "check": "tsc --noEmit",

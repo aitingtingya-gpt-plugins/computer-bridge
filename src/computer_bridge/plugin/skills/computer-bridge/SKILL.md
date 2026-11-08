@@ -46,8 +46,8 @@ description: Operate an explicitly selected registered computer, or connect a sa
    `sandbox_permissions="danger-full-access"` and `justification`. Accepting the confirmation
    approves that command once, including its child processes and subsequent stdin. There is no
    checkbox or permanent command approval. Wait on the returned original operation; do not rerun it.
-   Administrator full access executes commands directly without this approval, even if the
-   wider-access parameters are present. Following ordinary commands on a restricted computer
+   Administrator full access skips sandbox escalation, even if the wider-access parameters
+   are present. A separate per-tool confirmation rule can still apply. Following ordinary commands on a restricted computer
    remain confined after a one-command approval.
 4. Use a stable request_key for writes, commands and other mutations. Repeat the same key and arguments
    to retrieve the original execution; do not choose a new key because a response was lost. On interrupted
@@ -117,6 +117,13 @@ computer `c1`, workspace session `s1`, message `m1` and attachment `a1`. Every c
    this explicitly copies the file to server chat storage. Include the returned attachment ID in
    `chat.reply`. Existing computer file operations and command outputs otherwise stay on the computer.
 
+Write ordinary replies directly as Markdown in `chat.reply.text`. Use `$...$` for inline LaTeX and
+`$$...$$` for display LaTeX; `\(...\)`, `\[...\]` and AMS environments are also supported.
+Do not wrap an entire formatted answer in a `markdown` code fence unless the user explicitly asks
+for Markdown source. Keep intentional code examples fenced. Plain Unicode equations remain
+literal text, so use LaTeX for mathematical typesetting. Let the tool transport serialize JSON;
+do not manually escape the message a second time.
+
 A different active model endpoint returns `chat_in_use`: tell the user the conversation is in use
 and do not replace or disconnect its connection. Repeated resume by the original endpoint must
 include its retained connection credential. The terminal and web page may both send to the same
@@ -125,16 +132,15 @@ credential only when the user asks to end this connection. It does not stop comp
 delete messages. Explicit subscription cancellation releases the endpoint. Natural expiry only pauses notifications;
 the original writing connection and ownership remain.
 
-The existing computer tools remain available during communication with their unchanged account,
-workspace and approval rules. Use the selected chat's computer unless the user explicitly requests
-another target. For commands needing one-time wider access during a Bridge chat, use
-`approval_channel="chat"` and `approval_chat_id="t1"` with `sandbox_permissions` and `justification`.
-Choose an authorized chat on the command's computer. Its web and TUI message history receive
-the approval card, including the actual command, directory, reason and decision; other chats do not.
-The human decides directly on the card; this avoids a simultaneous host form. Keep the original operation
-and wait/recover it after approval; never launch the command again. Ordinary host calls default to
-`approval_channel="host"`. Full-access devices execute directly. An approval decision message
-reports the decision, not command completion. Chat history and attachments are stored on the server until the chat is deleted.
+Use the selected chat's computer unless the user explicitly requests another target.
+A device may allow, require confirmation for, or forbid each computer tool independently of full
+access. Respect tool_forbidden. Agree with the user where to request approval. Default host uses
+the host form; for a chat card pass `approval_channel="chat"` and `approval_chat_id="t1"` for
+an authorized conversation on the same computer. For one restricted command outside the
+workspace, also pass `sandbox_permissions="danger-full-access"` and `justification`.
+An awaiting_approval result has not executed. Use the original operation or the exact receipt
+arguments returned by the tool to get the approved result, without submitting a new call.
+A chat approval decision reports the decision, not command completion.
 
 Messages returned with `saved: true` are durable history. `notification` records pending, waiting,
 unreachable, received or blocked delivery separately; `reply` records actual reply references.

@@ -12,6 +12,9 @@ from pathlib import Path
 from .common import Error, Json
 from .native_files import file_call
 
+DEFAULT_READ_BYTES = 256 * 1024
+MAX_READ_BYTES = 1024 * 1024
+
 
 def read_original(
     path: Path,
@@ -23,11 +26,10 @@ def read_original(
     node_path: str | None = None,
 ) -> Json:
     media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    if offset < 0 or length is not None and length < 1:
-        raise Error("read_range", "offset 必须非负，length 必须为正数")
-    request: Json = {"offset": offset}
-    if length is not None:
-        request["length"] = length
+    if type(offset) is not int or offset < 0 or length is not None and (type(length) is not int or not 1 <= length <= MAX_READ_BYTES):
+        raise Error("read_range", "offset 必须非负；length 必须为 1..1048576，大文件请使用文件传输")
+    # Bound the native read before it allocates. Never read whole then truncate.
+    request: Json = {"offset": offset, "length": DEFAULT_READ_BYTES if length is None else length}
     if version is not None:
         request["version"] = version
     window = file_call("read", path, request, node_path)
