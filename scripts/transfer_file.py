@@ -24,7 +24,7 @@ import urllib.request
 
 CHUNK = 8 * 1024 * 1024
 RETRIES = 6
-USER_AGENT = "computer-bridge/0.2.5 transfer-helper"
+USER_AGENT = "computer-bridge/0.2.6-alpha transfer-helper"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):

@@ -25,7 +25,7 @@ def main() -> None:
     shutil.copyfile(ROOT / "适配协议.md", folder / "适配协议.md")
     shutil.copyfile(ROOT / "docs/更新与模块协议.md", folder / "更新与模块协议.md")
     (folder / 'docs').mkdir()
-    for name in ('chat.md','chat-terminal.md','file-transfer.md','attachment-http.md'):
+    for name in ('chat.md','chat-terminal.md','chat-modes.md','file-transfer.md','attachment-http.md'):
         shutil.copyfile(ROOT / 'docs' / name, folder / 'docs' / name)
     (folder / 'scripts').mkdir()
     shutil.copyfile(ROOT / 'scripts/transfer_file.py', folder / 'scripts/transfer_file.py')
@@ -55,7 +55,7 @@ def main() -> None:
                 shutil.copyfile(ROOT / "installers/source" / name, client / name)
                 (client / name).chmod(0o755)
     server = folder / "server"
-    shutil.copytree(ROOT / "gateway/src", server / "src", ignore=shutil.ignore_patterns("index-work-tree.ts"))
+    shutil.copytree(ROOT / "gateway/src", server / "src", ignore=shutil.ignore_patterns("index-work-tree.ts", "tests", "__tests__"))
     shutil.copytree(ROOT / "gateway/licenses", server / "licenses")
     shutil.copyfile(ROOT / 'scripts/transfer_file.py', server / 'transfer_file.py')
     for name in (

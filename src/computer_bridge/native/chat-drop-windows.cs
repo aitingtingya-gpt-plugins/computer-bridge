@@ -280,7 +280,7 @@ public static class ComputerBridgeDrop
     private static string ReceiverCommand(string name)
     {
         string bootstrap = "$ErrorActionPreference='Stop'; " +
-            "$p=[IO.Pipes.NamedPipeClientStream]::new('.', '" + name + "', [IO.Pipes.PipeDirection]::InOut); " +
+            "$p=[IO.Pipes.NamedPipeClientStream]::new('.', '" + name + "', [IO.Pipes.PipeDirection]::InOut, [IO.Pipes.PipeOptions]::Asynchronous); " +
             "try { $p.Connect(15000); $r=[IO.BinaryReader]::new($p,[Text.Encoding]::UTF8,$true); " +
             "try { $bytes=$r.ReadBytes($r.ReadInt32()) } finally { $r.Dispose() }; " +
             "[Reflection.Assembly]::Load($bytes)>$null; [ComputerBridgeDrop]::Receive($p) } finally { $p.Dispose() }";

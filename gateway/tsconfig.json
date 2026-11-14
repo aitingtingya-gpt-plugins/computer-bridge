@@ -1,8 +1,9 @@
 {
   "compilerOptions": {
     "target": "ES2022", "module": "ESNext", "moduleResolution": "Bundler",
-    "lib": ["ES2022"], "types": ["@cloudflare/workers-types", "node"],
-    "strict": true, "skipLibCheck": true, "noEmit": true
+    "lib": ["ES2023", "ES2022.Intl"], "types": ["@cloudflare/workers-types", "node"],
+    "strict": true, "skipLibCheck": true, "noEmit": true, "allowImportingTsExtensions": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/chat_module/super_agent/vendor/tests/**", "src/chat_module/super_agent/vendor/src/**"]
 }

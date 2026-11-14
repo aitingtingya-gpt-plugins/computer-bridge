@@ -22,16 +22,23 @@ export function callbackUrl(value:string):URL{
 export async function cloudflareWebhookFetch(value:string,init:RequestInit):Promise<Response>{
   const url=callbackUrl(value);
   if(!ipaddr.isValid(url.hostname.replace(/^\[|\]$/g,''))){
-    const answers=await Promise.all(['A','AAAA'].map(async type=>{
-      const dns=new URL('https://cloudflare-dns.com/dns-query');dns.searchParams.set('name',url.hostname);dns.searchParams.set('type',type);
-      const response=await fetch(dns,{headers:{Accept:'application/dns-json'},redirect:'manual',signal:init.signal});
-      if(!response.ok)throw new Error('回调 DNS 查询失败');
-      const result=await response.json<{Status:number;Answer?:{type:number;data:string}[]}>();
-      if(result.Status!==0 && result.Status!==3)throw new Error('回调 DNS 查询失败');
-      return (result.Answer || []).filter(a=>a.type===1||a.type===28).map(a=>a.data);
-    }));
-    const addresses=answers.flat();
-    if(!addresses.length || addresses.some(address=>!publicAddress(address)))throw new Error('回调 DNS 必须全部解析到公共地址');
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(new DOMException('DNS lookup timeout','TimeoutError')),4_000);
+    const onAbort=()=>controller.abort(init.signal?.reason);
+    if(init.signal?.aborted)onAbort();
+    else init.signal?.addEventListener('abort',onAbort,{once:true});
+    try{
+      const answers=await Promise.all(['A','AAAA'].map(async type=>{
+        const dns=new URL('https://cloudflare-dns.com/dns-query');dns.searchParams.set('name',url.hostname);dns.searchParams.set('type',type);
+        const response=await fetch(dns,{headers:{Accept:'application/dns-json'},redirect:'manual',signal:controller.signal});
+        if(!response.ok)throw new Error('回调 DNS 查询失败');
+        const result=await response.json<{Status:number;Answer?:{type:number;data:string}[]}>();
+        if(result.Status!==0 && result.Status!==3)throw new Error('回调 DNS 查询失败');
+        return (result.Answer || []).filter(a=>a.type===1||a.type===28).map(a=>a.data);
+      }));
+      const addresses=answers.flat();
+      if(!addresses.length || addresses.some(address=>!publicAddress(address)))throw new Error('回调 DNS 必须全部解析到公共地址');
+    }finally{clearTimeout(timer);init.signal?.removeEventListener('abort',onAbort);}
   }
   // The Workers runtime uses its own resolver and rejects private/local destinations at connect time.
   const response=await fetch(url,{...init,redirect:'manual'});

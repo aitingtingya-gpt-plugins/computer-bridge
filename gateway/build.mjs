@@ -10,3 +10,7 @@ await appendLicenses('build/server.mjs',server.metafile);
 const launcher=await build({entryPoints:["src/node/launcher.ts"],outfile:"build/launcher.mjs",bundle:true,platform:"node",metafile:true,
   target:"node24",format:"esm"});
 await appendLicenses('build/launcher.mjs',launcher.metafile);
+// Preserve the report transport artifact path; upstream task scheduling remains server-side.
+const host=await build({entryPoints:["src/chat_module/host.ts"],outfile:"build/super-agent-host.mjs",bundle:true,platform:"node",metafile:true,
+  target:"node24",format:"esm"});
+await appendLicenses('build/super-agent-host.mjs',host.metafile);

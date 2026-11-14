@@ -1,0 +1,330 @@
+{
+  "commit": "8c32a9dc5d72c033816c6a8110b37f40cf94fba4",
+  "adaptations": [
+    {
+      "source": "src/app/effects.ts",
+      "target": "upstream-effects.ts",
+      "replacements": [
+        [
+          "import type { HealthBoard, HealthEntry } from '../infra/health.ts'",
+          "import type { HealthBoard, HealthEntry } from './effect-store'"
+        ],
+        [
+          "import type { Store } from './store.ts'",
+          "import type { EffectStore as Store } from './effect-store'"
+        ],
+        [
+          "this.seq = Number(store.db.prepare('SELECT IFNULL(MAX(seq), 0) AS seq FROM effect').get()?.seq ?? 0)",
+          "this.seq = store.effects.maxSequence()"
+        ],
+        [
+          "this.store.db.prepare(`INSERT INTO effect (kind, key, value, seq, due, since) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE\n      SET value = excluded.value, generation = generation + 1, attempts = 0, error = '', due = excluded.due`)\n      .run(kind, key, JSON.stringify(payload), ++this.seq, this.now(), new Date(this.now()).toISOString())",
+          "this.store.effects.upsert(kind, key, JSON.stringify(payload), ++this.seq, this.now(), new Date(this.now()).toISOString())"
+        ],
+        [
+          "return key === undefined ? !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? LIMIT 1').get(kind) : !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? AND key = ?').get(kind, key)",
+          "return this.store.effects.pending(kind, key)"
+        ],
+        [
+          "this.store.db.prepare('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)",
+          "this.store.effects.remove(kind, key)"
+        ],
+        [
+          "const rows = (handler.ordered\n          ? this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? ORDER BY seq LIMIT 1').all(kind)\n          : this.store.db.prepare('SELECT key, value, seq, generation, attempts, due FROM effect WHERE kind = ? AND due <= ? ORDER BY seq LIMIT ?')\n            .all(kind, this.now(), 16 + running.size)) as unknown as Row[]",
+          "const rows = this.store.effects.ready(kind, this.now(), handler.ordered, 16 + running.size)"
+        ],
+        [
+          "const own = 'kind = ? AND key = ? AND seq = ? AND generation = ?', ownRow = [kind, row.key, row.seq, row.generation] as const",
+          "const ownRow = [kind, row.key, row.seq, row.generation] as const"
+        ],
+        [
+          "if (!failure) this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow)",
+          "if (!failure) this.store.effects.removeOwned(...ownRow)"
+        ],
+        [
+          "this.store.db.prepare(`UPDATE effect SET due = ? WHERE ${own}`).run(this.now() + handler.retry[0], ...ownRow)",
+          "this.store.effects.reschedule(this.now() + handler.retry[0], undefined, ...ownRow)"
+        ],
+        [
+          "this.store.db.prepare(`UPDATE effect SET attempts = attempts + 1, error = ?, due = ? WHERE ${own}`)\n        .run(String(failure.error).slice(0, 1000), this.now() + delay, ...ownRow)",
+          "this.store.effects.reschedule(this.now() + delay, String(failure.error).slice(0, 1000), ...ownRow)"
+        ],
+        [
+          "const row = this.store.db.prepare(`SELECT COUNT(*) AS waiting, MIN(since) AS since, MAX(attempts) AS attempts,\n      (SELECT error FROM effect WHERE kind = ? AND attempts > 0 ORDER BY seq DESC LIMIT 1) AS error FROM effect WHERE kind = ?`).get(kind, kind)",
+          "const row = this.store.effects.summary(kind)"
+        ]
+      ],
+      "reason": "Replace SQLite statements with an equivalent transaction-local row store; scheduler, order, generation matching and backoff remain upstream."
+    },
+    {
+      "source": "src/policy.ts",
+      "target": "upstream-policy.ts",
+      "replacements": [
+        [
+          "'./limits.ts'",
+          "'./vendor/src/limits.ts'"
+        ],
+        [
+          "'./admission.ts'",
+          "'./vendor/src/admission.ts'"
+        ],
+        [
+          "'./core/index.ts'",
+          "'./vendor/src/core/index.ts'"
+        ],
+        [
+          "'./infra/text.ts'",
+          "'./vendor/src/infra/text.ts'"
+        ],
+        [
+          "'./infra/environment.ts'",
+          "'./upstream-host-constants'"
+        ]
+      ],
+      "reason": "Dependency paths only; the complete original policy and validation code executes."
+    },
+    {
+      "source": "src/app/outbox.ts",
+      "target": "upstream-outbox.ts",
+      "replacements": [
+        [
+          "'../core/index.ts'",
+          "'./vendor/src/core/index.ts'"
+        ],
+        [
+          "'../infra/text.ts'",
+          "'./vendor/src/infra/text.ts'"
+        ],
+        [
+          "'./effects.ts'",
+          "'./upstream-effects'"
+        ],
+        [
+          "import type { Commands } from '../infra/commands.ts'",
+          "type Commands = unknown"
+        ],
+        [
+          "import type { SourceRegistry } from '../sources/registry.ts'",
+          "import type { ReplySource as SourceRegistry } from './effect-store'"
+        ],
+        [
+          "import type { Store } from './store.ts'",
+          "import type { ReceiptStore as Store } from './effect-store'"
+        ]
+      ],
+      "reason": "Types/import paths only; original reply ordering, withdrawal and retry code executes against Bridge receipts."
+    },
+    {
+      "source": "src/app/assessment.ts",
+      "target": "upstream-assessor.ts",
+      "replacements": [
+        [
+          "import type { Agent } from '@deepseek-ai/dsh-agent'",
+          "type Agent = unknown"
+        ],
+        [
+          "'../core/index.ts'",
+          "'./vendor/src/core/index.ts'"
+        ],
+        [
+          "'../policy.ts'",
+          "'./upstream-policy'"
+        ],
+        [
+          "'../infra/text.ts'",
+          "'./vendor/src/infra/text.ts'"
+        ],
+        [
+          "import type { Commands } from '../infra/commands.ts'",
+          "import type { Commands } from './assessment-host'"
+        ],
+        [
+          "import type { Deployment } from '../deployment.ts'",
+          "import type { Deployment } from './assessment-host'"
+        ],
+        [
+          "'../sources/admission-context.ts'",
+          "'./upstream-admission-context'"
+        ],
+        [
+          "import { readRepositoryPath } from '../sources/github-read.ts'",
+          "import { readRepositoryPath } from './assessment-host'"
+        ],
+        [
+          "import type { TriggerContext } from '../sources/kind.ts'",
+          "import type { TriggerContext } from './assessment-host'"
+        ],
+        [
+          "import { relatedTickets } from './cards.ts'",
+          "import { relatedTickets } from './assessment-host'"
+        ],
+        [
+          "import { textPage } from './context.ts'",
+          "import { textPage } from './assessment-host'"
+        ],
+        [
+          "import { AcknowledgementSchema } from './tools/tool.ts'",
+          "import { AcknowledgementSchema } from './upstream-assessment'"
+        ],
+        [
+          "import type { Effects } from './effects.ts'",
+          "import type { Effects } from './upstream-effects'"
+        ],
+        [
+          "      this.host.engine.candidateDelivered(evalId)",
+          "      // Bridge's model reports candidate_delivered explicitly; a queued notice is not delivery to the model."
+        ]
+      ],
+      "reason": "Original MasterAssessor, source context and decision rules. Host IO types/reads are injected; candidate delivery is confirmed by an explicit model report instead of a native DSH callback."
+    },
+    {
+      "source": "src/sources/admission-context.ts",
+      "target": "upstream-admission-context.ts",
+      "replacements": [
+        [
+          "import type { Commands } from '../infra/commands.ts'",
+          "import type { Commands } from './assessment-host'"
+        ],
+        [
+          "import type { ContextMessage, TriggerContext } from './kind.ts'",
+          "import type { ContextMessage, TriggerContext } from './assessment-host'"
+        ]
+      ],
+      "reason": "Original bounded source-context loader with Bridge IO types."
+    }
+  ],
+  "extractions": [
+    {
+      "target": "upstream-prompts.ts",
+      "parts": [
+        {
+          "literal": "/** Pure prompt assembly from upstream app/prompts.ts; filesystem resources and version storage are separate host boundaries. */\nimport {z} from 'zod';\nimport {key} from './vendor/src/core/index.ts';\nimport {policyVersion,type Settings} from './upstream-policy';\nimport {promptResources as resources,githubSkill,feishuSkill} from './upstream-prompt-resources';\nconst sharedPrompt=resources.shared,masterPrompt=resources.orchestrator,workerPrompt=resources.worker;\nconst guides:Record<string,string>={subscriptions:resources.subscriptions,replies:resources.replies,dispatch:resources.dispatch,work:resources.work};\nconst mainAdmissionPolicy=resources.admission;\nconst handoffPolicy=(role:'orchestrator'|'worker')=>resources.handoff+'\\n'+(role==='orchestrator'?resources['handoff-orchestrator']:resources['handoff-worker']);\nconst teamDefaults={communication:resources['team/communication'],scope:resources['team/scope'],delivery:resources['team/delivery']};\nconst sourceSkills:Record<'github'|'feishu',string>={github:githubSkill,feishu:feishuSkill};\nconst cliNotes=resources.cli;\ntype Variable={name:string;value:string};\nconst environmentLines=(variables:Variable[])=>variables.map(v=>v.name+'='+v.value).join('\\n');\n"
+        },
+        {
+          "source": "src/app/prompts.ts",
+          "start": "/** Prompt sections",
+          "end": "/** An override whose built-in text changed"
+        }
+      ],
+      "reason": "Original pure prompt assembly and schemas; browser-compatible packaged resources replace filesystem loading."
+    },
+    {
+      "target": "upstream-notices.ts",
+      "parts": [
+        {
+          "literal": "/** Unchanged pure projections and notice rules extracted from upstream app/cards.ts and app/notices.ts. */\nimport {key,latestReport,ticketStage,type Ticket,type WorkerReport} from './vendor/src/core/index.ts';\nconst SOURCE='github';\n"
+        },
+        {
+          "source": "src/sources/github-pull.ts",
+          "start": "const pullNumber",
+          "end": "export const agentPull"
+        },
+        {
+          "literal": "\n"
+        },
+        {
+          "source": "src/app/cards.ts",
+          "start": "export function preview",
+          "end": "export function triggerCard"
+        },
+        {
+          "literal": "\n"
+        },
+        {
+          "source": "src/app/cards.ts",
+          "start": "/** The states",
+          "end": "/** Strips"
+        },
+        {
+          "literal": "\n"
+        },
+        {
+          "source": "src/app/notices.ts",
+          "start": "function brief",
+          "end": "/** Creates a one-off"
+        },
+        {
+          "literal": "\n"
+        },
+        {
+          "source": "src/app/notices.ts",
+          "start": "export interface Relay",
+          "end": "/**\n * Builds a steering relay"
+        },
+        {
+          "literal": "\n"
+        },
+        {
+          "source": "src/app/notices.ts",
+          "start": "/**\n * A person's message that reached tickets"
+        }
+      ],
+      "reason": "Original pure relay rules and card projection without DSH runtime imports."
+    },
+    {
+      "target": "upstream-slots.ts",
+      "parts": [
+        {
+          "literal": "/** Original slot accounting, with the host-supplied running list based on declared task activity. */\nimport {Later} from './upstream-effects';\n"
+        },
+        {
+          "source": "src/executor/dsh.ts",
+          "start": "/**\n * Tracks active and starting worker sessions",
+          "end": "/**\n * Executes ticket assignments"
+        }
+      ],
+      "reason": "Original concurrency accounting, mapped to reported executor activity rather than native DSH sessions."
+    },
+    {
+      "target": "upstream-assessment.ts",
+      "parts": [
+        {
+          "literal": "/** Original assessment and routing argument schemas; dependencies bind to the Bridge host. */\nimport {z} from 'zod';\nimport {AdmissionDirectionSchema,RuleAssessmentSchema,directionAllowed} from './upstream-policy';\nimport {IM_WORDS,wordCount} from './vendor/src/infra/text.ts';\n"
+        },
+        {
+          "source": "src/app/tools/tool.ts",
+          "start": "/** Human-facing acknowledgement text",
+          "end": "/**\n * Builds the"
+        },
+        {
+          "source": "src/app/assessment.ts",
+          "start": "/** Schema for a short",
+          "end": "/** Character limits"
+        },
+        {
+          "source": "src/app/assessment.ts",
+          "start": "/** Schema for bounded context",
+          "end": "/**\n * Implements the"
+        }
+      ],
+      "reason": "Original model assessment schemas, including rule coverage and settled direction; no host lifecycle assumptions."
+    },
+    {
+      "target": "upstream-route.ts",
+      "parts": [
+        {
+          "literal": "/** Original routing argument checks and decision execution, invoked through chat.task. */\nimport {z} from 'zod';\nimport {reasonText,type Decision,type DecisionKind,type Engine,type Repositories} from './vendor/src/core/index.ts';\nimport {IM_WORDS,NOTE_WORDS,wordCount} from './vendor/src/infra/text.ts';\nimport {WorktreeNameSchema} from './upstream-assessment';\ninterface MainToolsHost {engine:Engine;store:Repositories;quietly<T>(body:()=>T):T}\n"
+        },
+        {
+          "source": "src/app/tools/tool.ts",
+          "start": "/** Human-facing acknowledgement text",
+          "end": "/**\n * Builds the"
+        },
+        {
+          "source": "src/app/tools/main.ts",
+          "start": "const RoutingNoteSchema",
+          "end": "export interface MainToolsHost"
+        },
+        {
+          "source": "src/app/tools/main.ts",
+          "start": "const fromDecision",
+          "end": "/**\n * `orchestrator_route`"
+        },
+        {
+          "literal": "\nexport {RouteItemSchema};\nexport function routeOriginal(engine:Engine,store:Repositories,value:unknown){\n const item=RouteItemSchema.parse(value),problem=invalid(item);\n if(problem)throw new Error(problem);\n return route({engine,store,quietly:body=>body()},item,new Map());\n}\n"
+        }
+      ],
+      "reason": "Unchanged original explicit route validation and execution; Bridge supplies engine/repositories and exposes a direct callable wrapper."
+    }
+  ]
+}

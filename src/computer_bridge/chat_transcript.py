@@ -5,7 +5,7 @@ import asyncio
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from prompt_toolkit.application.current import get_app
@@ -25,6 +25,20 @@ Row = list[Fragment]
 Anchor = tuple[int | None, int, int, int]
 RenderKey = tuple[int, str, str, int]
 TextPoint = tuple[int, int, int]  # message sequence, logical row in that message, source character
+
+
+def beijing_message_time(value: Any) -> str:
+    """Display protocol timestamps in Beijing time (UTC+08:00), to minutes."""
+    if value is None or value == "":
+        return ""
+    try:
+        instant = datetime.fromisoformat(value)
+        # Legacy timestamps without an offset still originate in UTC.
+        if instant.tzinfo is None:
+            instant = instant.replace(tzinfo=timezone.utc)
+        return instant.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "时间未知"
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +128,9 @@ class ChatTranscript(UIControl):
     def __init__(self, status: Callable[[Json], str], decide: Callable[[str, str], None]):
         self.status, self.decide = status, decide
         self.messages: dict[int, Json] = {}
+        self.user_name = "本机"
+        self.maintenance_statuses: dict[str, Json] = {}
+        self.leading_rows: list[Row] = []
         self.order: list[int] = []
         self.lines: dict[int, list[Row]] = {}
         self.bodies: dict[int, tuple[tuple[object, ...], list[Row]]] = {}
@@ -142,6 +159,8 @@ class ChatTranscript(UIControl):
         self.drag_anchor: TextPoint | None = None
         self.mouse_button = MouseButton.NONE
         self.copy_menu: Callable[[], None] | None = None
+        self.selection_started: Callable[[], None] | None = None
+        self.selection_finished: Callable[[], None] | None = None
         self.pending_count = 0
         self.history_state = ""
         self.on_scroll: Callable[[int], None] | None = None
@@ -217,7 +236,33 @@ class ChatTranscript(UIControl):
     def is_focusable(self) -> bool:
         return True
 
+    def _maintenance_rows(self, sequence: int) -> list[Row]:
+        rows: list[Row] = []
+        statuses = sorted((item for item in self.maintenance_statuses.values()
+            if int(item["anchor_sequence"]) == sequence), key=lambda item: (item["created_at"], item["id"]))
+        for item in statuses:
+            deferred = item.get("outcome") == "deferred" or (
+                item["state"] == "completed" and item["text"] == "收到新消息，空闲检查已顺延。")
+            state = "检查已顺延" if deferred else {"waiting": "等待维护", "running": "正在维护上下文", "completed": "上下文维护完成", "failed": "维护失败"}[item["state"]]
+            detail = str(item["text"])
+            text = "◇ 上下文维护 · " + state
+            if detail.strip().rstrip("。.") != state:
+                text += " · " + detail
+            rows.extend(self.row(line, "class:maintenance") for _, line in source_lines(text))
+            rows.append(self.row(""))
+        return rows
+
     def _format(self, message: Json) -> list[Row]:
+        rows = self._format_message(message)
+        sequence = int(message["sequence"])
+        maintenance = self._maintenance_rows(sequence)
+        if sequence in self.source_positions:
+            positions = self.source_positions[sequence][:len(rows)]
+            positions.extend(len(message["text"]) + 2 + offset for offset in range(len(maintenance)))
+            self.source_positions[sequence] = positions
+        return [*rows, *maintenance]
+
+    def _format_message(self, message: Json) -> list[Row]:
         self.formatted_messages += 1
         if message.get("approval_id"):
             return []  # Its decision is displayed on the original approval card.
@@ -238,7 +283,7 @@ class ChatTranscript(UIControl):
                 for title, value in (("目录", approval["cwd"]), ("工具调用" if tool else "命令", approval["command"]), ("理由", approval["justification"])):
                     rows.extend(self.row("│ " + (title + "：" if index == 0 else "  ") + line)
                                 for index, line in enumerate(str(value).splitlines() or [""]))
-                expires = datetime.fromtimestamp(float(approval["expires_at"]) / 1000).astimezone().strftime("%m-%d %H:%M:%S")
+                expires = beijing_message_time(datetime.fromtimestamp(float(approval["expires_at"]) / 1000, timezone.utc).isoformat())
                 rows.append(self.row("│ 到期：" + expires))
                 if approval.get("permission_confirmation"):
                     rows.append(self.row("│ 本次同时申请使用命令工具。", "class:hint"))
@@ -255,7 +300,8 @@ class ChatTranscript(UIControl):
             else:
                 rows.append([("", "│ ", None), ("class:approval.button", " 收起详情 " if identifier in self.expanded else " 查看详情 ", (identifier, "details"))])
             return [*rows, self.row("└"), self.row("")]
-        sender = "GPT / Dot" if message["role"] == "assistant" else "你"
+        sender = "Super Agent" if message.get("source") == "module" else "GPT / Dot" if message["role"] == "assistant" else self.user_name
+        sender = "▐ " + sender + " ▌"
         signature = (message["text"], tuple((file["id"], file["name"], file["size"]) for file in message.get("attachments", [])))
         sequence = int(message["sequence"])
         previous = self.bodies.get(sequence)
@@ -275,11 +321,14 @@ class ChatTranscript(UIControl):
             self.bodies[sequence] = signature, body
         else:
             body = previous[1]
+        quote = [("class:reply.label", "  ↪ 引用 " + str(message["reply_to"]) + " ", None)] if message.get("reply_to") else []
         return [[("class:sender.assistant" if message["role"] == "assistant" else "class:sender.user", sender, None),
-                 ("class:hint", f" · {message['id']} · {message.get('created_at', '')}  {self.status(message)}", None)], *body, self.row("")]
+                 ("class:hint", f" · {message['id']} · {beijing_message_time(message.get('created_at'))}  {self.status(message)}", None),
+                 *quote], *body, self.row("")]
 
     def update(self, messages: Iterable[Json] = (), *, reset: bool = False,
-               older: bool = False, history_state: str = "", history_complete: bool = False) -> None:
+               older: bool = False, history_state: str = "", history_complete: bool = False,
+               user_name: str | None = None, maintenance_statuses: Iterable[Json] | None = None) -> None:
         anchor = self._anchor()
         changed = reset
         if reset:
@@ -292,21 +341,42 @@ class ChatTranscript(UIControl):
             self.ready_documents.clear()
             if self.document_flush:self.document_flush.cancel();self.document_flush=None
             self.messages.clear(); self.order.clear(); self.lines.clear()
+            self.maintenance_statuses.clear()
             self.bodies.clear()
             self.segment_actions.clear()
             self.expanded.clear(); self.busy.clear(); self.selected = None
             self.clear_selection()
             self.following = True
+        refresh: set[int] = set()
+        if user_name is not None and user_name != self.user_name:
+            self.user_name = user_name
+            refresh.update(self.order)
+        if maintenance_statuses is not None:
+            for item in maintenance_statuses:
+                identifier = str(item["id"])
+                old = self.maintenance_statuses.get(identifier)
+                # A delayed history page must not revert a newer live status.
+                if old is not None and str(old["updated_at"]) > str(item["updated_at"]):
+                    continue
+                if old != item:
+                    self.maintenance_statuses[identifier] = item
+                    refresh.add(int(item["anchor_sequence"]))
+                    if old is not None:
+                        refresh.add(int(old["anchor_sequence"]))
+                    changed = True
         for message in messages:
             sequence = int(message["sequence"])
             if self.messages.get(sequence) != message:
                 if sequence not in self.messages:
                     insort(self.order, sequence)
                 self.messages[sequence] = message
-                self.lines[sequence] = self._format(message)
-                self.segment_actions[sequence] = [(action, offset) for offset, row in enumerate(self.lines[sequence])
-                                                  for _, _, action in row if action]
+                refresh.add(sequence)
                 changed = True
+        for sequence in refresh & self.messages.keys():
+            self.lines[sequence] = self._format(self.messages[sequence])
+            self.segment_actions[sequence] = [(action, offset) for offset, row in enumerate(self.lines[sequence])
+                                              for _, _, action in row if action]
+            changed = True
         if older != self.older:
             self.older = older; changed = True
         if history_state != self.history_state:
@@ -325,7 +395,7 @@ class ChatTranscript(UIControl):
             return None
         screen = self.top
         logical = bisect_right(self.display_starts, screen) - 1
-        if logical == 0 and (self.older or self.history_complete) and self.order:
+        if logical < len(self.leading_rows) and self.order:
             screen = self.display_starts[self.starts[0]]
         last_visible = min(self.display_count - 1, self.top + self.height - 1)
         while screen < last_visible and not any(text.strip() for _, text, _ in self._screen_row(screen).fragments):
@@ -350,7 +420,13 @@ class ChatTranscript(UIControl):
         self.starts = []
         self.actions = []
         self.pending_count = 0
-        count = int(self.older or self.history_complete)
+        self.leading_rows = []
+        if self.older or self.history_complete:
+            self.leading_rows.append(self.row({"loading": "正在加载更早消息…", "error": "历史暂不可用，恢复连接后继续加载"}.get(self.history_state,
+                "已到最早消息" if self.history_complete else ""), "class:hint"))
+        if not self.older:
+            self.leading_rows.extend(self._maintenance_rows(0))
+        count = len(self.leading_rows)
         for sequence in self.order:
             self.starts.append(count)
             rows = self.lines[sequence]
@@ -366,9 +442,8 @@ class ChatTranscript(UIControl):
             self.selected = None
 
     def _row(self, index: int) -> Row:
-        if (self.older or self.history_complete) and index == 0:
-            return self.row({"loading": "正在加载更早消息…", "error": "历史暂不可用，恢复连接后继续加载"}.get(self.history_state,
-                "已到最早消息" if self.history_complete else ""), "class:hint")
+        if index < len(self.leading_rows):
+            return self.leading_rows[index]
         segment = bisect_right(self.starts, index) - 1
         if segment >= 0:
             rows = self.lines[self.order[segment]]
@@ -377,7 +452,7 @@ class ChatTranscript(UIControl):
                 return rows[offset]
             index = offset - len(rows)
         else:
-            index -= int(self.older or self.history_complete)
+            index -= len(self.leading_rows)
         return self.row("")
 
     def _layout(self, width: int, height: int) -> None:
@@ -458,7 +533,12 @@ class ChatTranscript(UIControl):
                     style += " class:approval.selected"
                 if start < end and offset < end and offset+len(text) > start:
                     left, right = max(0,start-offset), min(len(text),end-offset)
-                    fragments.extend([(style,text[:left]),(style+" class:text-selection",text[left:right]),(style,text[right:])])
+                    selected_style = style + " class:text-selection"
+                    if "class:sender.user" in style.split():
+                        selected_style += " class:sender.user.selected"
+                    elif "class:sender.assistant" in style.split():
+                        selected_style += " class:sender.assistant.selected"
+                    fragments.extend([(style,text[:left]),(selected_style,text[left:right]),(style,text[right:])])
                 else:
                     fragments.append((style,text))
                 offset += len(text)
@@ -577,26 +657,36 @@ class ChatTranscript(UIControl):
             self.scroll(-3 if mouse_event.event_type == MouseEventType.SCROLL_UP else 3)
             return None
         if mouse_event.event_type == MouseEventType.MOUSE_DOWN:
+            if self.selection_started:
+                self.selection_started()
             self.mouse_button = mouse_event.button
-            if mouse_event.button == MouseButton.RIGHT and self.copy_menu:
-                self.copy_menu()
+            if mouse_event.button == MouseButton.RIGHT:
+                self.drag_anchor = None
                 return None
             if mouse_event.button == MouseButton.LEFT:
                 self.clear_selection()
                 self.selected = None
                 self.drag_anchor = self.text_point(mouse_event.position)
                 return None
+        if mouse_event.event_type == MouseEventType.MOUSE_UP and self.mouse_button == MouseButton.RIGHT:
+            self.mouse_button = MouseButton.NONE
+            if self.copy_menu:
+                self.copy_menu()
+            return None
         if mouse_event.event_type in {MouseEventType.MOUSE_MOVE, MouseEventType.MOUSE_UP} and self.drag_anchor:
             if mouse_event.event_type == MouseEventType.MOUSE_MOVE and mouse_event.button != MouseButton.LEFT:
                 return NotImplemented
             point = self.text_point(mouse_event.position)
-            if point and point != self.drag_anchor:
-                self.selection = self.drag_anchor,point
-                self.following = False
+            if point:
+                self.selection = (self.drag_anchor, point) if point != self.drag_anchor else None
+                if self.selection:
+                    self.following = False
             if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
                 return None
             self.drag_anchor = None
             if self.selection:
+                if self.selection_finished:
+                    self.selection_finished()
                 return None
         if mouse_event.event_type == MouseEventType.MOUSE_UP and self.mouse_button != MouseButton.RIGHT:
             if mouse_event.button == MouseButton.RIGHT or not 0 <= mouse_event.position.y < self.display_count:

@@ -48,3 +48,12 @@ TeX into presentation trees; the terminal adapter reuses TeXicode's canvas
 operations without modifying that package or evaluating mathematical expressions.
 
 The browser conversation export bundle uses fflate 0.8.2 (MIT) for local ZIP creation and @noble/hashes 2.4.0 (MIT) for attachment SHA256 verification. Full dependency license texts are embedded in the generated browser bundle by build-chat.mjs.
+
+## Super Agent domain core
+
+The independent chat module vendors source from DeepSeek's
+[dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype),
+pinned to commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4` (MIT).
+The complete upstream license is preserved at
+`gateway/src/chat_module/super_agent/vendor/LICENSE`; source provenance and hashes
+are recorded beside the vendored source. No DSH or Cordis runtime is imported.

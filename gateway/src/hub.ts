@@ -352,6 +352,7 @@ export class ComputerHubCore {
       return {id:current.id,state:current.state,decision:current.decision,delivery_pending,
         ...(notification_pending?{notification_pending:true}:{})};
     }
+    if(action==='connect'||action==='disconnect')return this.chats.channelControl(action,args,principal);
     return this.chats.action(action,args,principal);
   }
 

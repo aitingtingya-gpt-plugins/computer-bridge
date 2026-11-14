@@ -123,7 +123,7 @@ building these sources. Deployment and publishing remain separate actions.
 
 ## Explicit network selection
 
-The helper identifies itself as `computer-bridge/0.2.5 transfer-helper` and keeps
+The helper identifies itself as `computer-bridge/0.2.6-alpha transfer-helper` and keeps
 TLS certificate verification and redirect rejection enabled. Its first HEAD
 checks the real transfer resource before any upload bytes. DNS, TLS, timeout
 and connection failures are reported separately without URLs or credentials.

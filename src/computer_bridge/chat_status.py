@@ -58,18 +58,14 @@ def compact_status(
     if latency:
         tail.append(latency)
     suffix = " · ".join(tail)
-    room = available - display_width(suffix) - 3
     if notice:
         ending = " · " + latency if latency else ""
         left = (clipped(notice, available - display_width(ending)) + ending
                 if display_width(ending) < available else clipped(latency or notice, available))
-    elif room >= 12:
-        first = max(4, (room - 3) // 2)
-        left = " · ".join(filter(None, (clipped(device or device_id, first),
-            clipped(title, room - first - 3), suffix)))
     else:
-        left = clipped(" · ".join(filter(None, (device_id, state,
-            f"审批 {pending}" if pending else "", latency))), available)
+        # Metadata has its natural width; the title gets every remaining cell.
+        # In particular a short device name must not strand half the row.
+        left = clipped(" · ".join(filter(None, (device or device_id, suffix, title))), available)
     return left + " " * max(0, columns - display_width(left) - right) + identity
 
 

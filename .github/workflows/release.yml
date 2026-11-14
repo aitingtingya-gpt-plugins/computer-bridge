@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v0.2.5'
+      - 'v*'
 permissions:
   contents: write
 concurrency:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: github.ref == 'refs/tags/v0.2.5'
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -25,16 +25,20 @@ jobs:
       - run: npm ci --prefix src/computer_bridge/native
       - run: npm ci --prefix gateway
       - run: npm run check --prefix gateway
+      - name: Read release version
+        run: python -c 'import os,runpy; v=runpy.run_path("src/computer_bridge/__init__.py")["__version__"]; open(os.environ["GITHUB_ENV"],"a").write("RELEASE_VERSION="+v+"\n")'
+      - name: Verify tag matches package version
+        run: test "${GITHUB_REF_NAME}" = "v${RELEASE_VERSION}"
       - run: python scripts/source_integrity.py
       - name: Build verified public components
-        run: python scripts/build_release.py --release-version 0.2.5
+        run: python scripts/build_release.py --release-version "${RELEASE_VERSION}"
       - name: Check every release asset
-        run: python scripts/verify_release.py dist/release-0.2.5
+        run: python scripts/verify_release.py "dist/release-${RELEASE_VERSION}"
       - name: Require new version
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view v0.2.5 >/dev/null 2>&1; then
+          if gh release view "v${RELEASE_VERSION}" >/dev/null 2>&1; then
             echo "Release already exists; never replace its resources."
             exit 1
           fi
@@ -42,6 +46,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp docs/release-0.2.5.md release-notes.txt
+          cp "docs/release-${RELEASE_VERSION}.md" release-notes.txt
           printf '\nSource commit: %s\n' "$GITHUB_SHA" >> release-notes.txt
-          gh release create v0.2.5 --verify-tag --target "$GITHUB_SHA" --title 0.2.5 --notes-file release-notes.txt dist/release-0.2.5/*
+          release_flags=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "v${RELEASE_VERSION}" "${release_flags[@]}" --verify-tag --target "$GITHUB_SHA" --title "${RELEASE_VERSION}" --notes-file release-notes.txt "dist/release-${RELEASE_VERSION}/"*

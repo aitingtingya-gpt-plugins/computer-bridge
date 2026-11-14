@@ -1,4 +1,4 @@
-# Computer Bridge 0.2.5
+# Computer Bridge 0.2.6-alpha
 
 网页和终端聊天支持 Markdown 与科研公式。网页使用 MathJax 完整数学排版；终端显示二维字符公式，`/math` 可在本机打开完整 SVG 排版，无需再次登录或安装 TeX。公式资源随产品提供，不依赖第三方渲染服务。
 
@@ -47,7 +47,7 @@ GPT / Dot → MCP + OAuth → 中转服务
 
 ## 双向聊天
 
-打开服务地址的 `/chat`，选择电脑后新建或打开对话。安装后新开终端输入 `cs` 或 `closesi` 进入 TUI，默认直接使用已注册的本机身份；`/login` 切换到账户，可访问账户下所有获授权电脑的对话；`/resume` 按会话名称选择。详见[聊天说明](docs/chat.md)和[终端命令](docs/chat-terminal.md)。
+打开服务地址的 `/chat`，选择电脑后新建或打开对话。安装后新开终端输入 `cs` 或 `closesi` 进入 TUI，首次使用本机身份；`/login` 登录后重启终端会恢复账号，`/logout` 可退出账号。网页登录时可勾选「保持登录（30 天）」；`/resume` 按会话名称选择。详见[聊天说明](docs/chat.md)和[终端命令](docs/chat-terminal.md)。
 
 在 Work 或 Dot 启用 Computer Bridge 后，要求它“连接对话 t1 并订阅新消息，收到后回复到这里”。服务器更新后先在插件设置刷新工具及事件目录。事件唤醒用于 Work／Dot，普通 Chat 不提供该能力；原有电脑操作工具仍可正常使用。聊天过程中模型可以继续调用桥接器工具，沿用原账号、工作区及审批权限。
 

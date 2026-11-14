@@ -1,7 +1,8 @@
 """Verify the exact public release assets before publication."""
 from pathlib import Path
-import argparse,hashlib,json,re,zipfile,os
-VERSION='0.2.5'
+import argparse,hashlib,json,re,zipfile,os,runpy
+from packaging.version import Version
+VERSION=runpy.run_path(str(Path(__file__).resolve().parents[1]/'src/computer_bridge/__init__.py'))['__version__']
 EXPECTED={
  f'computer-bridge-{VERSION}-install.zip',
  f'computer-bridge-client-{VERSION}.zip',
@@ -10,7 +11,7 @@ EXPECTED={
  f'computer-bridge-cloudflare-base-{VERSION}.mjs',
  f'computer-bridge-cloudflare-work-tree-{VERSION}.mjs',
  f'computer-bridge-work-tree-server-{VERSION}.mjs',
- f'computer_bridge_work_tree-{VERSION}-py3-none-any.whl',
+ f'computer_bridge_work_tree-{Version(VERSION)}-py3-none-any.whl',
  'release-manifest.json','SHA256SUMS'}
 FORBIDDEN_PARTS={'.git','.venv','node_modules','__pycache__','.wrangler','.pytest_cache','validation'}
 FORBIDDEN_NAMES={'AGENTS.md','.env','.dev.vars','.DS_Store','test-targeted.mjs','inspect_input_keys.py'}

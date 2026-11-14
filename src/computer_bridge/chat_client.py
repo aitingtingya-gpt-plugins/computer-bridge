@@ -129,6 +129,8 @@ class ChatClient:
         await self.use_device()
         if login:
             await self.login_account(browser=browser, notice=notice)
+        else:
+            await self._restore_account()
 
     async def use_device(self) -> None:
         result = await self._post("/chat/device/session", {}, authenticated=False, headers={
@@ -142,21 +144,30 @@ class ChatClient:
         await self.use_device()
         self.credential_file.unlink(missing_ok=True)
 
-    async def login_account(self, *, browser: bool = True, notice: Callable[[str], None] = print) -> None:
-        if self.credential_file.exists():
+    async def _restore_account(self) -> bool:
+        try:
             saved = json.loads(self.credential_file.read_text(encoding="utf-8"))
-            if saved.get("server") == self.server and saved.get("scope") == "account" and saved.get("device_id") == self.settings["device_id"]:
-                try:
-                    await self._post("/chat/api/devices", {}, authenticated=False,
-                        headers={"Authorization": "Bearer " + str(saved["credential"])})
-                except Error as exc:
-                    if exc.code not in {"chat_login_required", "account_access_expired", "account_unavailable", "unauthorized", "auth_required", "chat_credential_invalid"}:
-                        raise
-                    self.credential_file.unlink(missing_ok=True)
-                else:
-                    self.credential, self.account = str(saved["credential"]), saved["account"]
-                    self.mode, self.connected = "account", True
-                    return
+        except (FileNotFoundError, json.JSONDecodeError):
+            return False
+        if (saved.get("server") != self.server or saved.get("scope") != "account"
+                or saved.get("device_id") != self.settings["device_id"]):
+            return False
+        credential = str(saved["credential"])
+        try:
+            await self._post("/chat/api/devices", {}, authenticated=False,
+                headers={"Authorization": "Bearer " + credential})
+        except Error as exc:
+            if exc.code not in {"chat_login_required", "account_access_expired", "account_unavailable", "unauthorized", "auth_required", "chat_credential_invalid"}:
+                raise
+            self.credential_file.unlink(missing_ok=True)
+            return False
+        self.credential, self.account = credential, saved["account"]
+        self.mode, self.connected = "account", True
+        return True
+
+    async def login_account(self, *, browser: bool = True, notice: Callable[[str], None] = print) -> None:
+        if await self._restore_account():
+            return
         pending = await self._post("/chat/device/start", {
             "device_id": self.settings["device_id"], "device_key": self.settings["device_key"], "scope": "account",
         }, authenticated=False)

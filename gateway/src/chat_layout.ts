@@ -70,12 +70,15 @@ export const chatLayoutScript=String.raw`<script>
  function restore(anchor){
   if(!anchor||anchor.generation!==window.bridgeChatView.generation())return;
   if(anchor.bottom)messages.scrollTop=messages.scrollHeight;
-  else{const node=window.bridgeChatView.byId(anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}remember();
+  else{const node=window.bridgeChatView.byId(anchor.id);messages.scrollTop=node?messages.scrollTop+node.getBoundingClientRect().top-messages.getBoundingClientRect().top-anchor.offset:anchor.top;}
+  // Prepending can expose an estimated-height row above the original anchor.
+  // Keep that original message while content-visibility resolves real heights.
+  reading={...anchor,top:messages.scrollTop};
  }
  // Browser image decode, font layout and expandable approvals can resize earlier rows after insertion.
  const contentObserver=new ResizeObserver(()=>{if(!restoring && !stopped && reading && Math.abs(reading.top-messages.scrollTop)<1)restore(reading);});
  function watch(node){contentObserver.observe(node);}
- function capture(){if(reading?.generation===window.bridgeChatView.generation() && Math.abs(reading.top-messages.scrollTop)<1)restore(reading);return remember();}
+ function capture(){if(reading?.generation===window.bridgeChatView.generation() && Math.abs(reading.top-messages.scrollTop)<1){restore(reading);return reading;}return remember();}
  window.bridgeChatLayout={capture,restore,isCompact:()=>narrow.matches,watch,unwatch:()=>contentObserver.disconnect()};
  function attr(node,name,value){value=String(value);if(node.getAttribute(name)!==value)node.setAttribute(name,value);}
  function style(name,value){if(layout.style.getPropertyValue(name)!==value)layout.style.setProperty(name,value);}
@@ -99,7 +102,7 @@ export const chatLayoutScript=String.raw`<script>
   style('--sidebar-width',width+'px');style('--compose-height',height+'px');attr(layout,'data-collapsed',prefs.collapsed);attr(layout,'data-drawer',drawer&&narrow.matches);
   const inert=narrow.matches?!drawer:prefs.collapsed;if(sidebar.inert!==inert)sidebar.inert=inert;attr(sidebar,'aria-hidden',inert);backdrop.hidden=!narrow.matches||!drawer;attr(open,'aria-expanded',!inert);
   for(const [handle,value,min,max] of [[sideHandle,width,200,maxWidth],[composeHandle,height,minHeight,maxHeight]]){attr(handle,'aria-valuenow',Math.round(value));attr(handle,'aria-valuemin',min);attr(handle,'aria-valuemax',Math.round(max));}
-  const layoutTop=messages.scrollTop;cancelAnimationFrame(restoreFrame);restoreFrame=requestAnimationFrame(()=>{restoreFrame=0;if(Math.abs(messages.scrollTop-layoutTop)<1)restore(anchor);restoring=false;remember();});
+  const layoutTop=messages.scrollTop;cancelAnimationFrame(restoreFrame);restoreFrame=requestAnimationFrame(()=>{restoreFrame=0;if(anchor&&Math.abs(messages.scrollTop-layoutTop)<1)restore(anchor);else remember();restoring=false;});
  }
  function schedule(){if(!stopped&&!applyFrame)applyFrame=requestAnimationFrame(apply);}
  messages.addEventListener('scroll',()=>{if(!restoring&&!scrollFrame)scrollFrame=requestAnimationFrame(()=>{scrollFrame=0;if(!restoring && (!reading || Math.abs(reading.top-messages.scrollTop)>=1))remember();});},{passive:true});
@@ -134,3 +137,4 @@ export const chatLayoutScript=String.raw`<script>
  remember();schedule();
 })();
 </script>`;
+

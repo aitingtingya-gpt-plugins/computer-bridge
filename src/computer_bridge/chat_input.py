@@ -10,7 +10,9 @@ import ctypes
 import os
 import re
 import sys
+from bisect import bisect_left, bisect_right
 from collections.abc import Callable
+from contextlib import contextmanager
 from types import FunctionType, MethodType
 from typing import Any
 
@@ -62,6 +64,20 @@ _NEWLINE_SEQUENCES = {
     "\x1b[13u": Keys.ControlM,
     "\x1b[13;1u": Keys.ControlM,
 }
+# These are decoded only when a terminal actually forwards the shortcut.
+# Terminal.app owns Command+C and does not emit it to the PTY. Do not install
+# a global key observer, change terminal preferences, or copy on selection.
+_COPY_SEQUENCES = {
+    "\x1b[99;9u": Keys.ControlInsert,       # Kitty / CSI-u Super+C
+    "\x1b[99;9:1u": Keys.ControlInsert,
+    "\x1b[99;9:2u": Keys.ControlInsert,
+    "\x1b[99;9:3u": Keys.Ignore,
+    "\x1b[99;6u": Keys.ControlInsert,       # Ctrl+Shift+C
+    "\x1b[99;6:1u": Keys.ControlInsert,
+    "\x1b[99;6:2u": Keys.ControlInsert,
+    "\x1b[99;6:3u": Keys.Ignore,
+    "\x1b[27;6;99~": Keys.ControlInsert,    # modifyOtherKeys
+}
 _PROTOCOL_REPLY = re.compile(r"\x1b\[\?(\d+)u")
 _PROTOCOL_PREFIX = re.compile(r"\x1b\[\?\d*")
 _APPLE_SHIFT_ARROWS = {
@@ -69,6 +85,10 @@ _APPLE_SHIFT_ARROWS = {
     "\x1b[B": Keys.ShiftDown,
     "\x1bOA": Keys.ShiftUp,
     "\x1bOB": Keys.ShiftDown,
+    "\x1b[C": Keys.ShiftRight,
+    "\x1b[D": Keys.ShiftLeft,
+    "\x1bOC": Keys.ShiftRight,
+    "\x1bOD": Keys.ShiftLeft,
 }
 
 
@@ -83,7 +103,7 @@ class NewlineParser(Vt100Parser):
         class PrefixCache(dict[str, bool]):
             def __missing__(self, prefix: str) -> bool:
                 result = (base_cache[prefix] or bool(_PROTOCOL_PREFIX.fullmatch(prefix))
-                          or any(key.startswith(prefix) and key != prefix for key in _NEWLINE_SEQUENCES))
+                          or any(key.startswith(prefix) and key != prefix for key in (*_NEWLINE_SEQUENCES, *_COPY_SEQUENCES)))
                 self[prefix] = result
                 return result
 
@@ -105,6 +125,8 @@ class NewlineParser(Vt100Parser):
             self._escape_shift = self.shift()
         if prefix in _NEWLINE_SEQUENCES:
             return _NEWLINE_SEQUENCES[prefix]
+        if prefix in _COPY_SEQUENCES:
+            return _COPY_SEQUENCES[prefix]
         if _PROTOCOL_REPLY.fullmatch(prefix):
             self.protocol()
             return Keys.Ignore
@@ -190,6 +212,48 @@ class KeyboardInput:
         console._use_virtual_terminal_input = False
         console.console_input_reader = NativeReader()
         console.raw_mode = lambda: NativeRawMode()
+        handle = console.console_input_reader.handle
+        original = DWORD()
+        if not windll.kernel32.GetConsoleMode(handle, ctypes.byref(original)):
+            raise OSError("无法读取终端输入模式")
+        self._console_handle = handle
+        self._console_original = original.value
+
+        @contextmanager
+        def cooked_mode():
+            prior = DWORD()
+            if not windll.kernel32.GetConsoleMode(handle, ctypes.byref(prior)):
+                raise OSError("无法读取终端输入模式")
+            if not windll.kernel32.SetConsoleMode(handle, DWORD(original.value)):
+                raise OSError("无法暂停终端输入模式")
+            try:
+                yield
+            finally:
+                windll.kernel32.SetConsoleMode(handle, prior)
+        console.cooked_mode = cooked_mode
+
+    def bind_output(self, output: Output) -> None:
+        """Pair this NativeReader with this output, never patch PTK globally."""
+        if sys.platform != "win32" or not hasattr(self, "_console_handle"):
+            return
+        from ctypes import windll
+        from ctypes.wintypes import DWORD
+        enable, disable = output.enable_mouse_support, output.disable_mouse_support
+        def mode(enabled: bool) -> None:
+            value = DWORD()
+            if not windll.kernel32.GetConsoleMode(self._console_handle, ctypes.byref(value)):
+                raise OSError("无法读取终端鼠标模式")
+            value.value = (value.value | 0x90) & ~0x40 if enabled else value.value & ~0x10
+            if not windll.kernel32.SetConsoleMode(self._console_handle, value):
+                raise OSError("无法设置终端鼠标模式")
+        def enable_mouse() -> None:
+            enable()
+            mode(True)
+        def disable_mouse() -> None:
+            disable()
+            mode(False)
+        output.enable_mouse_support = enable_mouse
+        output.disable_mouse_support = disable_mouse
 
     def start(self, output: Output) -> None:
         self.output = output
@@ -304,3 +368,21 @@ class InputNavigator:
             self.move(direction, count)
             if self.buffer.cursor_position == selection.original_cursor_position:
                 self.buffer.exit_selection()
+
+    def horizontal(self, direction: int, count: int = 1, *, selecting: bool = False) -> None:
+        """Move through graphemes and newlines, independent of visual wraps."""
+        buffer = self.buffer
+        if selecting and buffer.selection_state is None:
+            buffer.start_selection()
+        selection = buffer.selection_state
+        if selecting and selection is not None:
+            selection.enter_shift_mode()
+        elif not selecting:
+            buffer.exit_selection()
+        boundaries = [offset for offset, _, _ in graphemes(buffer.text)] + [len(buffer.text)]
+        cursor = buffer.cursor_position
+        index = (bisect_left(boundaries, cursor) - count if direction < 0
+                 else bisect_right(boundaries, cursor) + count - 1)
+        buffer.cursor_position = boundaries[max(0, min(len(boundaries) - 1, index))]
+        if selecting and selection is not None and buffer.cursor_position == selection.original_cursor_position:
+            buffer.exit_selection()

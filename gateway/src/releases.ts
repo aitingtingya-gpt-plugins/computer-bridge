@@ -2,7 +2,7 @@ import {compare,valid,satisfies} from 'semver';
 import type {Store} from './runtime';
 import type {Data} from './types';
 
-export const VERSION='0.2.5';
+export const VERSION='0.2.6-alpha';
 export const DEFAULT_REPOSITORY='aitingtingya-gpt-plugins/computer-bridge';
 export interface Artifact {
   id:string;

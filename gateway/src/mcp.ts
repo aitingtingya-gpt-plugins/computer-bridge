@@ -6,9 +6,13 @@ import type {Data} from "./types";
 import {toolSpecs,serverInstructions,helpText,promptText,approvalRouting} from "./contracts";
 import {VERSION} from './releases';
 import {commandDecision} from './approvals';
-import {chatToolSpecs,chatInstructions} from './chat_contracts';
+import {chatToolSpecs,chatInstructions,chatToolContext} from './chat_contracts';
 import {hasToolPermission} from './tool_permissions';
 import {admitMcpRequest} from './mcp_body';
+import type {Actor} from './accounts';
+import {toolObservationReceipt,type ObservedToolTicket} from './chat_module/tool_observation';
+import {withToolObservationReceipt} from './chat_module/tool_observation_mcp';
+import {resumeSummarySampling,afterReplySummarySampling,observeSamplingCapabilities} from './chat_module/summary_mcp';
 
 // Admission must happen before parsing JSON on the gateway. Large file bytes
 // belong to /transfers/, never an unbounded MCP request/response envelope.
@@ -34,16 +38,32 @@ export function handler(hub: ComputerHubCore) {
         }
       });
     for (const [name, description, schema] of [...toolSpecs,...chatToolSpecs]) {
-      const inputSchema=hasToolPermission(name) && name!=='computer.exec' ? (schema as z.ZodObject<any>).extend({
+      const baseSchema=name.startsWith('computer.')?(schema as z.ZodObject<any>).extend({chat_context:chatToolContext}):schema as z.ZodObject<any>;
+      const inputSchema=hasToolPermission(name) && name!=='computer.exec' ? baseSchema.extend({
         ...approvalRouting,...(name==='computer.lock_mode'?{request_key:z.string().optional()}:{}),
-      }) : schema as z.ZodObject<any>;
+      }) : baseSchema;
       server.registerTool(name, {description, inputSchema, annotations: {
-        readOnlyHint: ["computer.recover", "computer.list", "computer.workspaces", "computer.image", "computer.skills", "computer.agents", "computer.jobs", "computer.modules", "computer.module_tools","chat.list","chat.history"].includes(name),
+        // computer.* may now persist explicitly bound chat observations; mixed read/write tools cannot advertise read-only.
+        readOnlyHint: ["chat.list","chat.channel","chat.history","chat.context","chat.working_context","chat.pending","chat.receipt"].includes(name),
         openWorldHint: name === "computer.exec",
       }}, async (args: any, ctx: ServerContext) => {
+        let observation:ObservedToolTicket|undefined,actor:Actor|undefined;let caller='';
+        const finish=async(response:any,output:any=response)=>{
+          if(!observation||!actor)return response;
+          let receipt=toolObservationReceipt(observation);
+          try{receipt=await hub.chats.finishToolObservation(observation,output,actor,caller);}catch{/* The original result remains authoritative; capture is unavailable. */}
+          return withToolObservationReceipt(response,receipt);
+        };
         try {
-          const caller=String(ctx.http?.authInfo?.extra?.bridgeCaller || '');
-          const actor=await hub.identity(String(ctx.http?.authInfo?.extra?.bridgeAccount || ''),Number(ctx.http?.authInfo?.extra?.bridgeEpoch));
+          caller=String(ctx.http?.authInfo?.extra?.bridgeCaller || '');
+          actor=await hub.identity(String(ctx.http?.authInfo?.extra?.bridgeAccount || ''),Number(ctx.http?.authInfo?.extra?.bridgeEpoch));
+          if(name.startsWith('computer.')&&args.chat_context!==undefined){
+            const binding=args.chat_context;args={...args};delete args.chat_context;
+            observation=await hub.chats.beginToolObservation(binding,name,args,actor,caller);
+          }
+          const capabilities=era==='modern' ? (ctx.mcpReq.envelope as Data | undefined)?.[CLIENT_CAPABILITIES_META_KEY] : server.server.getClientCapabilities();
+          const summaryContinuation=await resumeSummarySampling({name,args,ctx,actor,caller,hub});
+          if(summaryContinuation!==undefined)return summaryContinuation;
           const requestState=ctx.mcpReq.requestState<string>();
           const commandTicket=typeof requestState==='string' && requestState.startsWith('command:') ? requestState.slice(8) : undefined;
           if(commandTicket !== undefined) {
@@ -52,7 +72,7 @@ export function handler(hub: ComputerHubCore) {
             if(answer && ['accept','decline','cancel'].includes(answer.action)) {
               const decision=commandDecision(answer.action);
               const result=await hub.approvalResult(record.id,decision,caller,actor);
-              return toolResult(result);
+              return finish(toolResult(result),result);
             }
           }
           await hub.checkToolPermission(name,args,actor);
@@ -64,10 +84,10 @@ export function handler(hub: ComputerHubCore) {
               const state = ctx.mcpReq.requestState<string>();
               if (!state) {
                 const ticket = await hub.humanTicket(args,actor);
-                return inputRequired({inputRequests: {confirm: {method: "elicitation/create", params: {
+                return finish(inputRequired({inputRequests: {confirm: {method: "elicitation/create", params: {
                   mode: "form", message: confirmation.message,
                   requestedSchema: confirmation.schema as any,
-                }}}, requestState: ticket});
+                }}}, requestState: ticket}),{state:'awaiting_host_input',executed:false});
               }
               await hub.consumeHumanTicket(state, args,actor);
               const answer = ctx.mcpReq.inputResponses?.confirm as Data | undefined;
@@ -77,11 +97,10 @@ export function handler(hub: ComputerHubCore) {
                 requestedSchema: confirmation.schema as any});
               confirmed = answer.action === "accept" && answer.content?.start === true;
             }
-            if (!confirmed) return {content: [{type: "text", text: JSON.stringify({started: false})}]};
+            if (!confirmed) return finish({content: [{type: "text", text: JSON.stringify({started: false})}]},{started:false});
           }
           const result = await hub.invoke(name, args, confirmed, ctx.mcpReq.signal,caller,actor);
           if(result.state==='awaiting_approval' && result.approval?.channel!=='chat') {
-            const capabilities=era==='modern' ? (ctx.mcpReq.envelope as Data | undefined)?.[CLIENT_CAPABILITIES_META_KEY] : server.server.getClientCapabilities();
             const elicit=capabilities?.elicitation;
             const supportsForm=elicit !== undefined && ('form' in elicit || Object.keys(elicit).length===0);
             if(supportsForm) {
@@ -96,22 +115,24 @@ export function handler(hub: ComputerHubCore) {
               if(era==='modern') {
                 const ticket=commandTicket !== undefined ? commandTicket :
                   await hub.approvals.ticket(result.approval.id,caller,name,args);
-                return inputRequired({inputRequests:{command:{method:'elicitation/create',params}},
-                  requestState:'command:'+ticket});
+                return finish(inputRequired({inputRequests:{command:{method:'elicitation/create',params}},
+                  requestState:'command:'+ticket}),result);
               }
               const answer=await ctx.mcpReq.elicitInput(params);
               const decision=commandDecision(answer.action);
               const completed=await hub.approvalResult(result.approval.id,decision,caller,actor);
-              return toolResult(completed);
+              return finish(toolResult(completed),completed);
             }
           }
-          return toolResult(result);
+          if(name==='chat.context'||name==='chat.resume')result.host_capabilities={sampling:observeSamplingCapabilities(era,capabilities)};
+          return finish(toolResult(result),result);
         } catch (error) {
-          return {isError: true, content: [{type: "text", text: JSON.stringify({error: {
+          const detail={error: {
             code: (error as any).code || "computer_error", message: String((error as Error).message),
             ...((error as any).request_state?{request_state:(error as any).request_state}:{}),
             ...((error as any).request_id?{request_id:(error as any).request_id,request_key:(error as any).request_key,device_id:(error as any).device_id,
-              recover:(error as any).recover}:{})}})}]};
+              recover:(error as any).recover}:{})}};
+          return finish({isError:true,content:[{type:'text',text:JSON.stringify(detail)}]},detail);
         }
       });
     }
@@ -154,3 +175,4 @@ export function handler(hub: ComputerHubCore) {
     return transport.handleRequest(request,{authInfo});
   }};
 }
+

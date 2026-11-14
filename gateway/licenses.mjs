@@ -22,11 +22,16 @@ export async function dependencyLicenses(metafile,base=process.cwd()) {
   const notices=[];
   for(const [directory,metadata] of [...packages].sort((a,b)=>a[1].name.localeCompare(b[1].name))) {
     const files=(await readdir(directory)).filter(name=>/^(licen[cs]e|copying|notice)([.-]|$)/i.test(name)).sort();
-    const supplied=metadata.name==='standardwebhooks'&&metadata.version==='1.1.1'?'standardwebhooks-1.1.1.txt':metadata.name==='@mathjax/mathjax-tex-font'&&metadata.version==='4.1.3'?'mathjax-tex-font-4.1.3.txt':null;
+    const supplied=metadata.name==='js-tiktoken'&&metadata.version==='1.0.21'?'js-tiktoken-1.0.21.txt':metadata.name==='standardwebhooks'&&metadata.version==='1.1.1'?'standardwebhooks-1.1.1.txt':metadata.name==='@mathjax/mathjax-tex-font'&&metadata.version==='4.1.3'?'mathjax-tex-font-4.1.3.txt':null;
     if(!files.length && !supplied)throw new Error('License text missing for '+metadata.name);
     const texts=files.length?await Promise.all(files.map(async name=>name+'\n'+await readFile(join(directory,name),'utf8'))):
       [await readFile(new URL('./licenses/'+supplied,import.meta.url),'utf8')];
     notices.push(metadata.name+' '+metadata.version+'\n'+texts.join('\n\n'));
+  }
+  // Vendored source is not an npm package, but its full license must survive server bundling.
+  if(Object.keys(metafile.inputs).some(input=>input.replaceAll('\\','/').includes('chat_module/super_agent/vendor/'))){
+    const license=await readFile(new URL('./src/chat_module/super_agent/vendor/LICENSE',import.meta.url),'utf8');
+    notices.push('DeepSeek Super Agent domain core (8c32a9dc5d72c033816c6a8110b37f40cf94fba4)\n'+license);
   }
   return notices.join('\n\n--------------------\n\n');
 }
@@ -38,3 +43,4 @@ export async function appendLicenses(output,metafile,base=process.cwd()) {
   await appendFile(output,'\n/* Computer Bridge license\n'+own.replaceAll('*/','* /')+'\n'+
     (notices?'\nThird-party licenses\n'+notices.replaceAll('*/','* /'):'')+'\n*/\n');
 }
+

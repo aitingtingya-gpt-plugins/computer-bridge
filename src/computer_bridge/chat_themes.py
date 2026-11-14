@@ -44,10 +44,20 @@ def theme_style(name: str) -> BaseStyle:
         "contrast": ("monokai", "#000000", "#ffffff", "#c5c5c5", "#56dfff", "#ffe36c", "#eda6ff", "#8dffb2", "#161616", "#234963", "#aaaaaa"),
     }
     syntax, background, foreground, muted, assistant, user, heading, accent, panel, selection, border = palettes[name]
+    # Identity is a solid, achromatic badge, not another syntax-token hue.
+    # Its complete foreground/background treatment is distinct from every
+    # token in native/friendly/monokai, including plain/strong white text.
+    badge_background, badge_foreground = ("#273142", "#ffffff") if name == "light" else ("#ffffff", "#171717")
+    assistant_foreground = "#ffffff" if name == "light" else "#171717"
     return merge_styles([style_from_pygments_cls(get_style_by_name(syntax)), Style.from_dict({
         "": f"bg:{background} {foreground}",
         "text-area": f"bg:{background} {foreground}",
-        "sender.user": f"{user} bold", "sender.assistant": f"{assistant} bold",
+        "sender.user": f"bg:{badge_background} {badge_foreground} bold",
+        "sender.assistant": f"bg:{assistant} {assistant_foreground} bold",
+        "sender.user.selected": f"bg:{badge_background} {badge_foreground} bold underline",
+        "sender.assistant.selected": f"bg:{assistant} {assistant_foreground} bold underline",
+        "reply.label": f"{accent} bold underline",
+        "maintenance": f"{accent} italic",
         "metadata": muted, "hint": muted,
         "header": f"bg:{panel} {foreground} bold", "status": accent,
         "latency.good": "#2fa66d", "latency.warning": "#c99a28",

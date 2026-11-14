@@ -11,7 +11,10 @@ import {mobileStyles} from './mobile_ui';
 
 type AuthEnv = ApplicationEnv & {OAUTH_PROVIDER: OAuthHelpers};
 const page = (title: string, body: string, headers?: HeadersInit, pageClass = '') => renderPage(title, body, headers, styles+cardStyles+accountStyles+chatStyles+mobileStyles,pageClass);
-const expiredCookie='bridge_admin=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0';
+const cookieAttributes='HttpOnly; Secure; SameSite=Strict; Path=/';
+const expiredCookie=`bridge_admin=; ${cookieAttributes}; Max-Age=0`;
+const rememberedSessionSeconds=30*24*60*60;
+const rememberLogin=(form:FormData|null):boolean=>form?.get('remember')==='1';
 
 /** Only verified application identities may become the hub's actor. Never forward a form/JSON actor. */
 async function control(env: ApplicationEnv, action: string, body: Data = {}, actor?:Data): Promise<Response> {
@@ -35,9 +38,10 @@ async function identity(request: Request, env: ApplicationEnv): Promise<Data | n
   const {actor}=await response.json<Data>();
   return actor?{...actor,nonce:value.nonce,expires_at:value.expires_at}:null;
 }
-async function sessionCookie(env: ApplicationEnv,actor:Data): Promise<string> {
-  const payload = btoa(JSON.stringify({id:actor.id,epoch:actor.epoch,nonce: opaque(), expires_at: Date.now() + 3600_000}));
-  return `bridge_admin=${payload}.${await signature(env, payload)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600`;
+async function sessionCookie(env: ApplicationEnv,actor:Data,remember:boolean): Promise<string> {
+  const seconds=remember?rememberedSessionSeconds:3600;
+  const payload = btoa(JSON.stringify({id:actor.id,epoch:actor.epoch,nonce: opaque(), expires_at: Date.now() + seconds*1000}));
+  return `bridge_admin=${payload}.${await signature(env, payload)}; ${cookieAttributes}${remember?`; Max-Age=${seconds}`:''}`;
 }
 async function login(form: FormData, env: ApplicationEnv): Promise<Data|null> {
   const response=await control(env,'accounts-login',{username:String(form.get('username') || 'admin'),
@@ -45,7 +49,7 @@ async function login(form: FormData, env: ApplicationEnv): Promise<Data|null> {
   return (await response.json<Data>()).actor || null;
 }
 function loginPage(title:string,form:FormData|null,extra=''):Response {
-  return page(title,`<section class="auth-card">${form?'<div class="notice error" role="alert">用户名或密码不正确。</div>':''}<form method="post">${loginFields(String(form?.get('username') || 'admin'))}${extra}<button class="full-width">登录 <span aria-hidden="true">→</span></button></form></section>`);
+  return page(title,`<section class="auth-card">${form?'<div class="notice error" role="alert">用户名或密码不正确。</div>':''}<form method="post">${loginFields(String(form?.get('username') || 'admin'),rememberLogin(form))}${extra}<button class="full-width">登录 <span aria-hidden="true">→</span></button></form></section>`);
 }
 
 async function management(request: Request, env: ApplicationEnv): Promise<Response> {
@@ -55,7 +59,7 @@ async function management(request: Request, env: ApplicationEnv): Promise<Respon
   if(!actor) {
     const logged=form && await login(form,env);
     if(logged) return new Response(null,{status:303,headers:{Location:'/manage?code='+encodeURIComponent(String(form!.get('code') || '')),
-      'Set-Cookie':await sessionCookie(env,logged),'Cache-Control':'no-store'}});
+      'Set-Cookie':await sessionCookie(env,logged,rememberLogin(form)),'Cache-Control':'no-store'}});
     return loginPage('设备管理',form,`<input type="hidden" name="code" value="${escape(url.searchParams.get('code') || '')}">${url.searchParams.get('notice')==='password_changed'?'<p class="notice">密码已更新，请重新登录。</p>':''}`);
   }
   let error = "", errorStatus=400;
@@ -157,7 +161,7 @@ async function commandApproval(request: Request, env: ApplicationEnv): Promise<R
   const form=request.method==='POST' ? await request.formData() : null;
   if(!actor) {
     const logged=form && await login(form,env);
-    if(logged) return new Response(null,{status:303,headers:{Location:'/manage/command-approval?id='+encodeURIComponent(id),'Set-Cookie':await sessionCookie(env,logged)}});
+    if(logged) return new Response(null,{status:303,headers:{Location:'/manage/command-approval?id='+encodeURIComponent(id),'Set-Cookie':await sessionCookie(env,logged,rememberLogin(form))}});
     return loginPage('命令审批',form);
   }
   let error='',errorStatus=400;
@@ -193,7 +197,7 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
     const form=request.method==='POST'?await request.formData():null;
     const logged=form && await login(form,env);
     if(logged) return new Response(null,{status:303,headers:{Location:url.pathname+url.search,
-      'Set-Cookie':await sessionCookie(env,logged),'Cache-Control':'no-store'}});
+      'Set-Cookie':await sessionCookie(env,logged,rememberLogin(form)),'Cache-Control':'no-store'}});
     return loginPage('下载文件',form);
   }
   if(request.method==='POST') return Response.redirect(env.PUBLIC_URL+url.pathname+url.search,303);
@@ -203,7 +207,7 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
   return env.service(new Request(request,{headers}));
 }
 
-const chatActions=new Set(['list','create','get','history','sync','timing','send','rename','delete','upload-start','upload-chunk',
+const chatActions=new Set(['list','create','connect','disconnect','channel','get','history','context','repository','task','sync','timing','send','rename','delete','upload-start','upload-chunk',
   'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide','device-access','device-access-save']);
 
 /** Native device credentials are supplied in headers, never in a URL or browser cookie. */
@@ -271,7 +275,7 @@ async function chat(request:Request,env:ApplicationEnv):Promise<Response> {
   if(!actor) {
     const logged=form && await login(form,env);
     if(logged) return new Response(null,{status:303,headers:{Location:url.pathname+url.search,
-      'Set-Cookie':await sessionCookie(env,logged),'Cache-Control':'no-store'}});
+      'Set-Cookie':await sessionCookie(env,logged,rememberLogin(form)),'Cache-Control':'no-store'}});
     return loginPage(url.pathname==='/chat/connect'?'连接终端聊天':'聊天',form);
   }
   if(url.pathname==='/chat/connect') {
@@ -357,12 +361,14 @@ async function defaults(request: Request, env: AuthEnv): Promise<Response> {
       const denied = await oauth.denyConsent(request, handle);
       return new Response(null, {status: 302, headers: denied.headers});
     }
-    const actor=await identity(request,env) || await login(form,env);
+    const existing=await identity(request,env);
+    const actor=existing || await login(form,env);
     if(!actor) return json({error:'invalid_credentials'},403);
     const approved = await oauth.approveConsent(request, handle, {scope: ["computer"]});
     const result = await oauth.completeAuthorization({request: approved.request, userId:actor.id, metadata:{},
       scope:approved.request.scope,props:{account_id:actor.id,account_epoch:actor.epoch}});
     approved.headers.set("Location", result.redirectTo);
+    if(!existing && rememberLogin(form))approved.headers.append('Set-Cookie',await sessionCookie(env,actor,true));
     return new Response(null, {status: 302, headers: approved.headers});
   }
   if (url.pathname === "/manage/command-approval") return commandApproval(request,env);
