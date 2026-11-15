@@ -2,12 +2,13 @@ import type {Store} from './runtime';
 import {hash,json,opaque,type Data} from './types';
 import {byteRange,unsignedHeader,MAX_PATCH_SIZE,cancelBody} from './attachment_http';
 import {transferClientSource,transferClientSha256} from './transfer_client';
+import {transferModeKey,type AutoToolGrant} from './chat_module/interaction/state';
 
 /** Only routing metadata is stored here. File bytes stay on the executor and computer. */
 export interface FileTransferGrant {
   id:string; device:string; session:string; account:string; epoch:number; revision:number;
   transfer_id:string; direction:'upload'|'download'; size:number; sha256:string; etag?:string;
-  expires_at:number;
+  expires_at:number; auto_tool_grant?:AutoToolGrant;
 }
 const CHUNK=256*1024,TTL=3600_000;
 const fail=(code:string,message:string)=>Object.assign(new Error(message),{code});
@@ -27,14 +28,16 @@ export class FileTransferHttp {
   async issue(result:Data,projection:Data,epoch:number):Promise<Data>{
     if(!/^[a-f0-9]{32}$/.test(result.transfer_id)||!Number.isSafeInteger(result.size)||result.size<0||!/^[a-f0-9]{64}$/.test(result.sha256))throw fail('transfer_invalid','Invalid computer transfer metadata');
     const direction=projection.args.action==='upload_begin'?'upload':'download';
-    const index='file-transfer-index:'+await hash(JSON.stringify([projection.account,projection.device,projection.args.session,result.transfer_id]));
+    const scope=projection.auto_tool_grant;
+    const index='file-transfer-index:'+await hash(JSON.stringify([projection.account,projection.device,projection.args.session,result.transfer_id,...(scope?[transferModeKey(scope)]:[])]));
     const grant=await this.store.transaction(async tx=>{
       const old=await tx.get<string>(index),existing=old?await tx.get<FileTransferGrant>('file-transfer:'+old):undefined;
       if(existing&&existing.expires_at>Date.now()&&existing.epoch===epoch&&existing.revision===projection.transfer_revision)return existing;
       if(existing)await tx.delete('file-transfer:'+existing.id);
       const grant:FileTransferGrant={id:opaque(),device:projection.device,session:projection.args.session,
         account:projection.account,epoch,revision:projection.transfer_revision,transfer_id:result.transfer_id,
-        direction,size:result.size,sha256:result.sha256,...(result.etag?{etag:result.etag}:{}),expires_at:Date.now()+TTL};
+        direction,size:result.size,sha256:result.sha256,...(result.etag?{etag:result.etag}:{}),expires_at:Date.now()+TTL,
+        ...(scope?{auto_tool_grant:scope}:{})};
       await tx.put('file-transfer:'+grant.id,grant);await tx.put(index,grant.id);return grant;
     });
     await this.authorize(grant);
@@ -171,7 +174,7 @@ export class FileTransferHttp {
     }catch(error){
       const code=(error as Data).code||'transfer_unavailable';
       const status=code==='transfer_unauthorized'?401:['transfer_expired','transfer_missing'].includes(code)?410:
-        ['account_unavailable','device_forbidden','handle_forbidden','tool_forbidden','approval_invalidated','access_changed'].includes(code)?403:
+        ['account_unavailable','device_forbidden','handle_forbidden','tool_forbidden','approval_invalidated','access_changed','chat_auto_ended'].includes(code)?403:
         ['transfer_conflict','transfer_busy','transfer_changed','transfer_offset','file_exists'].includes(code)?409:code==='transfer_timeout'?408:503;
       // Do not echo downstream errors: they can contain private filesystem paths.
       return json({error:code},status);

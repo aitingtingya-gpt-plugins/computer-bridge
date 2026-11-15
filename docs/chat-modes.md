@@ -42,9 +42,3 @@ Super Agent 使用固定的 DeepSeek 官方源码和原版角色提示词，Brid
 模式和仓库仅在创建时设置。会话、任务和电脑边界由服务端构造，不相信客户端自报身份；凭据或设备密钥不会进入公开上下文。主写入连接、任务原作者权限在事务中复核。任务状态随会话删除而清理，但已经运行的外部命令不因此撤销。
 
 模型回执、工具调用结果或网络响应不确定时，先查询原操作再恢复，不能盲目重跑。恢复不会把原操作自动标为失败或再次执行。上下文有界并保留截断提示，持久历史不等于无限塞入模型窗口。
-
-## 验证
-
-- `npm ci --prefix gateway`，随后 `npm run check --prefix gateway`、`npm run build --prefix gateway`。
-- `node gateway/src/chat_module/super_agent/verify-vendor.mjs` 核对固定上游源码，以及 `python scripts/source_integrity.py` 核对工具与沙盒源码。
-- 在部署服务端与电脑端后，通过 `/chat` 与 `cs` 验证真实宿主连接、事件唤醒及端到端交互。

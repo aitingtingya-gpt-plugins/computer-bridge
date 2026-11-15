@@ -4,9 +4,12 @@ import {sha256} from '@noble/hashes/sha2.js';
 import {Webhook} from 'standardwebhooks';
 import {byteRange,uploadMetadata,unsignedHeader,TUS_VERSION,MAX_ATTACHMENT_SIZE,MAX_PATCH_SIZE,cancelBody} from '../attachment_http';
 import type {Accounts, Actor} from '../accounts';
+import type {ApprovalOrigin} from '../approvals';
 import {readWorkingContext,indexContext,IDLE_MS,eraseWorkingSnapshot,eraseSourceFingerprints} from './working_context';
 import {maintenanceKey,subscriptionKey,maintenanceStatuses,observeContext,maintain,publicMaintenance,persist,updateStatus,type Maintenance} from './summary_maintenance';
-import {callbackDiagnosticsKey,callbackFailure,readCallbackDiagnostics,recordCallbackDiagnostic} from './callback_diagnostics';
+import {callbackDiagnosticsKey,callbackFailure,readCallbackDiagnostics,recordCallbackDiagnostic,type CallbackCategory} from './callback_diagnostics';
+import {channelDeleteInstructions,channelEventDefinition} from './channel_contract';
+import {admitRound,changeGoal,collaborationWakeKey,collaborationWakePrefix,goalKey,goalView,goalWakeId,interactionFail,newGoal,parseGoalCommand,PLAN_GUIDANCE,planWakeId,projectPlanMode,queueCollaborationWake,renderGoalRoundPrompt,reviewKey,type AutoToolGrant,type CollaborationWake,type GoalRecord,type GoalRound,type InteractionMode,type PlanReview} from './interaction/state';
 import {channelCommandKey,channelDiagnosticsKey,channelOutboxKey,classifyChannelError,eraseChannelDiagnosticsForChat,isChannelRetryable,readChannelDiagnostics,recordChannelDiagnostic,sanitizeChannelCommand,type ChannelAction,type ChannelCommandSummary,type ChannelDiagnostic} from './channel_diagnostics';
 import {maintenanceDiagnosticsKey,readMaintenanceDiagnostics,recordMaintenanceDiagnostic,type MaintenanceDiagnosticPhase} from './maintenance_diagnostics';
 import {buildContext,chatMode,sourceIdentity,fitContextToEnvelope,CHAT_EVENT_BYTES,jsonBytes,type ChatMode,type ChatContext} from './context';
@@ -38,12 +41,15 @@ export interface ChatEnvironment {
   equal(a:Uint8Array,b:Uint8Array):boolean;
   blobs?:ChatBlobs;
   changed?(chatId:string):Promise<void>;
+  claimAvailability?(tx:KeyStore,device:string,chatId:string,actor:ChatIdentity):Promise<{
+    claimable_approval_count:number;next_claimable_approval_expires_at:number|null;
+  }>;
   background?(work:Promise<unknown>):void;
   /** Optional trusted transport. Authentication must be scoped to this caller and repository, never globally shared. */
   repositoryFetch?(scope:{chatId:string;deviceId:string;principal:ChatPrincipal;repository:RepositoryBinding},url:string,init:RequestInit):Promise<Response>;
 }
-interface Conversation {mode?:ChatMode;repository?:RepositoryBinding;id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;writer?:string;revision?:number;reconnect_until?:number}
-interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model'|'module';source_identity?:ReturnType<typeof sourceIdentity>;command_processed?:string;text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;resolves_message_ids?:string[];kind?:'approval';approval?:Data;approval_id?:string}
+interface Conversation {mode?:ChatMode;repository?:RepositoryBinding;id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;writer?:string;revision?:number;reconnect_until?:number;interaction_mode?:InteractionMode;interaction_revision?:number;plan_review_id?:string}
+interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model'|'module';source_identity?:ReturnType<typeof sourceIdentity>;command_processed?:string;planning_request?:true;text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;resolves_message_ids?:string[];kind?:'approval';approval?:Data;approval_id?:string;approval_origin?:ApprovalOrigin}
 interface AttachmentView {id:string;name:string;size:number;mime_type:string;sha256?:string}
 interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string;protocol?:'tus';upload_metadata?:string}
 interface Candidate {chat:string;account:string;epoch:number;caller:string;expires_at:number}
@@ -53,14 +59,22 @@ interface ChannelSubscription {id:string;account:string;epoch:number;caller:stri
 interface ChannelOutbox {chat:string;subscription:string;action:ChannelAction;source:'web'|'tui';account:string;epoch:number;sequence:number;attempts:number;next_at:number;created_at:string;updated_at:string;last_error?:ChannelDiagnostic;device?:string;payload?:Data}
 interface ChannelDiagnosticScope {account:string;action?:ChannelAction;chat_id?:string;subscription_id?:string;attempt?:number}
 const CHANNEL_RETRY_DELAYS=[5_000,15_000,30_000,60_000];
-interface Outbox {chat:string;sequence:number;subscription:string;attempts:number;next_at:number;state:'pending'|'delivered'|'failed'|'paused'|'blocked'|'resolved';error?:string;received_at?:string}
+const MESSAGE_403_RETRY_DELAYS=[5_000,15_000,30_000,60_000];
+interface Outbox {chat:string;sequence:number;subscription:string;attempts:number;next_at:number;state:'pending'|'delivered'|'failed'|'paused'|'blocked'|'resolved';error?:string;received_at?:string;transient_403_attempts?:number}
 interface Link {scope?:'account'|'device';id:string;code:string;device:string;token_hash:string;expires_at:number;approved_by?:string;epoch?:number;credential?:string}
 interface Credential {account:string;epoch:number;device:string;scope?:'account'|'device'}
 interface Timing {saved_at:string;first_attempt_at?:string;host_accepted_at?:string;reply_saved_at?:string;attempts:number}
 interface Head {chat:string;sequence:number;at:number}
 interface Expiry {kind:string;id:string;at:number}
+interface ChatChange {sequences:number[];review_ids?:string[]}
+interface PendingApproval {id:string;sequence:number;expires_at:number}
+const PLAN_REVIEWS_PER_PAGE=8;
 const padded=(n:number)=>String(n).padStart(16,'0');
 const changeKey=(chat:string,revision:number)=>'chat-change:'+chat+':'+padded(revision);
+const reviewTimelinePrefix=(chat:string)=>'chat-plan-position:'+chat+':';
+const reviewTimelineAnchor=(chat:string,sequence:number)=>reviewTimelinePrefix(chat)+padded(sequence)+':';
+const reviewTimelineKey=(chat:string,sequence:number,revision:number)=>reviewTimelineAnchor(chat,sequence)+padded(revision);
+const pendingApprovalPrefix=(chat:string)=>'chat-approval-pending:'+chat+':';
 const pendingKey=(chat:string,sequence:number)=>'chat-pending:'+chat+':'+padded(sequence);
 const unackKey=(chat:string,subscription:string,sequence:number)=>'chat-unack:'+chat+':'+subscription+':'+padded(sequence);
 const dueKey=(head:Head)=>'chat-due:'+padded(head.at)+':'+head.chat;
@@ -96,16 +110,12 @@ const unboundRepository=(value:unknown)=>value===undefined||value===null||value=
 
 export const summaryDueEventDefinition={name:'chat.summary_due',description:'A configured chat needs context maintenance. Not a user message. Read chat.maintenance, claim its generation, read chat.working_context, then submit complete, unchanged or defer. History is context only; never resolve user inputs merely for maintenance.',delivery:['webhook'],inputSchema:{type:'object',properties:{chat_id:{type:'string'},connection:{type:'string'},handoff_id:{type:'string',description:'Optional prepared subscription handoff. Candidate delivery stays inactive until explicit activation.'}},required:['chat_id','connection'],additionalProperties:false},payloadSchema:{type:'object',properties:{chat_id:{type:'string'},connection:{type:'string'},generation:{type:'integer'},reason:{type:'string'},snapshot_through:{type:'integer'},summary_revision:{type:'integer'},url:{type:'string'}},required:['chat_id','connection','generation','reason','snapshot_through','summary_revision','url'],additionalProperties:false}};
 
-export const channelEventDefinition={
-  name:'chat.channel',description:'Plugin-level notification channel across conversations (established once per Dot client). action="connect" notifies Dot to open/resume its existing paused chat.message subscription (events/subscribe) or call chat.resume then subscribe to chat.message for chat_id. action="disconnect" notifies Dot to pause that chat.message subscription via events/unsubscribe (or call chat.disconnect if Dot host resources are full). action="delete" notifies Dot that the user permanently deleted chat_id: if Dot already holds an active or paused chat.message/chat.summary_due subscription or local task bound to chat_id, permanently unsubscribe via events/unsubscribe and remove that task/connection rather than pausing; otherwise ignore it without calling chat.resume. Never interrupts message persistence.',delivery:['webhook'],
-  inputSchema:{type:'object',properties:{},additionalProperties:false},
-  payloadSchema:{type:'object',properties:{action:{enum:['connect','disconnect','delete']},chat_id:{type:'string'},device_id:{type:'string'},device_name:{type:'string'},title:{type:'string'},mode:{enum:['chat','super_agent']},repository:{type:['object','null']},source:{enum:['web','tui']},requested_at:{type:'string'},url:{type:'string'}},required:['action','chat_id','device_id','device_name','title','mode','url'],additionalProperties:false}
-};
+export {channelEventDefinition} from './channel_contract';
 
 export const chatEventDefinition={
-  name:'chat.message',description:'One conversation event subscription for user messages and context maintenance. data.kind=context_maintenance is a system wake, NOT a user message: read/claim chat.maintenance, read chat.working_context, then complete/unchanged/defer; never reply or resolve user input merely for maintenance. Otherwise a person sent a message or attachment to a Computer Bridge conversation. User message events use payload_version=2 with canonical body and attachments in data.context.current_message. Available for Work and dots. Use data.connection from this signed event directly with chat.reply; do not call chat.resume without it. Each event contains anchored multi-message context and a server-selected mode. Chat is conversational and never dispatches tasks; Super Agent uses chat.task with upstream roles and explicit model-reported execution stages. data.kind=super_agent is a task-framework wake: read chat.task list; it is not a new human request. Prior messages are context only. Read history or attachments when context is missing or truncated. Other computer tools remain available. Model replies do not create this event.',delivery:['webhook'],
+  name:'chat.message',description:'One conversation event subscription for user messages, goal rounds, plan decisions and context maintenance. data.kind=context_maintenance is a system wake, NOT a user message: read/claim chat.maintenance, read chat.working_context, then complete/unchanged/defer; never reply or resolve user input merely for maintenance. Otherwise a person sent a message or attachment to a Computer Bridge conversation. User message events use payload_version=2 with canonical body and attachments in data.context.current_message. Available for Work and dots. Use data.connection from this signed event directly with chat.reply; do not call chat.resume without it. Each event contains anchored multi-message context and a server-selected mode. Chat is conversational and never dispatches tasks; Super Agent uses chat.task with upstream roles and explicit model-reported execution stages. data.kind=super_agent is a task-framework wake: read chat.task list; it is not a new human request. Prior messages are context only. Read history or attachments when context is missing or truncated. Other computer tools remain available. Model replies do not create this event. goal_round and plan_review are system wakes: claim with chat.goal or chat.plan before acting. The interaction_mode and interaction_revision describe the current collaboration mode.',delivery:['webhook'],
   inputSchema:{type:'object',properties:{chat_id:{type:'string',description:'Stable short conversation ID, e.g. t1.'},connection:{type:'string',description:'Original chat.resume credential, or data.connection from this subscription for renewal/unsubscribe.'},handoff_id:{type:'string',description:'Optional prepared subscription handoff. Candidate delivery stays inactive until explicit activation.'}},required:['chat_id','connection'],additionalProperties:false},
-  payloadSchema:{type:'object',properties:{kind:{enum:['user_message','context_maintenance','super_agent']},generation:{type:'integer'},reason:{type:'string'},snapshot_through:{type:'integer'},summary_revision:{type:'integer'},payload_version:{type:'integer'},chat_id:{type:'string'},mode:{enum:['chat','super_agent']},repository:{type:['object','null']},source_identity:{type:'object'},context:{type:['object','null']},command_processed:{type:['string','null']},approval_id:{type:['string','null']},processing:{type:'string'},connection:{type:'string',description:'Private reply/renewal credential for this active model subscription. Pass to chat.reply; never include in visible text or shared history.'},device_id:{type:'string'},message_id:{type:'string'},text:{type:'string'},text_truncated:{type:'boolean'},attachments_truncated:{type:'boolean'},attachments:{type:'array',items:{type:'object'}},url:{type:'string'}},required:['chat_id','connection','device_id','url'],anyOf:[{required:['kind','generation'],properties:{kind:{const:'super_agent'}}},{required:['message_id']},{required:['kind','generation','reason','snapshot_through','summary_revision'],properties:{kind:{const:'context_maintenance'}}}],additionalProperties:false}
+  payloadSchema:{type:'object',properties:{kind:{enum:['user_message','context_maintenance','super_agent','goal_round','plan_review']},interaction_mode:{enum:['normal','plan','auto']},interaction_revision:{type:'integer'},planning_request:{type:'boolean'},round_id:{type:'string'},goal_id:{type:'string'},goal_revision:{type:'integer'},round:{type:'integer'},review_id:{type:'string'},generation:{type:'integer'},reason:{type:'string'},snapshot_through:{type:'integer'},summary_revision:{type:'integer'},payload_version:{type:'integer'},chat_id:{type:'string'},mode:{enum:['chat','super_agent']},repository:{type:['object','null']},source_identity:{type:'object'},context:{type:['object','null']},command_processed:{type:['string','null']},approval_id:{type:['string','null']},processing:{type:'string'},connection:{type:'string',description:'Private reply/renewal credential for this active model subscription. Pass to chat.reply; never include in visible text or shared history.'},device_id:{type:'string'},message_id:{type:'string'},text:{type:'string'},text_truncated:{type:'boolean'},attachments_truncated:{type:'boolean'},attachments:{type:'array',items:{type:'object'}},url:{type:'string'}},required:['chat_id','connection','device_id','url'],anyOf:[{required:['kind','generation'],properties:{kind:{const:'super_agent'}}},{required:['message_id']},{required:['kind','round_id','goal_id','goal_revision','round'],properties:{kind:{const:'goal_round'}}},{required:['kind','review_id'],properties:{kind:{const:'plan_review'}}},{required:['kind','generation','reason','snapshot_through','summary_revision'],properties:{kind:{const:'context_maintenance'}}}],additionalProperties:false}
 };
 
 export class ChatService {
@@ -113,6 +123,7 @@ export class ChatService {
   private uploadRequests=new Set<string>();
   private pumping?:Promise<void>;
   private superAgentPumping?:Promise<void>;
+  private collaborationPumping?:Promise<void>;
   private wake?:()=>void;
   private wakeVersion=0;
   constructor(private store:Store,private accounts:Accounts,private env:ChatEnvironment){}
@@ -133,7 +144,7 @@ export class ChatService {
   }
 
   /** Same transaction as the approval record; immutable command details are captured once. */
-  async approvalCard(tx:KeyStore,record:Data,details?:Data):Promise<void>{
+  async approvalCard(tx:KeyStore,record:Data,details?:Data):Promise<number|undefined>{
     if(!record.chat_id)return;
     const chat=await tx.get<Conversation>(key(record.chat_id));
     if(!chat||chat.device!==record.device)return;
@@ -143,7 +154,7 @@ export class ChatService {
     let message:Message;
     const state={state:record.state,...(record.decision?{decision:record.decision}:{}),delivery_pending:!!record.delivery_pending};
     if(previous){
-      if(previous.approval?.state===state.state&&previous.approval?.decision===record.decision&&previous.approval?.delivery_pending===state.delivery_pending)return;
+      if(previous.approval?.state===state.state&&previous.approval?.decision===record.decision&&previous.approval?.delivery_pending===state.delivery_pending)return previous.sequence;
       message={...previous,approval:{...previous.approval,...state}};
     }else{
       if(!details)return;
@@ -160,18 +171,29 @@ export class ChatService {
           command:record.tool?.summary??details.command,cwd:record.tool?.cwd??details.cwd,
           justification:record.tool?.justification??details.justification,expires_at:record.expires_at,
           ...(record.tool?{tool:record.tool.method,request_id:record.tool.request_id}:{}),
+          ...(record.projection.module_confirmation?{module_confirmation:record.projection.module_confirmation.message}:{}),
           ...(record.projection.permission_confirmation?{permission_confirmation:true}:{}),...state}};
       await tx.put(ref,n);
     }
+    await this.indexPendingApproval(tx,record,message.sequence);
     chat.updated_at=now();
     await tx.put(messageKey(chat.id,message.sequence),message);
     await this.recordChange(tx,chat,[message.sequence]);
+    return message.sequence;
+  }
+
+  private async indexPendingApproval(tx:KeyStore,record:Data,sequence:number):Promise<void>{
+    const ref=pendingApprovalPrefix(record.chat_id)+padded(sequence);
+    if(record.state==='pending'&&!record.decision)
+      await tx.put(ref,{id:record.id,sequence,expires_at:record.expires_at} satisfies PendingApproval);
+    else await tx.delete(ref);
   }
 
   private async changed(chat:string):Promise<void>{await this.env.changed?.(chat);}
-  private async recordChange(tx:KeyStore,chat:Conversation,sequences:number[]=[]):Promise<void>{
+  private async recordChange(tx:KeyStore,chat:Conversation,sequences:number[]=[],reviewId?:string):Promise<void>{
     chat.revision=(chat.revision??0)+1;
-    await tx.put({[key(chat.id)]:chat,[changeKey(chat.id,chat.revision)]:{sequences}});
+    const change:ChatChange={sequences,...(reviewId?{review_ids:[reviewId]}:{})};
+    await tx.put({[key(chat.id)]:chat,[changeKey(chat.id,chat.revision)]:change});
   }
   private async expiry(tx:KeyStore,kind:string,id:string,at?:number|null):Promise<void>{
     const ref='chat-expiry-ref:'+kind+':'+id,old=await tx.get<Expiry>(ref);
@@ -276,17 +298,17 @@ export class ChatService {
     if(this.env.background)this.env.background(pending);else void pending;
   }
   private signal(chat:string):void {
-    this.background(()=>this.changed(chat));this.background(()=>this.kick());
+    this.background(()=>this.changed(chat));this.background(()=>this.kick());this.background(()=>this.drainCollaboration());
   }
-  async start():Promise<void>{await this.initialize();await this.kick();}
+  async start():Promise<void>{await this.initialize();await Promise.all([this.kick(),this.drainCollaboration()]);}
   private async kick():Promise<void>{
     this.wakeVersion++;this.wake?.();
     // Durable queue writes arm the wake transactionally. Immediate delivery is an independent optimization.
     await this.drain();
   }
   private projectMessage(m:Message,event?:Outbox):Data {
-    const state=!event?'none':event.state==='delivered'?'received':event.state==='resolved'?'none':event.state==='blocked'?'blocked':event.state==='paused'?'waiting':event.error?'unreachable':'pending';
-    const {delivery:_,...body}=m;
+    const state=!event?'none':event.state==='delivered'?'received':event.state==='resolved'?'none':event.state==='blocked'?'blocked':event.state==='paused'?'waiting':event.state==='failed'?'failed':event.error==='http_403'&&event.transient_403_attempts?'retrying':event.error?'unreachable':'pending';
+    const {delivery:_,approval_origin:__,...body}=m;
     return {...body,saved:true,saved_at:m.saved_at??m.created_at,
       notification:{state,...(event?.received_at?{received_at:event.received_at}:{}),...(event?.error&&state!=='none'&&state!=='received'?{reason:event.error}:{}),...(event?.state==='pending'?{next_attempt_at:new Date(event.next_at).toISOString()}:{} )},
       reply:{state:m.replied_at?'replied':'none',message_ids:m.replies??[],...(m.replied_at?{at:m.replied_at}:{})},
@@ -296,26 +318,75 @@ export class ChatService {
     return {...this.projectMessage(m,m.role==='user'?await tx.get<Outbox>(outboxKey(chat,m.sequence)):undefined),
       ...(m.role==='user'&&!m.approval_id?{processing:await processingRecord(tx,chat,m)}:{})};
   }
+  private async planReviewPage(tx:KeyStore,chat:string,first:number,last:number,after?:{anchor:number;revision:number}):Promise<Data>{
+    const prefix=reviewTimelinePrefix(chat);
+    const rows=[...(await tx.list<string>({prefix,limit:PLAN_REVIEWS_PER_PAGE+1,
+      startAfter:after?reviewTimelineKey(chat,after.anchor,after.revision):reviewTimelineAnchor(chat,first),
+      endBefore:reviewTimelineAnchor(chat,last)+'\uffff'})).entries()];
+    const entries=rows.slice(0,PLAN_REVIEWS_PER_PAGE);
+    const plan_reviews=(await Promise.all(entries.map(async ([,id])=>this.publicReview(await tx.get<PlanReview>(reviewKey(chat,id)),true)))).filter(Boolean);
+    const lastKey=entries.at(-1)?.[0];
+    if(rows.length<=PLAN_REVIEWS_PER_PAGE||!lastKey)return {plan_reviews};
+    const position=lastKey.slice(prefix.length).split(':').map(Number);
+    return {plan_reviews,review_next_cursor:[first,last,...position].join(':')};
+  }
+
+  private async pendingApprovalPositions(tx:KeyStore,chat:string):Promise<Pick<PendingApproval,'id'|'sequence'>[]>{
+    // Existing chat cards predate this index. Seed them once without reading ordinary messages.
+    const migrated='chat-approval-pending-index:'+chat;
+    if(!await tx.get(migrated)){
+      const prefix='chat-approval:'+chat+':';
+      for(const [ref,sequence] of await tx.list<number>({prefix})){
+        const record=await tx.get<Data>('command-approval:'+ref.slice(prefix.length));
+        if(record?.chat_id===chat)await this.indexPendingApproval(tx,record,sequence);
+      }
+      await tx.put(migrated,true);
+    }
+    const now=Date.now();
+    return [...(await tx.list<PendingApproval>({prefix:pendingApprovalPrefix(chat)})).values()]
+      .filter(item=>item.expires_at>now).map(({id,sequence})=>({id,sequence}));
+  }
+
   private async sync(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
     const after=integer(args.cursor??0,'cursor'),limit=Math.min(limitOf(args.limit),50);
     const snapshot=await this.store.transaction(async tx=>{
-      const current=(await tx.get<Conversation>(key(chat.id)))!;
+      await this.access(actor,chat.device,tx);
+      const current=await tx.get<Conversation>(key(chat.id));
+      if(!current)throw fail('chat_deleted','对话已删除');
       if(!current.revision)await this.recordChange(tx,current);
       if(after>current.revision!)throw fail('invalid_chat_cursor','同步游标超过当前对话版本');
-      let cursor=current.revision!,more=false,messages:Message[];
-      if(!after)messages=[...(await tx.list<Message>({prefix:'chat-message:'+chat.id+':',reverse:true,limit})).values()].reverse();
-      else{
-        const rows=await tx.list<{sequences:number[]}>({prefix:'chat-change:'+chat.id+':',startAfter:changeKey(chat.id,after),limit:limit+1});
-        more=rows.size>limit;const changes=[...rows.entries()].slice(0,limit);
-        cursor=changes.length?Number(changes.at(-1)![0].split(':').at(-1)):after;
-        const ids=new Set(changes.flatMap(([,change])=>change.sequences));messages=[];
-        for(const sequence of [...ids].sort((a,b)=>a-b)){const m=await tx.get<Message>(messageKey(chat.id,sequence));if(m)messages.push(m);}
+      let cursor=current.revision!,more=false,messages:Message[],reviews:Data;
+      if(!after){
+        messages=[...(await tx.list<Message>({prefix:'chat-message:'+chat.id+':',reverse:true,limit})).values()].reverse();
+        const first=messages[0]?.sequence??0;
+        reviews=await this.planReviewPage(tx,chat.id,first>1?first:0,current.sequence);
       }
-      return {current,messages,cursor,more};
+      else{
+        const rows=await tx.list<ChatChange>({prefix:'chat-change:'+chat.id+':',startAfter:changeKey(chat.id,after),limit:limit+1});
+        const ids=new Set<number>(),reviewIds=new Set<string>();
+        cursor=after;
+        let count=0;
+        for(const [k,change] of rows){
+          const newReviews=(change.review_ids??[]).filter(id=>!reviewIds.has(id));
+          if(count===limit||reviewIds.size+newReviews.length>PLAN_REVIEWS_PER_PAGE){more=true;break;}
+          for(const id of newReviews)reviewIds.add(id);
+          for(const sequence of change.sequences)ids.add(sequence);
+          cursor=Number(k.split(':').at(-1));
+          count++;
+        }
+        messages=[];
+        for(const sequence of [...ids].sort((a,b)=>a-b)){const m=await tx.get<Message>(messageKey(chat.id,sequence));if(m)messages.push(m);}
+        reviews={plan_reviews:(await Promise.all([...reviewIds].map(async id=>
+          this.publicReview(await tx.get<PlanReview>(reviewKey(chat.id,id)),true)))).filter(Boolean)};
+      }
+      return {current,messages,cursor,more,reviews,pending_approvals:await this.pendingApprovalPositions(tx,chat.id),
+        availability:await this.env.claimAvailability?.(tx,chat.device,chat.id,normalizeIdentity(actor))};
     });
     const first=snapshot.messages[0]?.sequence??0;
     const channel=sanitizeChannelCommand(await this.store.get<Data>(channelCommandKey(chat.id)));
-    return {chat:await this.summary(snapshot.current,actor),...(channel?{channel}:{}),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),messages:await Promise.all(snapshot.messages.map(m=>this.viewMessage(this.store,chat.id,m))),cursor:snapshot.cursor,more:snapshot.more,...(!after?{first_cursor:first,has_older:first>1}:{})};
+    return {chat:await this.summary(snapshot.current,actor,undefined,true),...(channel?{channel}:{}),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),
+      messages:await Promise.all(snapshot.messages.map(m=>this.viewMessage(this.store,chat.id,m))),...snapshot.reviews,pending_approvals:snapshot.pending_approvals,...snapshot.availability,
+      cursor:snapshot.cursor,more:snapshot.more,...(!after?{first_cursor:first,has_older:first>1}:{})};
   }
   private async timing(chat:Conversation,args:Data):Promise<Data>{
     let sequence:number;
@@ -375,11 +446,14 @@ export class ChatService {
     }
     return value;
   }
-  private async summary(chat:Conversation,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>):Promise<Data>{
+  private async summary(chat:Conversation,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>,timeline=false):Promise<Data>{
     const device=await this.deviceView(chat.device,actor,views),mode=chatMode(chat.mode);
     const last=chat.sequence?await this.store.get<Message>(messageKey(chat.id,chat.sequence)):undefined;
     const lastView=last?await this.viewMessage(this.store,chat.id,last):undefined;
     return {id:chat.id,title:chat.title,mode,...modeRepository(mode,chat.repository),device_id:device.id,device_name:device.name,system:device.system,
+      ...(mode==='chat'?{interaction_mode:chat.interaction_mode??'normal',interaction_revision:chat.interaction_revision??0,
+        ...(!views?{goal:goalView(await this.store.get<GoalRecord>(goalKey(chat.id))),
+          plan_review:chat.plan_review_id?this.publicReview(await this.store.get<PlanReview>(reviewKey(chat.id,chat.plan_review_id)),timeline):null}:{})}:{}),
       created_at:chat.created_at,updated_at:chat.updated_at,message_count:chat.sequence,state:chat.writer?'connected':'waiting',subscribed:!!chat.active,notification:lastView?.notification??{state:'none'},delivery_state:last?(last.role==='assistant'?'replied':lastView?.delivery):'none'};
   }
   private async next(tx:KeyStore,prefix:string):Promise<number>{const n=(await tx.get<number>('sequence:'+prefix)||0)+1;await tx.put('sequence:'+prefix,n);return n;}
@@ -422,7 +496,7 @@ export class ChatService {
           subscriptions:active.map(sub=>({id:sub.id,verified_at:sub.verified_at,expires_at:sub.expires_at,caller_match:sub.caller===caller})),
           recent_diagnostics,pending_deliveries:outboxRows,...(command?{command}:{}),
           event:{name:channelEventDefinition.name,arguments:{}},
-          next_step:active.length?'Plugin-level notification channel (chat.channel) is active. No duplicate subscription is needed unless another active endpoint is desired.':'No active plugin-level notification channel found. Subscribe now using the host MCP events/subscribe capability with name="chat.channel" and arguments={} so /new, /connect, /disconnect, and /delete wake Dot automatically.'};
+          next_step:(active.length?'Plugin-level notification channel (chat.channel) is active. Reuse this subscription.':'No active plugin-level notification channel found. Subscribe now using the host MCP events/subscribe capability with name="chat.channel" and arguments={} so /new, /connect, /disconnect, and /delete wake Dot automatically.')+' '+channelDeleteInstructions};
       }
       const deviceScope=targetChat?.device??(identity.kind==='device'?identity.device:undefined);
       const active=await this.activeChannelSubs(deviceScope,identity.kind==='account'?identity.actor.id:undefined,identity.kind==='account'?identity.actor.epoch:undefined);
@@ -512,7 +586,7 @@ export class ChatService {
     if(action==='working_context')return this.store.transaction(async tx=>{await this.access(actor,chat.device,tx);return readWorkingContext(tx,chat.id,chat.sequence,args);});
     if(action==='subscription_handoff')return this.handoffAction(chat,args,actor,caller);
     if(action==='maintenance')return this.maintenanceAction(chat,args,actor,caller);
-    if(action==='history')return this.history(chat,args,actor);
+    if(action==='history')return this.history(chat,args,actor,!caller);
     if(action==='context')return {context:await this.context(chat,args)};
     if(action==='pending')return this.pending(chat,args,actor);
     if(action==='receipt')return this.receipt(chat,args,actor);
@@ -527,6 +601,7 @@ export class ChatService {
       await this.chat(chat.id,actor);return result;
     }
     if(action==='task')return this.task(chat,args,actor,caller);
+    if(['interaction','goal','plan'].includes(action))return this.collaborationAction(action,chat,args,actor,caller);
     if(action==='sync')return this.sync(chat,args,actor);
     if(action==='timing')return this.timing(chat,args);
     if(action==='rename'){
@@ -575,12 +650,13 @@ export class ChatService {
       if(summary)await tx.put(subscriptionKey(id),summary);else await tx.delete(subscriptionKey(id));
       await tx.put(writerKey(id),w);await tx.put('chat-routing-revision:'+id,next.revision);
       if(normal?.id!==previous.endpoints['chat.message']?.id)for(const e of (await tx.list<Outbox>({prefix:'chat-event:'+id+':'})).values()){
-        if(['delivered','resolved'].includes(e.state))continue;
+        if(['delivered','resolved','failed'].includes(e.state))continue;
         if(normal){e.subscription=normal.id;if(e.state==='paused'){e.state='pending';e.next_at=Date.now();}}else e.state='paused';
         await this.saveEvent(tx,e);
       }
       const m=await tx.get<Maintenance>(maintenanceKey(id));
       if(summary&&summary.id!==previous.endpoints['chat.summary_due']?.id&&m?.state==='waiting'&&!m.notified){m.next_at=Date.now();await persist(tx,id,m);}
+      if(normal&&chatMode(c.mode)==='chat'){await this.rearmCollaborationWake(tx,c);await this.scheduleGoal(tx,c);}
       await this.recordChange(tx,c);await tx.requestAlarm?.(Date.now());
     }
   };}
@@ -767,9 +843,10 @@ export class ChatService {
       const recorded={chat_id:chat.id,saved:true,...await reportProcessing(tx,chat.id,current.sequence,messages,args as any,
         {account:writer.account,epoch:writer.epoch,caller:writer.caller})};
       if(args.state==='resolved')for(const message of messages)await this.resolveNotification(tx,chat.id,message.sequence);
+      if(args.state==='resolved')await this.scheduleGoal(tx,current);
       await tx.put(d.key,{fingerprint:d.fingerprint,result:recorded});await this.recordChange(tx,current,messages.map(m=>m.sequence));
       return recorded;
-    });this.background(()=>this.changed(chat.id));return result;
+    });this.signal(chat.id);return result;
   }
   private async contextRecord(kind:'summary'|'trace',chat:Conversation,args:Data,actor:ChatPrincipal,caller:string):Promise<Data>{
     if(chatMode(chat.mode)!=='chat')throw fail('chat_mode_mismatch','普通 Chat 上下文记录不能改变 Super Agent');
@@ -813,14 +890,239 @@ export class ChatService {
       throw fail('invalid_summary_production','未知摘要生产步骤');
     });
   }
-  /** Only an actual authenticated MCP invocation may create server observations.
-   * This is context capture, never authority to execute the underlying tool. */
+  private publicReview(row?:PlanReview,timeline=false):Data|null{
+    if(!row)return null;
+    const {writer:_,continued_by:__,anchor_sequence,created_revision,updated_revision,...visible}=row;
+    return timeline&&anchor_sequence!==undefined?{...visible,anchor_sequence,created_revision,updated_revision}:visible;
+  }
+
+  private async discardGoalRound(tx:KeyStore,chat:string,goal:GoalRecord):Promise<void>{
+    if(goal.round)await tx.delete(collaborationWakeKey(chat,goalWakeId(goal.round)));
+    delete goal.round;
+  }
+
+  private async parkGoal(tx:KeyStore,chat:string):Promise<void>{
+    const goal=await tx.get<GoalRecord>(goalKey(chat));
+    if(!goal)return;
+    goal.armed=false;delete goal.writer;
+    await this.discardGoalRound(tx,chat,goal);
+    await tx.put(goalKey(chat),goal);
+  }
+
+  private async rearmCollaborationWake(tx:KeyStore,chat:Conversation):Promise<void>{
+    if(!chat.plan_review_id)return;
+    const key=collaborationWakeKey(chat.id,'plan:'+chat.plan_review_id),wake=await tx.get<CollaborationWake>(key);
+    if(wake?.next_at===null){wake.next_at=Date.now();await tx.put(key,wake);await tx.requestAlarm?.(wake.next_at);}
+  }
+
+  private async cancelPendingReview(tx:KeyStore,chat:Conversation):Promise<string|undefined>{
+    if(!chat.plan_review_id)return;
+    const id=reviewKey(chat.id,chat.plan_review_id),review=await tx.get<PlanReview>(id);
+    if(review?.state!=='pending')return;
+    review.state='cancelled';
+    if(review.created_revision!==undefined)review.updated_revision=(chat.revision??0)+1;
+    await tx.put(id,review);
+    return review.created_revision!==undefined?review.id:undefined;
+  }
+
+  private async pauseQueuedGoal(tx:KeyStore,chat:string):Promise<void>{
+    const goal=await tx.get<GoalRecord>(goalKey(chat));
+    if(goal?.round?.state!=='queued')return;
+    await this.discardGoalRound(tx,chat,goal);await tx.put(goalKey(chat),goal);
+  }
+
+  private async scheduleGoal(tx:KeyStore,chat:Conversation):Promise<boolean>{
+    if(!chat.active||!chat.writer||chat.interaction_mode==='plan')return false;
+    if(chat.plan_review_id){
+      const review=await tx.get<PlanReview>(reviewKey(chat.id,chat.plan_review_id));
+      if(review?.state==='approved'&&review.writer===chat.writer&&!review.finished&&
+        (chat.interaction_revision??0)===review.mode_revision+1)return false;
+    }
+    const goal=await tx.get<GoalRecord>(goalKey(chat.id)),current=goal?.fold.goal;
+    if(!goal?.armed||goal.round||current?.phase!=='active')return false;
+    if(goal.writer&&goal.writer!==chat.writer){
+      goal.armed=false;await tx.put(goalKey(chat.id),goal);return true;
+    }
+    const sub=await tx.get<Subscription>(subKey(chat.active));
+    if(!await this.validSubscription(tx,sub,chat.device)||(sub!.writer_id??sub!.id)!==chat.writer)return false;
+    if((await tx.list({prefix:'chat-processing-open:'+chat.id+':',limit:1})).size)return false;
+    if(current.maxGoalRounds<=goal.fold.roundsStarted){
+      changeGoal(goal,'block',{reason:{code:'round-limit',message:'已达到目标的 '+current.maxGoalRounds+' 轮上限'}});
+    }else{
+      goal.writer=chat.writer;
+      goal.round={id:crypto.randomUUID(),goal_id:current.id,revision:current.revision,number:goal.fold.roundsStarted+1,state:'queued'};
+      await queueCollaborationWake(tx,chat.id,goalWakeId(goal.round),'goal_round',goal.round.id);
+    }
+    await tx.put(goalKey(chat.id),goal);return true;
+  }
+
+  private async checkGoal(id:string):Promise<void>{
+    if(!await this.store.get(goalKey(id)))return;
+    await this.store.transaction(async tx=>{
+      const current=await tx.get<Conversation>(key(id));
+      if(current&&await this.scheduleGoal(tx,current))await this.recordChange(tx,current);
+    });
+  }
+
+  private async setInteraction(tx:KeyStore,chat:Conversation,mode:InteractionMode):Promise<string|undefined>{
+    const previous=chat.interaction_mode??'normal';
+    if(previous===mode)return;
+    const plan=projectPlanMode(previous,mode);
+    chat.interaction_mode=plan?'plan':mode;
+    chat.interaction_revision=(chat.interaction_revision??0)+1;
+    if(plan)await this.pauseQueuedGoal(tx,chat.id);
+    else if(previous==='plan')return this.cancelPendingReview(tx,chat);
+  }
+
+  private async collaborationAction(action:string,chat:Conversation,args:Data,actor:ChatPrincipal,caller:string):Promise<Data>{
+    if(chatMode(chat.mode)!=='chat')throw interactionFail('chat_mode_mismatch','此操作仅用于普通 Chat 会话');
+    const operation=args.operation??'read';
+    const allowed=action==='goal'?(caller?['read','claim','settle']:['read','command'])
+      :action==='plan'?(caller?['read','submit','continue','finish']:['read','decide']):caller?['read']:['read','set'];
+    if(!allowed.includes(operation))throw interactionFail('invalid_chat_argument','此身份不能执行该会话操作');
+    const writer=caller&&operation!=='read'?await this.connection(chat,args.connection,actor,caller):undefined;
+    const {current,value,changed}=await this.store.transaction(async tx=>{
+      await this.access(actor,chat.device,tx);
+      const current=await tx.get<Conversation>(key(chat.id));
+      if(!current)throw fail('chat_deleted','对话已删除');
+      if(writer&&current.writer!==writer.id)throw fail('chat_not_connected','原模型连接已结束');
+      if(operation==='read'){
+        const ref=args.review_id??current.plan_review_id;
+        const review=action==='plan'&&ref?this.publicReview(await tx.get<PlanReview>(reviewKey(chat.id,textValue(ref,'review_id')))):null;
+        return {current,changed:false,value:{...(action==='plan'?{review}:{}),...(action==='goal'?{goal:goalView(await tx.get<GoalRecord>(goalKey(chat.id)))}:{})}};
+      }
+      const {connection:_,request_key:__,...input}=args;
+      const request=await this.dedupe(tx,chat.id+':'+action+':'+principalScope(actor),args.request_key,[input,writer?.id??null]);
+      if(request.result)return {current,changed:false,value:operation==='claim'||operation==='continue'?{claimed:false,duplicate:true}:request.result};
+      const value:Data={};
+      let changedReviewId:string|undefined;
+      if(action==='interaction'){
+        if(integer(args.expected_revision,'expected_revision')!==(current.interaction_revision??0))
+          throw interactionFail('stale_interaction_mode','会话模式已变更，请同步后再切换');
+        if(!['normal','plan','auto'].includes(args.mode))throw interactionFail('invalid_chat_argument','无效会话模式');
+        changedReviewId=await this.setInteraction(tx,current,args.mode);
+        const prompt=args.text===undefined?'':textValue(args.text,'text').trim();
+        if(prompt){
+          if(args.mode!=='plan'||new TextEncoder().encode(prompt).length>65536)throw interactionFail('invalid_chat_argument','规划请求最多 64 KiB');
+          const sequence=++current.sequence,stamp=now();
+          const message:Message={id:'m'+sequence,sequence,role:'user',source:args.source==='tui'?'tui':'web',source_identity:sourceIdentity(actor),planning_request:true,text:prompt,attachments:[],created_at:stamp,saved_at:stamp};
+          current.updated_at=stamp;await tx.put({[messageKey(chat.id,sequence)]:message,[timingKey(chat.id,sequence)]:{saved_at:stamp,attempts:0}});
+          await queueInput(tx,chat.id,message);await this.queueMessage(tx,current,message);
+          await observeContext(tx,chat.id,sequence,true);
+          await this.recordChange(tx,current,[sequence]);value.message_id=message.id;
+        }
+      }else if(action==='goal'){
+        const goal=await tx.get<GoalRecord>(goalKey(chat.id))??newGoal();
+        const g=goal.fold.goal;
+        if(operation==='command'){
+          const command=parseGoalCommand(textValue(args.input??'','input'));
+          if(command.kind==='show')return {current,changed:false,value:{goal:goalView(goal)}};
+          if(command.kind==='invalid-edit')throw interactionFail('invalid_chat_argument','/goal edit 需要新的目标');
+          if('objective' in command&&(!command.objective||new TextEncoder().encode(command.objective).length>16384))
+            throw interactionFail('invalid_chat_argument','目标需要 1 到 16384 字节');
+          const kind=command.kind==='edit'&&g?.phase==='complete'?'create':command.kind;
+          if(kind!=='clear'||g){
+            const needsIdle=kind==='edit'&&goal.round?.state==='claimed';
+            if(needsIdle)throw interactionFail('goal_round_active','先暂停目标，再编辑目标');
+            changeGoal(goal,kind,'objective' in command?{objective:command.objective}:{});
+            await this.discardGoalRound(tx,chat.id,goal);
+            if(kind==='create'||kind==='resume')goal.writer=current.writer;
+          }
+        }else{
+          const round=goal.round;
+          if(!round||round.id!==args.round_id||!g||g.id!==args.goal_id||g.revision!==args.expected_revision||goal.writer!==writer!.id)
+            throw interactionFail('stale_goal_round','目标轮次已更换或取消');
+          if(operation==='claim'){
+            if(round.state!=='queued')return {current,changed:false,value:{claimed:false,duplicate:true}};
+            if(!goal.armed||current.interaction_mode==='plan'||(await tx.list({prefix:'chat-processing-open:'+chat.id+':',limit:1})).size)
+              throw interactionFail('goal_round_deferred','先处理真人消息或完成规划');
+            admitRound(goal,round);round.state='claimed';round.writer=writer!.id;value.claimed=true;
+            value.prompt=renderGoalRoundPrompt({...g,roundsStarted:goal.fold.roundsStarted,activation:'armed',createdAt:goal.fold.createdAt!,updatedAt:goal.fold.updatedAt!},round.number)[0].text;
+            value.context_source={round_id:round.id,source_message_ids:[]};
+          }else{
+            if(round.state!=='claimed'||round.writer!==writer!.id)throw interactionFail('stale_goal_round','轮次尚未由当前宿主认领');
+            if(!['continue','complete','blocked'].includes(args.outcome))throw interactionFail('invalid_chat_argument','无效目标结算结果');
+            if(args.outcome==='complete')changeGoal(goal,'complete');
+            else if(args.outcome==='blocked'){
+              const blocker=textValue(args.reason,'reason').trim();
+              if(!blocker||blocker.length>1000)throw interactionFail('invalid_chat_argument','请记录明确的阻塞原因（最多 1000 字）');
+              goal.blockerCount=goal.blocker===blocker?(goal.blockerCount??0)+1:1;goal.blocker=blocker;
+              if(goal.blockerCount>=3)changeGoal(goal,'block',{reason:{code:'repeated-blocker',message:blocker}});
+            }else{delete goal.blocker;delete goal.blockerCount;}
+          }
+          await tx.delete(collaborationWakeKey(chat.id,goalWakeId(round)));
+          if(operation==='settle')delete goal.round;
+        }
+        await tx.put(goalKey(chat.id),goal);
+      }else if(operation==='submit'){
+        if(current.interaction_mode!=='plan'||integer(args.expected_revision,'expected_revision')!==(current.interaction_revision??0))
+          throw interactionFail('stale_interaction_mode','仅可在当前计划模式版本提交方案');
+        const markdown=textValue(args.markdown,'markdown').trim();
+        if(!/^#\s+\S/.test(markdown)||new TextEncoder().encode(markdown).length>65536)
+          throw interactionFail('invalid_chat_argument','方案必须以一级标题开头且不超过 64 KiB');
+        const previous=current.plan_review_id?await tx.get<PlanReview>(reviewKey(chat.id,current.plan_review_id)):undefined;
+        if(previous?.state==='pending')throw interactionFail('plan_review_pending','已有方案在等待审阅');
+        const sources=args.source_message_ids===undefined?[]:await this.inputMessages(tx,chat.id,args.source_message_ids);
+        const revision=(current.revision??0)+1;
+        const review:PlanReview={id:crypto.randomUUID(),markdown,mode_revision:current.interaction_revision!,writer:writer!.id,state:'pending',source_message_ids:sources.map(m=>m.id),
+          anchor_sequence:current.sequence,created_revision:revision,updated_revision:revision};
+        await tx.put(reviewKey(chat.id,review.id),review);
+        await tx.put(reviewTimelineKey(chat.id,current.sequence,revision),review.id);
+        current.plan_review_id=changedReviewId=review.id;
+        value.review=this.publicReview(review);
+      }else{
+        const id=textValue(args.review_id,'review_id'),key=reviewKey(chat.id,id),review=await tx.get<PlanReview>(key);
+        if(!review||id!==current.plan_review_id)throw interactionFail('stale_plan_review','方案已更换');
+        if(operation==='continue'||operation==='finish'){
+          if(operation==='continue'&&(!review.decision||review.continued_by))return {current,changed:false,value:{claimed:false,duplicate:true}};
+          if(review.writer!==writer!.id)throw interactionFail('stale_plan_review','方案属于原模型连接');
+          if((review.decision==='reject'?'plan':review.decision)!==(current.interaction_mode??'normal')||
+            (current.interaction_revision??0)!==review.mode_revision+(review.decision==='reject'?0:1))
+            throw interactionFail('stale_interaction_mode','审阅决定后的会话模式已更换');
+          if(operation==='continue'){
+            review.continued_by=writer!.id;value.claimed=true;
+            value.context_source={review_id:review.id,source_message_ids:review.source_message_ids??[]};
+            await tx.delete(collaborationWakeKey(chat.id,planWakeId(review)));
+          }else{
+            if(review.state!=='approved'||review.continued_by!==writer!.id)
+              throw interactionFail('stale_plan_review','当前模型尚未认领已批准方案');
+            review.finished=true;
+          }
+        }else{
+          if(review.state!=='pending'||review.writer!==current.writer||current.interaction_mode!=='plan'||review.mode_revision!==current.interaction_revision)
+            throw interactionFail('stale_plan_review','此方案已结算或已退出计划');
+          if(!['reject','normal','auto'].includes(args.decision))throw interactionFail('invalid_chat_argument','无效审阅决定');
+          review.decision=args.decision;review.state=args.decision==='reject'?'rejected':'approved';
+          if(args.decision==='reject'){
+            review.reason=textValue(args.reason??'','reason').trim();
+            if(review.reason.length>4000)throw interactionFail('invalid_chat_argument','拒绝理由最多 4000 字');
+          }
+          await tx.put(key,review);
+          if(args.decision!=='reject')await this.setInteraction(tx,current,args.decision);
+          await queueCollaborationWake(tx,chat.id,planWakeId(review),'plan_review',review.id);
+        }
+        if(review.created_revision!==undefined&&operation!=='continue'){
+          review.updated_revision=(current.revision??0)+1;changedReviewId=review.id;
+        }
+        await tx.put(key,review);value.review=this.publicReview(review);
+      }
+      await this.scheduleGoal(tx,current);
+      if(action==='goal')value.goal=goalView(await tx.get<GoalRecord>(goalKey(chat.id)));
+      await this.recordChange(tx,current,[],changedReviewId);
+      await tx.put(request.key,{fingerprint:request.fingerprint,result:operation==='claim'||operation==='continue'?{claimed:true}:value});
+      return {current,value,changed:true};
+    });
+    if(changed)this.signal(chat.id);
+    return {...value,chat:await this.summary(current,actor)};
+  }
+
+  /** Validate the explicit Chat binding before capture or automatic tool admission. */
   async beginToolObservation(binding:ChatToolBinding,tool:string,input:Data,actor:Actor,caller:string):Promise<ObservedToolTicket>{
     await this.initialize();
     if(!binding||typeof binding!=='object'||!toolSpecs.some(([name])=>name===tool)||
       binding.capture!==undefined&&!['metadata','content'].includes(binding.capture))throw fail('invalid_chat_context','无效工具上下文绑定');
     const ids=binding.source_message_ids;
-    if(!Array.isArray(ids)||ids.length<1||ids.length>100||ids.some(id=>typeof id!=='string'||!/^m[1-9]\d*$/.test(id))||new Set(ids).size!==ids.length)
+    if(!Array.isArray(ids)||(!binding.round_id&&!binding.review_id&&ids.length<1)||ids.length>100||ids.some(id=>typeof id!=='string'||!/^m[1-9]\d*$/.test(id))||new Set(ids).size!==ids.length)
       throw fail('invalid_chat_context','工具上下文需要 1 到 100 条本对话的真实来源消息');
     const chat=await this.chat(textValue(binding.chat_id,'chat_id'),actor);
     if(chatMode(chat.mode)!=='chat')throw fail('chat_mode_mismatch','普通 Chat 工具上下文不能读取或改变 Super Agent 私有任务');
@@ -830,9 +1132,11 @@ export class ChatService {
       await this.access(actor,chat.device,tx);
       const current=await tx.get<Conversation>(key(chat.id)),active=await tx.get<Writer>(writerKey(chat.id));
       if(!current||current.writer!==writer.id||active?.id!==writer.id)throw fail('chat_not_connected','原模型连接已结束');
+      await this.assertCollaborationSource(tx,current,writer.id,binding.round_id,binding.review_id);
       for(const id of ids){const message=await tx.get<Message>(messageKey(chat.id,cursorOf(id)));
         if(!message||message.id!==id||message.sequence>current.sequence)throw fail('invalid_trace_source','工具上下文来源必须存在于本对话');}
       validated={chatId:chat.id,latestSequence:current.sequence,writer:{id:writer.id,account:writer.account,epoch:writer.epoch,caller:writer.caller}};
+      if(!ids.length)return unavailableToolTicket(validated,binding,tool);
       return observeToolCall(tx,validated,binding,tool,input,id=>tx.get<Message>(messageKey(chat.id,cursorOf(id))));
     });}catch(error){
       // Failed storage rolls back the whole observation. Never disguise an ACL,
@@ -840,6 +1144,47 @@ export class ChatService {
       if(!validated||/^(?:invalid_|chat_|account_|device_|context_)/.test(String((error as Data)?.code??'')))throw error;
       return unavailableToolTicket(validated,binding,tool);
     }
+  }
+
+  private async assertCollaborationSource(tx:KeyStore,chat:Conversation,writer:string,roundId?:string,reviewId?:string):Promise<void>{
+    if(roundId){
+      const round=(await tx.get<GoalRecord>(goalKey(chat.id)))?.round;
+      if(round?.id!==roundId||round.state!=='claimed'||round.writer!==writer)
+        throw fail('invalid_chat_context','目标轮次未由当前模型认领');
+    }
+    if(reviewId){
+      const review=await tx.get<PlanReview>(reviewKey(chat.id,reviewId));
+      if(review?.continued_by!==writer||review.finished||chat.plan_review_id!==review.id||
+        (chat.interaction_revision??0)!==review.mode_revision+(review.decision==='reject'?0:1))
+        throw fail('invalid_chat_context','方案决定不属于当前模型和模式');
+    }
+  }
+
+  async assertToolDispatch(ticket:ObservedToolTicket,device:string,grant?:AutoToolGrant):Promise<void>{
+    await this.store.transaction(async tx=>{
+      if(grant)await this.assertAutoToolGrant(grant,device,tx);
+      const chat=await tx.get<Conversation>(key(ticket.chatId));
+      if(!chat||chat.writer!==ticket.writerId)throw fail('chat_not_connected','原模型连接已结束');
+      await this.assertCollaborationSource(tx,chat,ticket.writerId,ticket.roundId,ticket.reviewId);
+    });
+  }
+
+  async autoToolGrant(ticket:ObservedToolTicket|undefined,actor:Actor,device:string):Promise<AutoToolGrant|undefined>{
+    if(!ticket)return undefined;
+    const current=await this.store.get<Conversation>(key(ticket.chatId));
+    if(current?.device!==device||current.interaction_mode!=='auto')return undefined;
+    const grant={chatId:current.id,writerId:ticket.writerId,revision:current.interaction_revision!,account:actor.id,epoch:actor.epoch,caller:ticket.caller};
+    await this.assertAutoToolGrant(grant,device);
+    return grant;
+  }
+
+  async assertAutoToolGrant(grant:AutoToolGrant,device:string,tx:KeyStore=this.store):Promise<void>{
+    if(tx===this.store)return this.store.transaction(inner=>this.assertAutoToolGrant(grant,device,inner));
+    const [chat,writer]=await Promise.all([tx.get<Conversation>(key(grant.chatId)),tx.get<Writer>(writerKey(grant.chatId))]);
+    if(!chat||chat.device!==device||chatMode(chat.mode)!=='chat'||chat.interaction_mode!=='auto'||chat.interaction_revision!==grant.revision||
+      chat.writer!==grant.writerId||writer?.id!==grant.writerId||writer.account!==grant.account||writer.epoch!==grant.epoch||writer.caller!==grant.caller)
+      throw interactionFail('chat_auto_ended','会话已退出自动模式或模型连接已变化');
+    await this.accounts.assertAccessIn(tx,{id:grant.account,epoch:grant.epoch,role:'user',username:''},device);
   }
   async finishToolObservation(ticket:ObservedToolTicket,output:Data,actor:Actor,caller:string):Promise<ObservedToolReceipt>{
     await this.initialize();const chat=await this.chat(ticket.chatId,actor),account=modelActor(actor);
@@ -975,14 +1320,32 @@ export class ChatService {
       });
     }));
   }
-  private async history(chat:Conversation,args:Data,actor:ChatPrincipal):Promise<Data>{
+  private async history(chat:Conversation,args:Data,actor:ChatPrincipal,human:boolean):Promise<Data>{
+    if(human&&args.review_after!==undefined){
+      const value=textValue(args.review_after,'review_after');
+      if(!/^\d{1,16}:\d{1,16}:\d{1,16}:\d{1,16}$/.test(value))throw fail('invalid_chat_cursor','无效方案历史游标');
+      const [first,last,anchor,revision]=value.split(':').map(Number);
+      if(![first,last,anchor,revision].every(Number.isSafeInteger)||first>anchor||anchor>last||last>chat.sequence)
+        throw fail('invalid_chat_cursor','无效方案历史游标');
+      return this.store.transaction(async tx=>{
+        await this.access(actor,chat.device,tx);
+        return this.planReviewPage(tx,chat.id,first,last,{anchor,revision});
+      });
+    }
     const prefix='chat-message:'+chat.id+':',limit=limitOf(args.limit),forward=args.after!==undefined;
     const after=forward?integer(args.after,'after'):0,before=args.before===undefined?undefined:integer(args.before,'before',1);
     if(forward&&before!==undefined)throw fail('invalid_chat_argument','after 与 before 不能同时使用');
-    const rows=await this.store.list<Message>({prefix,limit:limit+1,...(forward?{startAfter:messageKey(chat.id,after)}:{reverse:true,...(before?{endBefore:messageKey(chat.id,before)}:{})})});
-    let messages=[...rows.values()].slice(0,limit);if(!forward)messages=messages.reverse();
-    const first=messages[0]?.sequence??(before??after),last=messages.at(-1)?.sequence??after;
-    return {chat:await this.summary(chat,actor),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),notification_diagnostics:await readCallbackDiagnostics(this.store,chat.id),messages:await Promise.all(messages.map(m=>this.viewMessage(this.store,chat.id,m))),next_cursor:last,first_cursor:first,eof:last>=chat.sequence,has_older:first>1};
+    const {messages,reviews,first,last}=await this.store.transaction(async tx=>{
+      await this.access(actor,chat.device,tx);
+      const rows=await tx.list<Message>({prefix,limit:limit+1,...(forward?{startAfter:messageKey(chat.id,after)}:{reverse:true,...(before?{endBefore:messageKey(chat.id,before)}:{})})});
+      const messages=[...rows.values()].slice(0,limit);if(!forward)messages.reverse();
+      const first=messages[0]?.sequence??(before??after),last=messages.at(-1)?.sequence??after;
+      const lower=messages.length&&first>1?first:0;
+      const reviews=!human?{}:messages.length||(!after&&!chat.sequence)
+        ?await this.planReviewPage(tx,chat.id,lower,last):{plan_reviews:[]};
+      return {messages,reviews,first,last};
+    });
+    return {chat:await this.summary(chat,actor,undefined,human),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),notification_diagnostics:await readCallbackDiagnostics(this.store,chat.id),messages:await Promise.all(messages.map(m=>this.viewMessage(this.store,chat.id,m))),...reviews,next_cursor:last,first_cursor:first,eof:last>=chat.sequence,has_older:first>1};
   }
   private async resume(chat:Conversation,args:Data,actor:ChatPrincipal,caller:string):Promise<Data>{
     if(!caller)throw fail('model_connection_required','请通过模型 MCP 连接恢复对话');
@@ -993,7 +1356,8 @@ export class ChatService {
         const current=await tx.get<Conversation>(key(chat.id));
         if(!current||current.active||!current.writer||!current.reconnect_until||current.reconnect_until<=Date.now())return;
         delete current.writer;delete current.reconnect_until;
-        await tx.delete(writerKey(chat.id));await this.recordChange(tx,current);
+        await tx.delete(writerKey(chat.id));await this.parkGoal(tx,chat.id);
+        await this.recordChange(tx,current,[],await this.cancelPendingReview(tx,current));
       });
       chat=await this.chat(chat.id,actor);
     }
@@ -1013,6 +1377,7 @@ export class ChatService {
     const current=await this.chat(chat.id,actor);if(current.writer)await this.connection(current,connection,actor,caller);this.background(()=>this.changed(chat.id));
     return {chat:await this.summary(current,actor),connection,subscribed:!!current.active,context:await this.context(current,{}),
       next_step:(chatMode(current.mode)==='super_agent'?'Super Agent: first call chat.task instructions for the original role and runtime_version; existing legacy tasks retain their original protocol until drained. In version 2, discuss pending requests here before routing if needed. Choose authorized Bridge or host tools within upstream role rules, with no added tool priority or forced delegation. Explicitly report execution stages; this server does not monitor host agents. Do not also handle this as ordinary Chat. ':'Chat: converse naturally using the included multi-message context. Do not create or dispatch Super Agent tasks. ')+'You may save replies now with chat.reply. Subscribe to chat.message through the host event-task capability (MCP events/subscribe) to receive future notifications. Event delivery is independent of saved messages.',
+      ...(current.interaction_mode==='plan'?{planning_instructions:PLAN_GUIDANCE}:{}),
       event:{name:chatEventDefinition.name,arguments:{chat_id:chat.id,connection}},history:{chat_id:chat.id}};
   }
   private async connection(chat:Conversation,connection:unknown,actor:ChatPrincipal,caller:string):Promise<Writer>{
@@ -1074,7 +1439,10 @@ export class ChatService {
       approval_id:message.approval_id??null,connection,device_id:chat.device_id,message_id:message.id,url:this.env.publicUrl+'/chat?id='+chat.id,
       payload_version:2};
     const data=mode==='chat'?{...base,
-      processing:'The complete current body and attachments are in context.current_message. Continue this conversation naturally; combine pending inputs when appropriate, without a separate acknowledgement or reply to every message. Do not create Super Agent tasks. Before recovery read newer user directions and inspect uncertain effects.'}
+      interaction_mode:chat.interaction_mode??'normal',interaction_revision:chat.interaction_revision??0,
+      ...(message.planning_request?{planning_request:true}:{}),
+      processing:'The complete current body and attachments are in context.current_message. Continue this conversation naturally; combine pending inputs when appropriate, without a separate acknowledgement or reply to every message. Do not create Super Agent tasks. Before recovery read newer user directions and inspect uncertain effects.'+
+        (chat.interaction_mode==='plan'?'\n\n'+PLAN_GUIDANCE:message.planning_request?' This input was explicitly sent for planning. It is not an instruction to implement the work.':'')}
       :{...base,kind:'user_message',
       processing:'The complete current body and attachments are in context.current_message. Read chat.task instructions for this runtime version. Discuss with the user here before routing when needed; preserve original source references. Use the original framework tools and report execution stages explicitly. Choose authorized host or Bridge tools under the upstream role rules; no added tool preference or mandatory delegation. Commands marked command_processed are already applied; inspect tasks without repeating commands. Approval notices are not new tasks.'};
     return {eventId:chat.id+'-'+message.id,name:chatEventDefinition.name,timestamp:message.created_at,data,cursor:cursor?'m'+cursor:null};
@@ -1174,29 +1542,39 @@ export class ChatService {
         }
         await this.queueMessage(tx,current,m);
       }
-      if(chatMode(current.mode)==='chat')await observeContext(tx,chat.id,current.sequence,true);
+      if(chatMode(current.mode)==='chat'){
+        if(!model)await this.pauseQueuedGoal(tx,chat.id);
+        if(resolved.length)await this.scheduleGoal(tx,current);
+        await observeContext(tx,chat.id,current.sequence,true);
+      }
       return this.savedResponse(tx,current,m,summary);
     });
     this.signal(chat.id);return result;
   }
-  async approvalNotice(actor:ChatPrincipal,chatId:string,approvalId:string,decision:string,tool?:Data):Promise<Data>{
+  async approvalNotice(actor:ChatPrincipal,chatId:string,approvalId:string,decision:string,tool?:Data,origin?:ApprovalOrigin):Promise<Data>{
     await this.initialize();const chat=await this.chat(chatId,actor);
     const result=await this.store.transaction(async tx=>{
       await this.access(actor,chat.device,tx);
       const noticeKey='chat-approval-notice:'+approvalId,previous=await tx.get<Data>(noticeKey);
       if(previous)return previous;
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
+      if(origin){
+        const writer=await tx.get<Writer>(writerKey(chat.id));
+        if(origin.chatId!==chat.id||current.writer!==origin.writerId||writer?.id!==origin.writerId||
+          writer.account!==origin.account||writer.epoch!==origin.epoch||writer.caller!==origin.caller)return {discarded:true};
+      }
       const sequence=++current.sequence,stamp=now();
       const message:Message={id:'m'+sequence,sequence,role:'user',source:normalizeIdentity(actor).kind==='device'?'tui':'web',
         text:(tool?'工具审批 '+tool.method+' '+tool.device+' '+tool.request_id:'命令审批 '+approvalId)+'：'+(decision==='allowed-once'?'已同意本次执行。':decision==='cancelled'?'已取消本次执行。':'已拒绝本次执行。'),
-        attachments:[],created_at:stamp,saved_at:stamp,source_identity:sourceIdentity(actor),approval_id:approvalId};
+        attachments:[],created_at:stamp,saved_at:stamp,source_identity:sourceIdentity(actor),approval_id:approvalId,
+        ...(origin?{approval_origin:origin}:{})};
       current.updated_at=stamp;const result={saved:true,chat_id:chat.id,message_id:message.id,decision};
       await tx.put({[messageKey(chat.id,sequence)]:message,[timingKey(chat.id,sequence)]:{saved_at:stamp,attempts:0},[noticeKey]:result});
       await this.recordChange(tx,current,[sequence]);await this.queueMessage(tx,current,message);
       if(chatMode(current.mode)==='chat')await observeContext(tx,chatId,current.sequence,true);
       return result;
     });
-    this.signal(result.chat_id);return result;
+    if(result.chat_id)this.signal(result.chat_id);return result;
   }
   private async attachment(chat:string,id:unknown,ready=false):Promise<Attachment>{
     if(typeof id!=='string')throw fail('attachment_not_found','附件不存在');
@@ -1419,12 +1797,16 @@ export class ChatService {
       for(const a of files)await this.expiry(tx,'upload',chat.id+':'+a.id);
       const head=await tx.get<Head>('chat-head:'+chat.id);if(head)await tx.delete([dueKey(head),'chat-head:'+chat.id]);
       for(const prefix of ['chat-change:','chat-timing:','chat-pending:','chat-unack:','chat-message:','chat-attachment:','chat-chunk:','chat-event:','chat-request:','chat-import:','chat-approval:','chat-module-reply:','chat-context-token:','chat-working-snapshot:','chat-maintenance-status:','chat-maintenance-receipt:'])await tx.delete([...(await tx.list({prefix:prefix+chat.id+':'})).keys()]);
+      for(const prefix of [reviewTimelinePrefix(chat.id),pendingApprovalPrefix(chat.id)])await tx.delete([...(await tx.list({prefix})).keys()]);
+      await tx.delete('chat-approval-pending-index:'+chat.id);
       await eraseSourceFingerprints(tx,'chat-working-source:'+chat.id+':');
       await eraseSourceFingerprints(tx,'chat-maintenance-source:'+chat.id+':');
       await superAgentErase(tx,chat.id);
       const taskSchedule=await tx.get<Data>('chat-super-agent-schedule:'+chat.id);if(taskSchedule)await tx.delete(taskSchedule.key);
       await tx.delete(['chat-super-agent-schedule:'+chat.id,'chat-super-agent-wake:'+chat.id]);
       await eraseProcessing(tx,chat.id);
+      await tx.delete([goalKey(chat.id),...(await tx.list({prefix:collaborationWakePrefix+chat.id+':'})).keys(),
+        ...(await tx.list({prefix:'chat-plan-review:'+chat.id+':'})).keys()]);
       await eraseChatSummary(tx,chat.id);await eraseTrace(tx,chat.id);
       await eraseSummaryProduction(tx,chat.id);await eraseSubscriptionHandoffs(tx,chat.id);await tx.delete('chat-routing-revision:'+chat.id);
       await this.clearChatChannelOutbox(tx,chat.id);
@@ -1494,10 +1876,16 @@ export class ChatService {
     await this.accounts.require(actor.id,actor.epoch);await this.initialize();
     if(method==='list')return {events:[chatEventDefinition,summaryDueEventDefinition,channelEventDefinition]};
     if(args.name===channelEventDefinition.name)return this.channelEvents(method,args,actor,caller);
-    if(method==='unsubscribe'&&['chat.message','chat.summary_due'].includes(args.name)&&!args.arguments?.handoff_id){
-      const c=await this.chat(textValue(args.arguments?.chat_id,'chat_id'),actor),w=await this.store.get<Writer>(writerKey(c.id));
+    if(method==='unsubscribe'&&['chat.message','chat.summary_due'].includes(args.name)){
+      const input=args.arguments,chatId=textValue(input?.chat_id,'chat_id');
+      if(!/^t[1-9]\d*$/.test(chatId)||typeof input.connection!=='string'||args.delivery?.mode!=='webhook')throw fail('invalid_event','退订需要 chat_id、connection 和 webhook');
+      const url=parseWebhookUrl(args.delivery.url);
+      let c:Conversation;
+      try{c=await this.chat(chatId,actor);}
+      catch(error){if((error as Data).code==='chat_not_found')return {};throw error;}
+      if(input.handoff_id)return this.stagedEvent(method,args,actor,caller);
+      const w=await this.store.get<Writer>(writerKey(c.id));
       if(w&&w.account===actor.id&&w.epoch===actor.epoch&&w.caller===caller&&await this.matchesConnection(w,args.arguments?.connection)){
-        const url=textValue(args.delivery?.url,'url');if(args.delivery?.mode!=='webhook')throw fail('invalid_event','Webhook required');
         await this.store.transaction(async tx=>{
           if(args.name==='chat.summary_due')await recordMaintenanceDiagnostic(tx,c.id,method,'entered').catch(()=>{});
           const routes=await this.handoffPort().readRouting(tx,c.id),live=routes.endpoints[args.name as 'chat.message'|'chat.summary_due'];
@@ -1548,20 +1936,26 @@ export class ChatService {
       if(expires_at!==null)await tx.requestAlarm?.(expires_at);
       for(const message of (await tx.list<Message>({prefix:'chat-message:'+chat.id+':'})).values())if(message.role==='user'&&!message.replied_at){
         const old=await tx.get<Outbox>(outboxKey(chat.id,message.sequence));
-        if(old?.state==='delivered'||old?.state==='resolved')continue;
+        if(old?.state==='delivered'||old?.state==='resolved'||old?.state==='failed')continue;
+        if(message.approval_origin&&!this.approvalNoticeMatches(message.approval_origin,sub)){
+          if(old)await this.resolveNotification(tx,chat.id,message.sequence);
+          continue;
+        }
         // Ordinary refreshes preserve backoff; only paused/configuration-blocked work is reactivated.
         const pending=old?.state==='pending';
         await this.saveEvent(tx,{chat:chat.id,sequence:message.sequence,subscription:id,attempts:old?.attempts??0,
-          next_at:pending?old.next_at:Date.now(),state:'pending',...(pending&&old.error?{error:old.error}:{})});
+          next_at:pending?old.next_at:Date.now(),state:'pending',...(pending&&old.error?{error:old.error}:{}),
+          ...(old?.transient_403_attempts?{transient_403_attempts:old.transient_403_attempts}:{})});
       }
       const maintenance=await tx.get<Maintenance>(maintenanceKey(chat.id));
       if(sub.unified_context&&maintenance?.state==='waiting'&&!maintenance.notified&&maintenance.next_at===null){maintenance.next_at=Date.now();await persist(tx,chat.id,maintenance);}
       if(chatMode(current.mode)==='super_agent'){const wake=await tx.get<Data>('chat-super-agent-wake:'+chat.id);if(wake){wake.next_at=Date.now();await tx.put('chat-super-agent-wake:'+chat.id,wake);await tx.requestAlarm?.(wake.next_at);}}
+      else await this.rearmCollaborationWake(tx,current);
       return sub;
     });
-    this.signal(chat.id);return {id,refreshBefore:expires_at===null?null:new Date(expires_at).toISOString(),cursor:saved.cursor?'m'+saved.cursor:null,truncated:false};
+    await this.checkGoal(chat.id);this.signal(chat.id);return {id,refreshBefore:expires_at===null?null:new Date(expires_at).toISOString(),cursor:saved.cursor?'m'+saved.cursor:null,truncated:false};
   }
-  private async signed(sub:Pick<Subscription,'id'|'url'|'secret'|'previous_secret'|'rotation_until'>&{chat?:string;channel?:ChannelDiagnosticScope},event:Data):Promise<Response>{
+  private async signed(sub:Pick<Subscription,'id'|'url'|'secret'|'previous_secret'|'rotation_until'>&{chat?:string;channel?:ChannelDiagnosticScope},event:Data,onRejection?:(category:CallbackCategory)=>void):Promise<Response>{
     const body=JSON.stringify(event),id=String(event.eventId??'verify-'+secret()),date=new Date();
     if(new TextEncoder().encode(body).length>262144)throw fail('event_too_large','事件超过 256 KiB');
     let signature=new Webhook(sub.secret).sign(id,date,body);
@@ -1599,6 +1993,7 @@ export class ChatService {
       const diagnostic={...await callbackFailure(response),at:date.toISOString(),phase:event.type==='verification'?'verification' as const:'delivery' as const,
         ...(typeof event.data?.message_id==='string'&&/^m[1-9][0-9]*$/.test(event.data.message_id)?{message_id:event.data.message_id}:{}),
         ...(Number.isSafeInteger(event.data?.generation)?{generation:event.data.generation}:{})};
+      onRejection?.(diagnostic.category);
       await this.store.transaction(async tx=>{if(await tx.get(key(sub.chat!)))await recordCallbackDiagnostic(tx,sub.chat!,diagnostic);}).catch(()=>{});
     }
     return response;
@@ -1621,13 +2016,17 @@ export class ChatService {
     const current=await tx.get<Conversation>(key(chat)),writer=await tx.get<Writer>(writerKey(chat));
     const ending=!!(endWriter&&writer&&(writer.id===id||current?.active===id));
     const ids=new Set<string>([id]);if(ending&&current?.active)ids.add(current.active);
+    let cancelledReview:string|undefined;
     if(ending){
       for(const sub of (await tx.list<Subscription>({prefix:'chat-subscription:'})).values())if(sub.chat===chat&&(sub.writer_id??sub.id)===writer!.id)ids.add(sub.id);
-      if(current)delete current.writer;await tx.delete(writerKey(chat));await tx.delete(subscriptionKey(chat));await eraseSubscriptionHandoffs(tx,chat);
+      if(current){delete current.writer;cancelledReview=await this.cancelPendingReview(tx,current);}
+      await tx.delete(writerKey(chat));await tx.delete(subscriptionKey(chat));await eraseSubscriptionHandoffs(tx,chat);
     }
     if(current?.active&&ids.has(current.active))delete current.active;
+    if(ending)await this.parkGoal(tx,chat);
+    else if(current&&!current.active)await this.pauseQueuedGoal(tx,chat);
     const summary=await tx.get<Subscription>(subscriptionKey(chat));if(summary&&ids.has(summary.id))await tx.delete(subscriptionKey(chat));
-    if(current)await this.recordChange(tx,current);
+    if(current)await this.recordChange(tx,current,[],cancelledReview);
     for(const endpoint of ids){await tx.delete(subKey(endpoint));await this.expiry(tx,'subscription',endpoint);}
     for(const seq of (await tx.list<number>({prefix:'chat-pending:'+chat+':'})).values()){
       const event=await tx.get<Outbox>(outboxKey(chat,seq));if(event&&ids.has(event.subscription)){event.state='paused';await this.saveEvent(tx,event);if(current)await this.recordChange(tx,current,[seq]);}
@@ -1738,6 +2137,7 @@ export class ChatService {
         action:command,chat_id:chat.id,device_id:chat.device_id,device_name:deviceName,
         title:chat.title,mode,...modeRepository(mode,chat.repository),
         source,requested_at:requestedAt,url:this.env.publicUrl+'/chat?id='+chat.id,
+        ...(command==='delete'?{instructions:channelDeleteInstructions}:{}),
       },
       cursor:null,
     };
@@ -2031,14 +2431,21 @@ export class ChatService {
     const stillPending=await this.store.transaction(async tx=>{
       const current=await tx.get<Outbox>(outboxKey(chat.id,event.sequence));
       if(!current||current.subscription!==sub.id||current.state!=='pending')return false;
+      if(message!.approval_origin){
+        const live=await tx.get<Conversation>(key(chat.id));
+        const route=await tx.get<Subscription>(subKey(sub.id));
+        if(!route||live?.writer!==message!.approval_origin.writerId||!this.approvalNoticeMatches(message!.approval_origin,route)){
+          await this.resolveNotification(tx,chat.id,event.sequence);return false;
+        }
+      }
       if(chatMode(chat.mode)==='chat'&&(await processingRecord(tx,chat.id,message!)).state==='resolved'){
         await this.resolveNotification(tx,chat.id,event.sequence);return false;
       }
       return beginRouteDelivery(tx,this.handoffPort(),chat.id,'chat.message',sub.id,String(envelope.eventId));
     });if(!stillPending)return;
-    let status=0,error:string|undefined,retryAfter=0;
+    let status=0,error:string|undefined,retryAfter=0,category:CallbackCategory|undefined;
     try{
-      const response=await this.signed(sub,envelope);status=response.status;
+      const response=await this.signed(sub,envelope,value=>{category=value;});status=response.status;
       const retry=response.headers.get('retry-after');if(retry){const seconds=Number(retry);retryAfter=Number.isFinite(seconds)?Math.max(0,seconds*1000):Math.max(0,Date.parse(retry)-Date.now())||0;}
       await response.body?.cancel();
     }catch(e){error=(e as Data).code==='invalid_callback'?'callback_address':'network';}
@@ -2052,6 +2459,14 @@ export class ChatService {
         await this.saveEvent(tx,current);live.cursor=await this.safeCursor(tx,event.chat,sub.id,event.sequence);
         const t=await tx.get<Timing>(timingKey(event.chat,event.sequence));if(t){t.host_accepted_at??=current.received_at;await tx.put(timingKey(event.chat,event.sequence),t);}await tx.put(subKey(sub.id),live);
       }else if(status===410){current.state='paused';current.error='callback_gone';await this.saveEvent(tx,current);await this.releaseIn(tx,chat.id,sub.id,false);}
+      else if(status===403&&chatMode(c.mode)==='chat'&&message!.role==='user'&&!message!.approval_id&&
+        (category==='http_rejected'||category==='edge_challenge')){
+        const attempt=current.transient_403_attempts??0,delay=MESSAGE_403_RETRY_DELAYS[attempt];
+        current.transient_403_attempts=attempt+1;current.error='http_403';
+        if(delay===undefined)current.state='failed';
+        else current.next_at=Date.now()+Math.max(delay,retryAfter);
+        await this.saveEvent(tx,current);
+      }
       else if(status===413||status>=400&&status<500&&status!==408&&status!==429||error==='callback_address'){
         current.state='blocked';current.error=status?'http_'+status:error;await this.saveEvent(tx,current);
       }else{
@@ -2063,10 +2478,83 @@ export class ChatService {
     },status>=200&&status<300?'accepted':status>=400&&status<500&&status!==408?'not_accepted':'uncertain'));
     this.background(()=>this.changed(chat.id));
   }
+  private approvalNoticeMatches(origin:ApprovalOrigin,subscription:Subscription):boolean{
+    return origin.chatId===subscription.chat&&origin.writerId===(subscription.writer_id??subscription.id)&&
+      origin.account===subscription.account&&origin.epoch===subscription.epoch&&origin.caller===subscription.caller;
+  }
   private drain():Promise<void>{
     if(this.pumping)return this.pumping;
     this.pumping=this.pump().finally(()=>{this.pumping=undefined;this.wake=undefined;});return this.pumping;
   }
+  private drainCollaboration():Promise<void>{
+    if(this.collaborationPumping)return this.collaborationPumping;
+    this.collaborationPumping=this.pumpCollaboration().finally(()=>{this.collaborationPumping=undefined;});
+    return this.collaborationPumping;
+  }
+
+  private async pumpCollaboration():Promise<void>{
+    const due=[...(await this.store.list<CollaborationWake>({prefix:collaborationWakePrefix})).entries()]
+      .filter(([,wake])=>wake.next_at!==null&&wake.next_at<=Date.now());
+    for(const [keyName,entry] of due){
+      const job=await this.store.transaction(async tx=>{
+        const wake=await tx.get<CollaborationWake>(keyName);
+        if(!wake||wake.next_at!==entry.next_at)return;
+        const chat=await tx.get<Conversation>(key(wake.chat));
+        if(!chat){await tx.delete(keyName);return;}
+        const goal=wake.kind==='goal_round'?await tx.get<GoalRecord>(goalKey(chat.id)):undefined;
+        const review=wake.kind==='plan_review'?await tx.get<PlanReview>(reviewKey(chat.id,wake.ref)):undefined;
+        const round=goal?.round;
+        if(wake.kind==='goal_round'&&(!goal?.armed||round?.id!==wake.ref||round.state!=='queued'||chat.interaction_mode==='plan')||
+          wake.kind==='plan_review'&&(!review?.decision||review.continued_by||review.writer!==chat.writer||chat.plan_review_id!==review.id||
+          (chat.interaction_revision??0)!==review.mode_revision+(review.decision==='reject'?0:1))){
+          await tx.delete(keyName);return;
+        }
+        if(!chat.active||!chat.writer){await tx.put(keyName,{...wake,next_at:null});return;}
+        const sub=await tx.get<Subscription>(subKey(chat.active));
+        if(!await this.validSubscription(tx,sub,chat.device)||(sub!.writer_id??sub!.id)!==chat.writer){await tx.put(keyName,{...wake,next_at:null});return;}
+        if(wake.kind==='goal_round'&&goal?.writer!==chat.writer){await this.parkGoal(tx,chat.id);await this.recordChange(tx,chat);return;}
+        wake.attempts++;wake.next_at=Date.now()+20_000;
+        await tx.put(keyName,wake);await tx.requestAlarm?.(wake.next_at);
+        return {wake,chat,sub:sub!,round,review};
+      });
+      if(!job)continue;
+      const {wake,chat,sub,round,review}=job;
+      let status=0,category:CallbackCategory|undefined,retryAfter=0;
+      try{
+        const response=await this.signed(sub,{
+          eventId:chat.id+'-'+wake.id,name:chatEventDefinition.name,timestamp:now(),cursor:null,
+          data:{kind:wake.kind,chat_id:chat.id,device_id:chat.device_id,connection:sub.event_connection,
+            mode:'chat',interaction_mode:chat.interaction_mode??'normal',interaction_revision:chat.interaction_revision??0,
+            url:this.env.publicUrl+'/chat?id='+chat.id,
+            ...(round?{round_id:round.id,goal_id:round.goal_id,goal_revision:round.revision,round:round.number}:{review_id:review!.id}),
+            processing:round?'Call chat.goal claim with this goal, revision and round before any work. Only act if claimed is true. Use its context source for bound tool calls and settle the round after verifying results.'
+              :'Call chat.plan continue with this review_id before acting; only act if claimed is true. Follow the returned decision and reason. After implementing an approved plan, call chat.plan finish.',
+          }},value=>{category=value;});
+        status=response.status;retryAfter=this.parseRetryAfterMs(response);await response.body?.cancel();
+      }catch{/* A missing HTTP result leaves this wake retryable. */}
+      await this.store.transaction(async tx=>{
+        const live=await tx.get<CollaborationWake>(keyName);
+        if(live?.attempts!==wake.attempts)return;
+        if(status>=200&&status<300){await tx.delete(keyName);return;}
+        const retry=status===0||isChannelRetryable(status,category??'http_rejected');
+        const delay=MESSAGE_403_RETRY_DELAYS[wake.attempts-1];
+        if(retry&&delay!==undefined){
+          const next_at=Date.now()+Math.max(delay,retryAfter);await tx.put(keyName,{...live,next_at});await tx.requestAlarm?.(next_at);
+        }else{
+          await tx.delete(keyName);
+          if(round){
+            const current=await tx.get<Conversation>(key(chat.id)),goal=await tx.get<GoalRecord>(goalKey(chat.id));
+            if(current&&goal?.round?.id===round.id&&goal.round.state==='queued'){
+              changeGoal(goal,'block',{reason:{code:'wake-failed',message:'未能通知 Dot 开始目标轮次'}});
+              await this.discardGoalRound(tx,chat.id,goal);await tx.put(goalKey(chat.id),goal);await this.recordChange(tx,current);
+            }
+          }
+        }
+      });
+      await this.changed(chat.id);
+    }
+  }
+
   private async pump():Promise<void>{
     await this.initialize();
     const active=new Map<string,Promise<void>>();
@@ -2097,7 +2585,8 @@ export class ChatService {
     const maintenance=[...(await this.store.list<Maintenance>({prefix:'chat-maintenance:'})).values()].map(s=>s.next_at??undefined);
     const taskDue=[...(await this.store.list<Data>({prefix:'chat-super-agent-due:',limit:1})).values()][0]?.at;
     const taskWakes=[...(await this.store.list<Data>({prefix:'chat-super-agent-wake:'})).values()].map(w=>w.next_at);
-    const times=[head?.at,expiry?.at,channelDue,...maintenance,taskDue,...taskWakes].filter((v):v is number=>v!==undefined);return times.length?Math.min(...times):undefined;
+    const collaboration=[...(await this.store.list<CollaborationWake>({prefix:collaborationWakePrefix})).values()].map(wake=>wake.next_at??undefined);
+    const times=[head?.at,expiry?.at,channelDue,...maintenance,taskDue,...taskWakes,...collaboration].filter((v):v is number=>v!==undefined);return times.length?Math.min(...times):undefined;
   }
   private async cleanup():Promise<void>{
     for(const [k,s] of await this.store.list<{chat:string;id:string;expires_at:number}>({prefix:'chat-working-snapshot:'}))if(s.expires_at<=Date.now())await this.store.transaction(tx=>eraseWorkingSnapshot(tx,s.chat,s.id));
@@ -2128,7 +2617,7 @@ export class ChatService {
   async alarm():Promise<void>{
     await this.initialize();
     // Start ready delivery before cleanup; attachment reclamation is not on the delivery path.
-    await Promise.all([this.drain(),this.pumpChannelOutbox(),this.cleanup(),this.maintenanceAlarm(),this.superAgentAlarm()]);const next=await this.nextAlarm();if(next!==undefined)await this.env.schedule(next);
+    await Promise.all([this.drain(),this.drainCollaboration(),this.pumpChannelOutbox(),this.cleanup(),this.maintenanceAlarm(),this.superAgentAlarm()]);const next=await this.nextAlarm();if(next!==undefined)await this.env.schedule(next);
   }
 }
 

@@ -13,7 +13,7 @@ export function mathDocument(html,id,errors){
 }
 
 export function renderMessage(text,id='message') {
-  const {html,formulas}=parseMessage(text),env={formulas},errors=[];
+  const {html,formulas}=parseMessage(text,id),env={formulas},errors=[];
   if(!env.formulas.length)return {html,css:'',formulas:[],errors};
   const reusable=!env.formulas.some(f=>/\\(?:label|ref|eqref|tag|begin)\b/.test(f.tex));
   const key=JSON.stringify(env.formulas.map(({tex,display})=>[tex,display]));

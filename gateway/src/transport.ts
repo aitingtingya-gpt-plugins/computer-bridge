@@ -3,6 +3,7 @@ import type {DeviceSocket,HubContext} from './runtime';
 
 const interrupted=()=>Object.assign(new Error('连接已失效；原请求可继续恢复'),{code:'connection_interrupted'});
 const elapsed=()=>Object.assign(new Error('本次等待已结束；请使用原请求号继续恢复'),{code:'request_pending'});
+class SendRejected extends Error {}
 export const MAX_DEVICE_WIRE_BYTES=1024*1024;
 const MAX_REASSEMBLY_BYTES=8*1024*1024,MAX_FRAME_GROUPS=8,MAX_FRAMES=512;
 interface FrameGroup {parts:string[];bytes:number;sequence:number;timer:ReturnType<typeof setTimeout>}
@@ -74,9 +75,10 @@ export class DeviceTransport {
     if(a.failed) throw interrupted();
     ws.send(JSON.stringify(value));
   }
-  async send(ws:DeviceSocket,value:Data):Promise<void> {
+  async send(ws:DeviceSocket,value:Data,beforeSend?:()=>Promise<void>):Promise<void> {
     const previous=this.writers.get(ws) || Promise.resolve();
     const work=previous.catch(()=>{}).then(async()=>{
+      if(beforeSend)await beforeSend();
       const text=JSON.stringify(value),a=ws.deserializeAttachment() as Data;
       if(a.failed) throw interrupted();
       if(text.length<=131072){this.control(ws,value);return;}
@@ -159,7 +161,7 @@ export class DeviceTransport {
   }
   private dropFrame(key:string):void{const group=this.frames.get(key);if(group)clearTimeout(group.timer);this.frames.delete(key);}
   async rpc(device:string,method:string,params:Data,confirmed:boolean,signal:AbortSignal,receipt?:Data,
-    deadline=Date.now()+30_000):Promise<any> {
+    deadline=Date.now()+30_000,beforeSend?:()=>Promise<void>):Promise<any> {
     this.active++;
     try {
     while(true) {
@@ -170,7 +172,7 @@ export class DeviceTransport {
         const remaining=Math.max(0,deadline-Date.now());
         // Poll the original execution within the caller's remaining network budget.
         const args=method==='bridge.recover'?{...params,seconds:Math.min(params.seconds || 0,Math.max(0,(remaining-100)/1000))}:params;
-        return await this.once(ws,device,method,args,confirmed,signal,deadline,receipt);
+        return await this.once(ws,device,method,args,confirmed,signal,deadline,receipt,beforeSend);
       } catch(error) {
         if(signal.aborted || (error as Data).code!=='connection_interrupted' ||
           (!receipt && method!=='bridge.recover' && method!=='bridge.ping')) throw error;
@@ -192,7 +194,7 @@ export class DeviceTransport {
     }
   }
   private async once(ws:DeviceSocket,device:string,method:string,params:Data,confirmed:boolean,signal:AbortSignal,
-    deadline:number,receipt?:Data):Promise<any> {
+    deadline:number,receipt?:Data,beforeSend?:()=>Promise<void>):Promise<any> {
     const id=opaque(),a=ws.deserializeAttachment() as Data;
     let delivery:ReturnType<typeof setTimeout>|undefined;
     const promise=new Promise((resolve,reject)=>this.pending.set(id,{socket:ws,device,accepted:false,receipt_id:receipt?.id,
@@ -201,8 +203,17 @@ export class DeviceTransport {
     const timer=setTimeout(()=>this.pending.get(id)?.reject(elapsed()),Math.max(0,deadline-Date.now()));
     signal.addEventListener('abort',abort,{once:true});
     const start=Date.now();
+    const validate=beforeSend?async()=>{
+      try{
+        signal.throwIfAborted();
+        if(Date.now()>=deadline)throw elapsed();
+        await beforeSend();
+        signal.throwIfAborted();
+        if(Date.now()>=deadline)throw elapsed();
+      }catch(error){this.pending.get(id)?.reject(error as Error);throw new SendRejected();}
+    }:undefined;
     void this.send(ws,{type:'request',id,method,params,confirmed,
-      ...(receipt?{request_id:receipt.id,fingerprint:receipt.fingerprint}:{})}).then(()=>{
+      ...(receipt?{request_id:receipt.id,fingerprint:receipt.fingerprint}:{})},validate).then(()=>{
         if(!this.pending.has(id)) return;
         if(a.transport_v2) {
           if(!this.pending.get(id)?.accepted) delivery=setTimeout(()=>this.invalidate(ws,'delivery_timeout'),10_000);
@@ -211,7 +222,7 @@ export class DeviceTransport {
           void this.once(ws,device,'bridge.ping',{},false,signal,Math.min(deadline,Date.now()+10_000))
             .catch(()=>{if(!signal.aborted && this.pending.has(id))this.invalidate(ws,'legacy_probe_timeout');});
         }
-      }).catch(()=>this.invalidate(ws,'send_failed'));
+      }).catch(error=>{if(!(error instanceof SendRejected))this.invalidate(ws,'send_failed');});
     try {if(signal.aborted)abort();return await promise;}
     finally {
       clearTimeout(timer);if(delivery)clearTimeout(delivery);this.pending.delete(id);signal.removeEventListener('abort',abort);

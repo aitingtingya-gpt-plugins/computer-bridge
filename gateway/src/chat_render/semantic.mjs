@@ -18,7 +18,7 @@ function formulaErrors(tree){
 
 /** Compile one complete message, sharing macros and references only within it. */
 export function compileMessage(text,id='message'){
-  const parsed=parseMessage(text),errors=[];
+  const parsed=parseMessage(text,id),errors=[];
   if(!parsed.formulas.length)return {id,formulas:[],errors};
   const document=semanticDocument(parsed.html,id,errors);
   document.findMath({elements:['.cb-math-target']});document.compile();

@@ -657,16 +657,6 @@
       "path": "src/sources/registry.ts",
       "git_blob_sha1": "a4e0e77b84629a635ac909c309da3017ea5f24ec",
       "sha256": "fe8a8fce0b00b65d4fb69b7cd2e5fbf4950b8dc32f0891169f9150c4a16eb5cd"
-    },
-    {
-      "path": "tests/core-engine.spec.ts",
-      "git_blob_sha1": "733d134a7d60f150a9b53897994a678571859c52",
-      "sha256": "e29358c139a2dbb1a2877e980e043f34cf39bca1905fb10ee14e0b4866bc1a6b"
-    },
-    {
-      "path": "tests/stage.spec.ts",
-      "git_blob_sha1": "ab49b09c95a2fe621fa3cdcf21ac4c609a7b6f91",
-      "sha256": "3df130eae87d70643f0c924caf66fbca8cb27ced50467e0c7283dee0a39436be"
     }
   ]
 }

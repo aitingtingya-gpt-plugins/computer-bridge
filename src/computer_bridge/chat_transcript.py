@@ -1,11 +1,11 @@
-"""Incremental terminal history with inline, keyboard-accessible approval cards."""
+"""Incremental terminal history with keyboard-accessible review entries."""
 from __future__ import annotations
 
 import asyncio
 from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
 from prompt_toolkit.application.current import get_app
@@ -22,7 +22,7 @@ from .common import Json
 
 Fragment = tuple[str, str, tuple[str, str] | None]
 Row = list[Fragment]
-Anchor = tuple[int | None, int, int, int]
+Anchor = tuple[int | str | None, int, int, int]
 RenderKey = tuple[int, str, str, int]
 TextPoint = tuple[int, int, int]  # message sequence, logical row in that message, source character
 
@@ -35,10 +35,36 @@ def beijing_message_time(value: Any) -> str:
         instant = datetime.fromisoformat(value)
         # Legacy timestamps without an offset still originate in UTC.
         if instant.tzinfo is None:
-            instant = instant.replace(tzinfo=timezone.utc)
+            instant = instant.replace(tzinfo=UTC)
         return instant.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
     except (TypeError, ValueError, OverflowError, OSError):
         return "时间未知"
+
+
+def approval_kind(card: Json) -> str:
+    if card.get("module_confirmation"):
+        return "work_tree"
+    return "tool" if card.get("tool") else "command"
+
+
+def approval_detail_lines(card: Json) -> list[str]:
+    """Render the original, persisted request for both history and the reader."""
+    device = str(card["device_id"])
+    name = str(card.get("device_name", device))
+    kind = approval_kind(card)
+    lines = ["设备：" + (f"{name} · {device}" if name != device else device)]
+    for label, key in (("目录", "cwd"), ("命令" if kind == "command" else "工具调用", "command"), ("理由", "justification")):
+        lines.extend((label + "：" if index == 0 else "  ") + line.expandtabs(8)
+                     for index, (_, line) in enumerate(source_lines(str(card[key]))))
+    expires = datetime.fromtimestamp(float(card["expires_at"]) / 1000, UTC)
+    lines.append("到期：" + beijing_message_time(expires.isoformat()))
+    if kind == "work_tree":
+        lines.extend(line for _, line in source_lines(str(card["module_confirmation"])))
+    if card.get("permission_confirmation"):
+        lines.append("本次同时申请使用设备命令工具。" if kind == "command" else "本次同时申请使用设备工具。")
+    lines.append("仅本次命令、子进程与后续输入使用当前用户权限，在工作区限制外运行。" if kind == "command" else
+                 "仅批准本次调用，工作区限制保持不变。")
+    return lines
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,11 +151,18 @@ class TranscriptWindow(Window):
 class ChatTranscript(UIControl):
     """Keep message lines separately; only visible lines enter the renderer."""
 
-    def __init__(self, status: Callable[[Json], str], decide: Callable[[str, str], None]):
-        self.status, self.decide = status, decide
+    def __init__(self, status: Callable[[Json], str], open_review: Callable[[str, str], None]):
+        self.status, self.open_review = status, open_review
         self.messages: dict[int, Json] = {}
         self.user_name = "本机"
         self.maintenance_statuses: dict[str, Json] = {}
+        self.plan_reviews: dict[str, Json] = {}
+        self.plans_at: dict[int, set[str]] = {}
+        self.plan_documents: dict[str, tuple[str, int, Body]] = {}
+        self.review_offsets: dict[str, tuple[int, int]] = {}
+        self.review_positions: dict[str, list[int]] = {}
+        self.approval_sequences: dict[str, int] = {}
+        self.approval_errors: dict[str, str] = {}
         self.leading_rows: list[Row] = []
         self.order: list[int] = []
         self.lines: dict[int, list[Row]] = {}
@@ -151,7 +184,6 @@ class ChatTranscript(UIControl):
         self.pending_anchor: Anchor | None = None
         self.wrap_computations = 0
         self.following = True
-        self.expanded: set[str] = set()
         self.busy: set[str] = set()
         self.actions: list[tuple[tuple[str, str], int]] = []
         self.selected: tuple[str, str] | None = None
@@ -180,10 +212,9 @@ class ChatTranscript(UIControl):
         for key,(sequence,body) in self.ready_documents.items():
             if self._current_document(key,sequence):
                 _,_,text,columns=key
-                current=self.messages[sequence]
                 self.documents[sequence]=(text,columns,body)
                 self.bodies.pop(sequence,None)
-                self.lines[sequence]=self._format(current);changed=True
+                self._refresh_segment(sequence);changed=True
         self.ready_documents.clear()
         if changed:self._index(anchor);get_app().invalidate()
 
@@ -252,15 +283,81 @@ class ChatTranscript(UIControl):
             rows.append(self.row(""))
         return rows
 
+    def _plan_rows(self, sequence: int, start: int) -> list[Row]:
+        rows: list[Row] = []
+        for item in sorted((self.plan_reviews[identifier] for identifier in self.plans_at.get(sequence, ())),
+                           key=lambda item: (item['created_revision'], item['id'])):
+            identifier, markdown = str(item['id']), str(item['markdown'])
+            self.review_offsets[identifier] = sequence, start + len(rows)
+            state = {'pending': '待审', 'rejected': '已要求修改', 'cancelled': '已取消'}.get(item['state'], '已同意')
+            state = {'normal': '已同意 · 普通模式', 'auto': '已同意 · 自动模式'}.get(item.get('decision', ''), state)
+            heading = self.row('◇ 计划 · ', 'class:approval.heading')
+            heading.append(('class:approval.button' if item['state'] == 'pending' else 'class:approval.heading',
+                            state, (identifier, 'plan') if item['state'] == 'pending' else None))
+            rows.append(heading)
+            document = self.plan_documents.get(identifier)
+            if document and document[0] == markdown:
+                rows.extend(document[2].rows)
+                positions = list(document[2].sources)
+                if document[1] != self.format_width:
+                    self._prepare_plan(identifier, markdown)
+            elif self.markdown:
+                self._prepare_plan(identifier, markdown)
+                rows.append(self.row('正在排版方案…', 'class:hint'))
+                positions = [0]
+            else:
+                source = list(source_lines(markdown))
+                rows.extend(self.row(line.expandtabs(8)) for _, line in source)
+                positions = [offset for offset, _ in source]
+            if item.get('reason'):
+                for offset, line in source_lines('修改理由：' + str(item['reason'])):
+                    rows.append(self.row(line, 'class:hint'))
+                    positions.append(len(markdown) + 1 + offset)
+            rows.append(self.row(''))
+            self.review_positions[identifier] = [-1, *positions, max(positions[-1] + 1 if positions else 0, len(markdown) + 1)]
+        return rows
+
+    def _prepare_plan(self, identifier: str, markdown: str) -> None:
+        if self.markdown is None:
+            return
+        worker, columns = self.markdown, self.format_width
+        key = (self.generation, 'review:' + identifier, markdown, columns)
+        if key in worker.tasks:
+            return
+
+        async def prepare() -> None:
+            try:
+                body = await worker.body(markdown, key[1], columns)
+                current = self.plan_reviews.get(identifier)
+                if current and current['markdown'] == markdown and self.generation == key[0] and self.format_width == columns:
+                    anchor = self._anchor()
+                    self.plan_documents[identifier] = markdown, columns, body
+                    sequence = int(current['anchor_sequence'])
+                    if sequence in self.messages:
+                        self._refresh_segment(sequence)
+                    self._index(anchor)
+                    get_app().invalidate()
+            finally:
+                if worker.tasks.get(key) is asyncio.current_task():
+                    worker.tasks.pop(key, None)
+
+        worker.tasks[key] = asyncio.create_task(prepare())
+
     def _format(self, message: Json) -> list[Row]:
         rows = self._format_message(message)
         sequence = int(message["sequence"])
         maintenance = self._maintenance_rows(sequence)
+        reviews = self._plan_rows(sequence, len(rows) + len(maintenance))
         if sequence in self.source_positions:
             positions = self.source_positions[sequence][:len(rows)]
-            positions.extend(len(message["text"]) + 2 + offset for offset in range(len(maintenance)))
+            positions.extend(len(message["text"]) + 2 + offset for offset in range(len(maintenance) + len(reviews)))
             self.source_positions[sequence] = positions
-        return [*rows, *maintenance]
+        return [*rows, *maintenance, *reviews]
+
+    def _refresh_segment(self, sequence: int) -> None:
+        self.lines[sequence] = self._format(self.messages[sequence])
+        self.segment_actions[sequence] = [(action, offset) for offset, row in enumerate(self.lines[sequence])
+                                          for _, _, action in row if action]
 
     def _format_message(self, message: Json) -> list[Row]:
         self.formatted_messages += 1
@@ -270,35 +367,32 @@ class ChatTranscript(UIControl):
         if approval:
             identifier = str(approval["id"])
             pending = approval["state"] == "pending" and not approval.get("decision")
-            tool = bool(approval.get("tool"))
-            decision = {"allowed-once": "已批准本次调用" if tool else "已批准本次命令", "rejected": "已拒绝", "cancelled": "已取消"}.get(approval.get("decision"), "")
-            label = "授权已变化" if approval["state"] == "invalidated" else decision or {
-                "pending": "工具审批" if tool else "命令审批", "expired": "审批已过期", "ended": "审批已结束"
-            }.get(approval["state"], "审批已处理")
+            kind = approval_kind(approval)
+            decision = {"allowed-once": "已批准本次命令" if kind == "command" else "已批准本次调用",
+                        "rejected": "已拒绝", "cancelled": "已取消"}.get(approval.get("decision"), "")
+            state = approval["state"]
+            if state in {"invalidated", "expired", "revoked"}:
+                label = {"invalidated": "授权已变化", "expired": "审批已过期", "revoked": "授权已撤销"}[state]
+            elif state == "ended" and approval.get("decision") == "allowed-once":
+                label = decision + " · 审批已结束"
+            elif pending:
+                label = {"work_tree": "Work Tree 启动确认", "tool": "工具审批", "command": "命令审批"}[kind]
+            else:
+                label = decision or "审批已处理"
             if approval.get("delivery_pending"):
-                label += " · 决定等待送达"
-            rows = [self.row("┌ " + label, "class:approval.heading"),
-                    self.row("│ " + str(approval.get("device_name", approval["device_id"])) + " · " + str(approval["device_id"]))]
-            if pending or identifier in self.expanded:
-                for title, value in (("目录", approval["cwd"]), ("工具调用" if tool else "命令", approval["command"]), ("理由", approval["justification"])):
-                    rows.extend(self.row("│ " + (title + "：" if index == 0 else "  ") + line)
-                                for index, line in enumerate(str(value).splitlines() or [""]))
-                expires = beijing_message_time(datetime.fromtimestamp(float(approval["expires_at"]) / 1000, timezone.utc).isoformat())
-                rows.append(self.row("│ 到期：" + expires))
-                if approval.get("permission_confirmation"):
-                    rows.append(self.row("│ 本次同时申请使用命令工具。", "class:hint"))
-                rows.append(self.row("│ 仅批准本次调用，工作区限制保持不变。" if tool else
-                    "│ 仅本次命令、子进程与后续输入使用当前用户权限，在工作区限制外运行。", "class:hint"))
+                label += " · 决定已保存，等待送达"
+            lines = approval_detail_lines(approval)
+            rows = [self.row("┌ " + label, "class:approval.heading")]
+            rows.extend(self.row("│ " + line) for line in (lines if pending else lines[:1]))
             if pending:
                 if identifier in self.busy:
                     rows.append(self.row("│ 正在保存决定…", "class:status"))
                 else:
-                    rows.append([( "", "│ ", None),
-                        ("class:approval.button", " 批准本次 ", (identifier, "allowed-once")), ("", "  ", None),
-                        ("class:approval.button", " 拒绝 ", (identifier, "rejected")), ("", "  ", None),
-                        ("class:approval.button", " 取消调用 " if tool else " 取消命令 ", (identifier, "cancelled"))])
+                    rows.append([("", "│ ", None), ("class:approval.button", " 审阅 ", (identifier, "approval"))])
             else:
-                rows.append([("", "│ ", None), ("class:approval.button", " 收起详情 " if identifier in self.expanded else " 查看详情 ", (identifier, "details"))])
+                rows.append([("", "│ ", None), ("class:approval.button", " 查看详情 ", (identifier, "details"))])
+            if pending and identifier in self.approval_errors:
+                rows.append(self.row('│ ' + self.approval_errors[identifier], 'class:hint'))
             return [*rows, self.row("└"), self.row("")]
         sender = "Super Agent" if message.get("source") == "module" else "GPT / Dot" if message["role"] == "assistant" else self.user_name
         sender = "▐ " + sender + " ▌"
@@ -328,7 +422,8 @@ class ChatTranscript(UIControl):
 
     def update(self, messages: Iterable[Json] = (), *, reset: bool = False,
                older: bool = False, history_state: str = "", history_complete: bool = False,
-               user_name: str | None = None, maintenance_statuses: Iterable[Json] | None = None) -> None:
+               user_name: str | None = None, maintenance_statuses: Iterable[Json] | None = None,
+               plan_reviews: Iterable[Json] = ()) -> None:
         anchor = self._anchor()
         changed = reset
         if reset:
@@ -342,9 +437,13 @@ class ChatTranscript(UIControl):
             if self.document_flush:self.document_flush.cancel();self.document_flush=None
             self.messages.clear(); self.order.clear(); self.lines.clear()
             self.maintenance_statuses.clear()
+            self.plan_reviews.clear(); self.plans_at.clear(); self.plan_documents.clear()
+            self.review_offsets.clear(); self.review_positions.clear()
+            self.approval_sequences.clear()
+            self.approval_errors.clear()
             self.bodies.clear()
             self.segment_actions.clear()
-            self.expanded.clear(); self.busy.clear(); self.selected = None
+            self.busy.clear(); self.selected = None
             self.clear_selection()
             self.following = True
         refresh: set[int] = set()
@@ -364,18 +463,33 @@ class ChatTranscript(UIControl):
                     if old is not None:
                         refresh.add(int(old["anchor_sequence"]))
                     changed = True
+        for item in plan_reviews:
+            identifier = str(item['id'])
+            old = self.plan_reviews.get(identifier)
+            if old is not None and old['updated_revision'] > item['updated_revision']:
+                continue
+            if old != item:
+                sequence = int(item['anchor_sequence'])
+                self.plan_reviews[identifier] = item
+                if old:
+                    previous = int(old['anchor_sequence'])
+                    self.plans_at[previous].discard(identifier)
+                    refresh.add(previous)
+                self.plans_at.setdefault(sequence, set()).add(identifier)
+                refresh.add(sequence)
+                changed = True
         for message in messages:
             sequence = int(message["sequence"])
             if self.messages.get(sequence) != message:
                 if sequence not in self.messages:
                     insort(self.order, sequence)
+                if approval := message.get('approval'):
+                    self.approval_sequences[str(approval['id'])] = sequence
                 self.messages[sequence] = message
                 refresh.add(sequence)
                 changed = True
         for sequence in refresh & self.messages.keys():
-            self.lines[sequence] = self._format(self.messages[sequence])
-            self.segment_actions[sequence] = [(action, offset) for offset, row in enumerate(self.lines[sequence])
-                                              for _, _, action in row if action]
+            self._refresh_segment(sequence)
             changed = True
         if older != self.older:
             self.older = older; changed = True
@@ -395,7 +509,7 @@ class ChatTranscript(UIControl):
             return None
         screen = self.top
         logical = bisect_right(self.display_starts, screen) - 1
-        if logical < len(self.leading_rows) and self.order:
+        if logical < len(self.leading_rows) and self.order and self._review_anchor(logical) is None:
             screen = self.display_starts[self.starts[0]]
         last_visible = min(self.display_count - 1, self.top + self.height - 1)
         while screen < last_visible and not any(text.strip() for _, text, _ in self._screen_row(screen).fragments):
@@ -403,6 +517,14 @@ class ChatTranscript(UIControl):
         logical = bisect_right(self.display_starts, screen) - 1
         line = self.display_rows[logical][screen - self.display_starts[logical]]
         screen_offset = screen - self.top
+        review = self._review_anchor(logical)
+        if review:
+            identifier, offset = review
+            review_positions = self.review_positions[identifier]
+            origin = logical - offset
+            character = line.start + sum(sum(len(text) for _, text, _ in self._row(row))
+                for row in range(origin + bisect_left(review_positions, review_positions[offset]), logical))
+            return identifier, review_positions[offset], character, screen_offset
         index = bisect_right(self.starts, logical) - 1
         if index >= 0 and index < len(self.order):
             sequence = self.order[index]
@@ -416,6 +538,25 @@ class ChatTranscript(UIControl):
                 return sequence, positions[offset] if positions else offset, character, screen_offset
         return None, logical, line.start, screen_offset
 
+    def _review_start(self, identifier: str) -> int | None:
+        location = self.review_offsets.get(identifier)
+        if not location or self.plan_reviews[identifier]['anchor_sequence'] != location[0]:
+            return None
+        sequence, offset = location
+        if not sequence:
+            return None if self.older else offset
+        index = bisect_left(self.order, sequence)
+        return self.starts[index] + offset if sequence in self.messages else None
+
+    def _review_anchor(self, logical: int) -> tuple[str, int] | None:
+        segment = bisect_right(self.starts, logical) - 1
+        sequence = self.order[segment] if segment >= 0 else 0
+        for identifier in self.plans_at.get(sequence, ()):
+            start = self._review_start(identifier)
+            if start is not None and start <= logical < start + len(self.review_positions[identifier]):
+                return identifier, logical - start
+        return None
+
     def _index(self, anchor: Anchor | None = None) -> None:
         self.starts = []
         self.actions = []
@@ -426,6 +567,9 @@ class ChatTranscript(UIControl):
                 "已到最早消息" if self.history_complete else ""), "class:hint"))
         if not self.older:
             self.leading_rows.extend(self._maintenance_rows(0))
+            self.leading_rows.extend(self._plan_rows(0, len(self.leading_rows)))
+        self.actions.extend((action, offset) for offset, row in enumerate(self.leading_rows)
+                            for _, _, action in row if action)
         count = len(self.leading_rows)
         for sequence in self.order:
             self.starts.append(count)
@@ -464,9 +608,9 @@ class ChatTranscript(UIControl):
                 for task in tuple(self.markdown.tasks.values()):task.cancel()
                 self.markdown.tasks.clear();self.pending_documents.clear()
             for sequence in self.order:
-                if self.messages[sequence].get('kind')!='approval':
+                if self.messages[sequence].get('kind') != 'approval' or self.plans_at.get(sequence):
                     self.bodies.pop(sequence,None)
-                    self.lines[sequence]=self._format(self.messages[sequence])
+                    self._refresh_segment(sequence)
             self._index(anchor)
             anchor = self._anchor()
         if self.dirty or width != self.width:
@@ -490,7 +634,17 @@ class ChatTranscript(UIControl):
             self.width = width
             if anchor is not None and not self.following:
                 anchor_sequence, logical, character, screen_offset = anchor
-                if anchor_sequence is not None and anchor_sequence in self.messages:
+                if isinstance(anchor_sequence, str) and (start := self._review_start(anchor_sequence)) is not None:
+                    review_positions = self.review_positions[anchor_sequence]
+                    offset = min(bisect_left(review_positions, logical), len(review_positions) - 1)
+                    while offset + 1 < len(review_positions) and review_positions[offset + 1] == review_positions[offset]:
+                        size = sum(len(text) for _, text, _ in self._row(start + offset))
+                        if character < size:
+                            break
+                        character -= size
+                        offset += 1
+                    logical = start + offset
+                elif isinstance(anchor_sequence, int) and anchor_sequence in self.messages:
                     index = bisect_right(self.order, anchor_sequence) - 1
                     positions=self.source_positions.get(anchor_sequence)
                     offset=max(0,bisect_left(positions,logical)) if positions else logical
@@ -595,6 +749,13 @@ class ChatTranscript(UIControl):
     def page(self, direction: int) -> None:
         self.scroll(direction * max(1, self.height - 1))
 
+    def follow_latest(self) -> None:
+        self.following = True
+        self.pending_anchor = None
+        self.selected = None
+        self._layout(self.width, self.height)
+        get_app().invalidate()
+
     def move_cursor_up(self) -> None:
         self.scroll(-1)
 
@@ -613,7 +774,37 @@ class ChatTranscript(UIControl):
         if not 0 <= index < len(actions):
             self.selected = None
             return False
-        self.selected, logical = self.actions[index]
+        return self._focus_action(*self.actions[index])
+
+    def focus_approval(self, identifier: str) -> bool:
+        return next((self._focus_action(action, logical) for action, logical in self.actions
+                     if action == (identifier, 'approval')), False)
+
+    def approval(self, identifier: str) -> Json | None:
+        sequence = self.approval_sequences.get(identifier)
+        return self.messages[sequence]["approval"] if sequence is not None else None
+
+    def reveal_approval(self, identifier: str) -> None:
+        self._layout(self.width, self.height)
+        sequence = self.approval_sequences.get(identifier)
+        if sequence is not None:
+            self._reveal(self.starts[bisect_left(self.order, sequence)])
+
+    def reveal_plan(self, identifier: str) -> None:
+        self._layout(self.width, self.height)
+        logical = self._review_start(identifier)
+        if logical is not None:
+            self._reveal(logical)
+
+    def _reveal(self, logical: int) -> None:
+        maximum = max(0, self.display_count - self.height)
+        self.top = min(self.display_starts[logical], maximum)
+        self.following = self.top == maximum
+        self.selected = None
+        get_app().invalidate()
+
+    def _focus_action(self, selected: tuple[str, str], logical: int) -> bool:
+        self.selected = selected
         self.following = False
         self._layout(self.width, self.height)
         parts = self.display_rows[logical]
@@ -631,24 +822,15 @@ class ChatTranscript(UIControl):
         action = action or self.selected
         if not action:
             return
-        identifier, decision = action
-        if decision == "details":
-            if identifier in self.expanded:
-                self.expanded.remove(identifier)
-            else:
-                self.expanded.add(identifier)
-            self.refresh_approval(identifier)
-        elif identifier not in self.busy:
-            self.decide(identifier, decision)
+        identifier, entry = action
+        if identifier not in self.busy:
+            self.open_review(identifier, entry)
 
     def refresh_approval(self, identifier: str) -> None:
         anchor = self._anchor()
-        for sequence in self.order:
-            if self.messages[sequence].get("approval", {}).get("id") == identifier:
-                self.lines[sequence] = self._format(self.messages[sequence])
-                self.segment_actions[sequence] = [(action, offset) for offset, row in enumerate(self.lines[sequence])
-                                                  for _, _, action in row if action]
-                break
+        sequence = self.approval_sequences.get(identifier)
+        if sequence is not None:
+            self._refresh_segment(sequence)
         self._index(anchor)
         get_app().invalidate()
 

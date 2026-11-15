@@ -28,6 +28,8 @@ COMMANDS = (
     Command("/quote", "[消息 ID | cancel]", "引用 dot 消息或取消引用"),
     Command("/resume", "[对话 ID]", "按名称选择历史对话"),
     Command("/new", "[标题]", "选择 Chat / Super Agent 并新建对话"),
+    Command("/goal", "[目标 | edit 目标 | pause | resume | clear]", "查看或管理当前目标", modes=frozenset({"chat"})),
+    Command("/plan", "[规划请求 | off]", "进入计划模式或返回普通", modes=frozenset({"chat"})),
     Command("/tasks", "", "Super Agent：查看任务", modes=frozenset({"super_agent"})),
     Command("/task", "任务 ID [内容]", "Super Agent：查看或定向跟进任务", True, modes=frozenset({"super_agent"})),
     Command("/task-new", "任务内容", "Super Agent：新建任务", True, modes=frozenset({"super_agent"})),
@@ -49,6 +51,8 @@ COMMANDS = (
     Command("/theme", "", "选择终端主题"),
     Command("/login", "", "登录账号，访问账号授权的电脑"),
     Command("/logout", "", "返回本机身份"),
+    Command("/status", "", "查看当前对话、待审阅与连接详细状态"),
+    Command("/update", "[stable | beta | alpha]", "检查并从 GitHub 更新本机客户端"),
     Command("/delete", "", "删除当前对话及其服务器附件"),
     Command("/quit", "", "退出终端，保留模型连接（别名 /exit；快捷 /q、/e）"),
 )
@@ -64,6 +68,7 @@ HELP_KEYS = (
     "\nShift+方向键 选择文字（↑/↓ 按可视行）· F4 清空输入框（Mac 可能需 Fn+F4，可撤销）"
     "\n选中文字后 Ctrl+C / Ctrl+Insert 复制 · 右键打开系统复制／粘贴菜单"
     "\nMac 右键打开复制菜单 · Esc 或点击外部取消"
+    "\nF6 审阅或领取审批 · 审阅时按底部键位提示操作"
     "\nPageUp/PageDown 滚动 · Ctrl+Q 退出\n"
 )
 
@@ -77,7 +82,8 @@ def commands_for_mode(mode: str | None = "chat") -> tuple[Command, ...]:
 
 def help_for_mode(mode: str | None = "chat") -> str:
     return "\n".join(command.usage + "  ·  " + command.description
-                     for command in commands_for_mode(mode)) + HELP_KEYS
+                     for command in commands_for_mode(mode)) + HELP_KEYS + (
+                         "\nChat 输入框 Shift+Tab：普通 → 计划 → 自动 → 普通\n" if mode != "super_agent" else "")
 
 
 # Safe default for older consumers; active terminals use help_for_mode instead.

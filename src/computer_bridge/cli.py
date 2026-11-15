@@ -265,12 +265,115 @@ def package(server: str, destination: Path) -> Json:
     return {"plugin": str(destination), "server": server, "credentials_in_package": False}
 
 
+def update_channel_prompt() -> str:
+    print("请选择更新渠道：", flush=True)
+    print("  1. 正式版 (stable) — 仅正式发布版本", flush=True)
+    print("  2. b测 (beta)      — 包含正式版与 Beta 版本", flush=True)
+    print("  3. a测 (alpha)     — 包含正式版、Beta 与 Alpha 版本", flush=True)
+    return input("输入序号或名称 [默认 1]: ")
+
+
+async def run_update_cli(
+    config: Path,
+    *,
+    channel: str | None = None,
+    channel_flag: str | None = None,
+    yes: bool = False,
+    check_only: bool = False,
+    repository: str | None = None,
+    api_base: str | None = None,
+) -> Json:
+    from .github_update import (
+        CHANNEL_LABELS,
+        DEFAULT_REPOSITORY,
+        GITHUB_API_URL,
+        current_installed_version,
+        fetch_latest_release,
+        install_client_release,
+        is_newer_version,
+        load_device_settings,
+        normalize_channel,
+        parse_version,
+    )
+
+    if channel and channel_flag and normalize_channel(channel) != channel_flag:
+        raise Error("update_channel", "不能同时指定相互冲突的更新渠道")
+    if channel_flag:
+        resolved_channel = channel_flag
+    elif channel:
+        resolved_channel = normalize_channel(channel)
+    elif sys.stdin.isatty():
+        resolved_channel = normalize_channel(update_channel_prompt())
+    else:
+        resolved_channel = "stable"
+
+    repo = (repository or DEFAULT_REPOSITORY).strip()
+    home_dir = config.parent
+    current = current_installed_version(home_dir)
+    settings = load_device_settings(home_dir)
+    print(f"当前版本：{current}（渠道：{CHANNEL_LABELS[resolved_channel]} · 仓库：{repo}）", flush=True)
+    release = await fetch_latest_release(
+        settings,
+        channel=resolved_channel,
+        repository=repo,
+        api_base=api_base or GITHUB_API_URL,
+    )
+    if release is None:
+        print(f"所选渠道（{CHANNEL_LABELS[resolved_channel]}）暂无可用客户端发布版本。", flush=True)
+        return {"updated": False, "reason": "no_release", "channel": resolved_channel, "current_version": current}
+
+    latest = str(release["version"])
+    if not is_newer_version(latest, current):
+        if parse_version(latest) == parse_version(current):
+            print(f"当前已是所选渠道最新版本（{current}）。", flush=True)
+        else:
+            print(f"当前版本（{current}）已高于所选渠道最新版本（{latest}），无需更新（不自动降级）。", flush=True)
+        return {
+            "updated": False,
+            "reason": "up_to_date",
+            "channel": resolved_channel,
+            "current_version": current,
+            "latest_version": latest,
+        }
+
+    print(f"发现新版本：{current} -> {latest}", flush=True)
+    if release.get("published_at"):
+        print(f"发布时间：{release['published_at']}", flush=True)
+    notes = str(release.get("notes") or "").strip()
+    if notes:
+        summary = "\n".join(notes.splitlines()[:10])[:600]
+        print(f"更新说明：\n{summary}", flush=True)
+    if check_only:
+        return {
+            "updated": False,
+            "check_only": True,
+            "available": True,
+            "channel": resolved_channel,
+            "current_version": current,
+            "latest_version": latest,
+        }
+    if not yes:
+        if not sys.stdin.isatty():
+            raise Error("update_confirmation_required", "非交互终端检测到新版本，请使用 -y / --yes 确认安装")
+        answer = input(f"是否立即更新到 {latest}？[y/N]: ").strip().lower()
+        if answer not in {"y", "yes", "是"}:
+            print("已取消更新。", flush=True)
+            return {"updated": False, "reason": "cancelled", "channel": resolved_channel, "current_version": current}
+
+    result = await install_client_release(home_dir, release, progress=lambda text: print(text, flush=True))
+    print(f"更新完成：{result['version']}（安装 ID: {result['id']}）", flush=True)
+    return {"updated": True, **result}
+
+
 def main(argv: list[str] | None = None) -> None:
     if os.name == "nt":
         os.environ["PYTHONUTF8"] = "1"
         for stream in (sys.stdout, sys.stderr):
             if stream is not None and hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8")
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if len(effective_argv) >= 2 and effective_argv[0] == "chat" and effective_argv[1] == "update":
+        effective_argv = ["update", *effective_argv[2:]]
     parser = argparse.ArgumentParser(prog="computer-bridge")
     parser.add_argument("--version", action="version", version=__version__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -287,6 +390,7 @@ def main(argv: list[str] | None = None) -> None:
         "module",
         "network",
         "chat",
+        "update",
     ]:
         item = commands.add_parser(name)
         item.add_argument("--config", type=Path, default=home() / "device.json")
@@ -307,10 +411,28 @@ def main(argv: list[str] | None = None) -> None:
             item.add_argument("action", choices=["enable", "disable"])
             item.add_argument("name")
             item.add_argument("--package")
+        elif name == "update":
+            item.add_argument("channel", nargs="?", help="更新渠道：stable（正式版）/ beta（b测）/ alpha（a测）")
+            group = item.add_mutually_exclusive_group()
+            group.add_argument(
+                "--stable", action="store_const", const="stable", dest="channel_flag", help="仅检查或更新正式版"
+            )
+            group.add_argument(
+                "--beta", action="store_const", const="beta", dest="channel_flag",
+                help="检查或更新 b测（包含正式版与 beta）",
+            )
+            group.add_argument(
+                "--alpha", action="store_const", const="alpha", dest="channel_flag",
+                help="检查或更新 a测（包含正式版、beta 与 alpha）",
+            )
+            item.add_argument("-y", "--yes", action="store_true", help="发现新版本后直接安装，不再次确认")
+            item.add_argument("--check", action="store_true", help="仅检查更新，不执行安装")
+            item.add_argument("--repo", help="GitHub 仓库（owner/repo）")
+            item.add_argument("--api-base", help=argparse.SUPPRESS)
     item = commands.add_parser("package")
     item.add_argument("--server", required=True)
     item.add_argument("--destination", type=Path, required=True)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(effective_argv)
     try:
         if hasattr(args, "config"):
             args.config = args.config.expanduser().resolve()
@@ -322,6 +444,19 @@ def main(argv: list[str] | None = None) -> None:
             from .chat import run
 
             asyncio.run(run(args.config, args.resume, browser=not args.no_browser, login=args.login))
+            return
+        elif args.command == "update":
+            asyncio.run(
+                run_update_cli(
+                    args.config,
+                    channel=args.channel,
+                    channel_flag=args.channel_flag,
+                    yes=args.yes,
+                    check_only=args.check,
+                    repository=args.repo,
+                    api_base=args.api_base,
+                )
+            )
             return
         elif args.command == "network":
             from .network import proxy_for

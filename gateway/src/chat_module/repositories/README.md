@@ -37,7 +37,7 @@ CNB directory responses use `{type: "tree", entries: [...]}`, files use `{type: 
 
 ## Verification and limits
 
-`npm run check --prefix gateway` and `npm run build --prefix gateway` validate TypeScript contracts and server bundling. Deterministic security-boundary tests remain in the internal repository and are not live platform authentication checks.
+`npm run check --prefix gateway` and `npm run test:chat --prefix gateway` include the repository tests. These are deterministic fixtures and security-boundary tests, not live platform authentication checks. Service integration covers stored-binding isolation, ignored injected credentials, no-binding behavior and ACL revocation while a read is in flight.
 
 Live checks performed during implementation:
 

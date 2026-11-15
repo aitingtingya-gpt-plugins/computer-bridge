@@ -28,13 +28,3 @@ disk chunks when no replacement exists in SQLite. Each operation closes its
 database handle. This preserves Windows server support without claiming that an
 unsupported directory fsync succeeded. Real Windows filesystem verification is
 still part of release qualification.
-
-## Mature implementation assessment
-
-The web chat uses pinned `tus-js-client` 4.3.1, including pause/resume, bounded requests and CSRF headers. A real Node HTTP compatibility test with this client, SQLite and disk blobs is part of `npm test`. Production-browser and Cloudflare runtime checks remain release verification steps. The legacy client is used only when protocol discovery confirms the server does not support tus; authorization and network failures do not trigger a silent fallback.
-
-The established `@tus/server` / `@tus/file-store` stack is a better default for a new standalone Node tus service. This gateway already has one shared Fetch/ReadableStream service running on both Node and Cloudflare, existing device/account authorization, transactional chat metadata, and a fixed-chunk attachment backend. A separate file-store server would duplicate resource ownership and expiration, bypass those transactions, and need an adapter for the Workers runtime and existing attachment IDs. This change therefore uses a deliberately narrow Fetch adapter over existing storage rather than introducing a second storage service. It does not claim full optional-extension support or certification. Before expanding beyond creation/core, prefer evaluating a maintained tus server adapter over accumulating bespoke extensions.
-
-## Focused tests
-
-From gateway: `node_modules/.bin/esbuild tests/attachment_http.test.ts --bundle --platform=node --format=esm --outfile=/tmp/attachment-http-test.mjs && node --test /tmp/attachment-http-test.mjs`.

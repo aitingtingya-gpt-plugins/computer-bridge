@@ -90,7 +90,13 @@ Never ask the model to change administrator directory grants or bypass a denied 
 When first initializing Work or Dot with Computer Bridge (or when notified via `chat.channel`), check `chat.channel()` and establish a **plugin-level** event subscription via MCP `events/subscribe` with `name="chat.channel"` and empty `arguments={}`. Once active, `/new`, `/connect`, `/disconnect`, and `/delete` in web or terminal notify Dot automatically:
 - On `chat.channel` event `data.action="connect"` for `chat_id`: if this Dot host already holds a paused `chat.message` subscription/task for `chat_id`, resume its `events/subscribe` (`chat.message`); otherwise call `chat.resume(chat_id=...)` and subscribe to `chat.message` for that `chat_id` without requiring manual user instructions in Dot chat. Multiple `tN` conversations stay connected concurrently.
 - On `chat.channel` event `data.action="disconnect"` for `chat_id`: pause that conversation's `chat.message` event subscription via `events/unsubscribe` (or call `chat.disconnect` if host task resources are full). Server history saving and human messaging remain active independently.
-- On `chat.channel` event `data.action="delete"` for `chat_id`: if this Dot host holds an existing active or paused `chat.message`/`chat.summary_due` subscription or local task bound to `chat_id`, permanently unsubscribe via `events/unsubscribe` and remove/cancel that subscription/task rather than merely pausing; if no subscription/task exists for `chat_id`, ignore the event cleanly without calling `chat.resume`.
+- On a signed `chat.channel` event with `data.action="delete"`, follow `data.instructions`: permanently remove only the active or paused `chat.message`/`chat.summary_due` listeners or tasks bound to that `data.chat_id` on this Computer Bridge connection. The gateway already removed its subscriptions; host unsubscribe can complete as a no-op. Keep the plugin-level `chat.channel` listener and all other chats. Do nothing if there is no local match, and never call `chat.resume` for the deleted chat.
+
+Ordinary Chat also uses the same `chat.message` subscription for collaboration. Refresh the tool and event catalog, and update saved Dot listener instructions to recognize these signed event kinds before interpreting an event as a user message:
+
+- `data.kind="goal_round"`: call `chat.goal(operation="claim")` with `goal_id`, `round_id`, `expected_revision=data.goal_revision`, the event connection, and a stable request key. Work only when `claimed:true`. Use its continuation prompt and `context_source`; settle that exact round with `continue`, `complete` after verification, or `blocked` with a concrete reason. Mark genuinely handled human inputs resolved using the current `chat.pending` revision; unresolved inputs take priority over goal rounds.
+- `data.kind="plan_review"`: call `chat.plan(operation="continue")` with the review ID and event connection. Act only when `claimed:true`. Incorporate rejection feedback and stay in plan. An approval may be implemented in the returned mode; call `chat.plan(operation="finish")` after the approved work finishes. Until then do not start a new goal round.
+- `data.interaction_mode="plan"`: do read-only investigation; submit the Markdown proposal using `chat.plan(operation="submit", expected_revision=...)` as the final tool call in that turn. Wait for the signed decision. Conversational assent, a mode switch, and a webhook receipt do not approve the submitted plan. For a bound computer call, include the original Chat connection and actual message IDs or the claimed `context_source`. Auto skips only the bound device's ask/deny rule; workspace limits and separate approval of a command outside the workspace still apply.
 
 You may also connect manually when asked to connect or resume a Bridge chat. Conversation IDs
 are short, stable `t1`, `t2`, etc.; editable titles do not change them. They are distinct from
@@ -162,9 +168,12 @@ the original writing connection and ownership remain.
 
 When using registered-computer tools, use the selected chat's computer unless the user explicitly requests another target.
 A device may allow, require confirmation for, or forbid each computer tool independently of full
-access. Respect tool_forbidden. Agree with the user where to request approval. Default host uses
-the host form; for a chat card pass `approval_channel="chat"` and `approval_chat_id="t1"` for
-an authorized conversation on the same computer. For one restricted command outside the
+access. Respect tool_forbidden. Ask in the conversation where the work originated: in the Dot main
+conversation explicitly pass `approval_channel="host"`; in Bridge pass `approval_channel="chat"`
+and the current authorized `approval_chat_id` on the same computer. Do not guess a conversation.
+If no destination is known, omit the fields and tell the user to press F6 in the terminal or use
+the web claim button. Bridge keeps that request pending without opening a host form.
+For one restricted command outside the
 workspace, also pass `sandbox_permissions="danger-full-access"` and `justification`.
 An awaiting_approval result has not executed. Use the original operation or the exact receipt
 arguments returned by the tool to get the approved result, without submitting a new call.

@@ -33,6 +33,10 @@ export async function dependencyLicenses(metafile,base=process.cwd()) {
     const license=await readFile(new URL('./src/chat_module/super_agent/vendor/LICENSE',import.meta.url),'utf8');
     notices.push('DeepSeek Super Agent domain core (8c32a9dc5d72c033816c6a8110b37f40cf94fba4)\n'+license);
   }
+  if(Object.keys(metafile.inputs).some(input=>input.replaceAll('\\','/').includes('chat_module/interaction/vendor/'))){
+    const license=await readFile(new URL('./src/chat_module/interaction/vendor/LICENSE',import.meta.url),'utf8');
+    notices.push('DeepSeek Harness goal and plan (b830ec950faba0a46dda564be3e2d854afed94f1)\n'+license);
+  }
   return notices.join('\n\n--------------------\n\n');
 }
 

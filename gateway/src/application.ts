@@ -184,6 +184,7 @@ async function commandApproval(request: Request, env: ApplicationEnv): Promise<R
   const rendered=page(details.method?'工具审批':'命令审批',`<section class="auth-card">${error?'<p role="alert">'+escape(error)+'</p>':''}
     <p>设备 ${escape(details.device)}</p><p>工作目录 ${escape(details.cwd)}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${escape(details.summary??details.command)}</pre>
     <p>申请理由 ${escape(details.justification || '')}</p><p>${details.method?'仅批准这一次工具调用，工作区限制保持不变。':(details.permission_confirmation?'本次同时申请使用命令工具。':'')+'本次命令以当前登录用户权限在工作区沙盒外运行，授权包含其子进程及后续交互输入。'}</p>
+    ${details.module_confirmation?'<p>'+escape(details.module_confirmation.message)+'</p>':''}
     <p>状态 ${escape(details.state)} · 有效期至 ${escape(new Date(details.expires_at*1000).toISOString())}</p>
     ${pending?'<form method="post"><input type="hidden" name="csrf" value="'+escape(actor.nonce)+'"><button name="decision" value="allowed-once">接受</button> <button name="decision" value="rejected">拒绝</button> <button name="decision" value="cancelled">取消</button></form>':''}</section>`);
   return error?new Response(rendered.body,{status:errorStatus,headers:rendered.headers}):rendered;
@@ -207,8 +208,8 @@ async function download(request:Request,env:ApplicationEnv):Promise<Response> {
   return env.service(new Request(request,{headers}));
 }
 
-const chatActions=new Set(['list','create','connect','disconnect','channel','get','history','context','repository','task','sync','timing','send','rename','delete','upload-start','upload-chunk',
-  'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide','device-access','device-access-save']);
+const chatActions=new Set(['list','create','connect','disconnect','channel','get','history','context','repository','task','interaction','goal','plan','sync','timing','send','rename','delete','upload-start','upload-chunk',
+  'upload-complete','attachment','read-attachment','devices','approvals','approval-details','approval-decide','approval-claim','device-access','device-access-save']);
 
 /** Native device credentials are supplied in headers, never in a URL or browser cookie. */
 function nativeChatCredentials(request:Request):Data|null {

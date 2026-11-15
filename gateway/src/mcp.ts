@@ -70,48 +70,37 @@ export function handler(hub: ComputerHubCore) {
             const record=await hub.approvals.resume(commandTicket,caller,name,args);
             const answer=ctx.mcpReq.inputResponses?.command as Data | undefined;
             if(answer && ['accept','decline','cancel'].includes(answer.action)) {
-              const decision=commandDecision(answer.action);
+              const decision=commandDecision(answer.action==='accept'&&record.projection.module_confirmation&&answer.content?.start!==true
+                ?'decline':answer.action);
               const result=await hub.approvalResult(record.id,decision,caller,actor);
               return finish(toolResult(result),result);
             }
           }
-          await hub.checkToolPermission(name,args,actor);
-          let confirmed = false;
-          const confirmation = name === "computer.module_call"
-            ? (await hub.modules.require(args.module)).confirmation(args.action) : undefined;
-          if (confirmation) {
-            if (era === "modern") {
-              const state = ctx.mcpReq.requestState<string>();
-              if (!state) {
-                const ticket = await hub.humanTicket(args,actor);
-                return finish(inputRequired({inputRequests: {confirm: {method: "elicitation/create", params: {
-                  mode: "form", message: confirmation.message,
-                  requestedSchema: confirmation.schema as any,
-                }}}, requestState: ticket}),{state:'awaiting_host_input',executed:false});
-              }
-              await hub.consumeHumanTicket(state, args,actor);
-              const answer = ctx.mcpReq.inputResponses?.confirm as Data | undefined;
-              confirmed = answer?.action === "accept" && answer?.content?.start === true;
-            } else {
-              const answer = await ctx.mcpReq.elicitInput({mode: "form", message: confirmation.message,
-                requestedSchema: confirmation.schema as any});
-              confirmed = answer.action === "accept" && answer.content?.start === true;
-            }
-            if (!confirmed) return finish({content: [{type: "text", text: JSON.stringify({started: false})}]},{started:false});
+          await hub.checkToolPermission(name,args,actor,observation);
+          // An outstanding pre-upgrade Work Tree form was already routed to the host.
+          let confirmed=false;
+          if(typeof requestState==='string' && commandTicket===undefined && name==='computer.module_call' &&
+            (await hub.modules.require(args.module)).confirmation(args.action)){
+            await hub.consumeHumanTicket(requestState,args,actor);
+            const answer=ctx.mcpReq.inputResponses?.confirm as Data|undefined;
+            confirmed=answer?.action==='accept'&&answer?.content?.start===true;
+            if(!confirmed)return finish(toolResult({started:false}),{started:false});
           }
-          const result = await hub.invoke(name, args, confirmed, ctx.mcpReq.signal,caller,actor);
-          if(result.state==='awaiting_approval' && result.approval?.channel!=='chat') {
+          const result = await hub.invoke(name, args, confirmed, ctx.mcpReq.signal,caller,actor,observation);
+          if(result.state==='awaiting_approval' && result.approval?.channel==='host') {
             const elicit=capabilities?.elicitation;
             const supportsForm=elicit !== undefined && ('form' in elicit || Object.keys(elicit).length===0);
             if(supportsForm) {
               const details=await hub.approvals.details(result.approval.id,caller);
               const params={mode:'form' as const,
                 message:details.method
-                  ? '批准本次工具调用。\n设备 '+details.device+'\n'+details.summary
+                  ? (details.module_confirmation?.message??'批准本次工具调用。')+
+                    (details.module_confirmation&&details.permission_confirmation?'\n此电脑也要求确认本次工具使用。':'')+
+                    '\n设备 '+details.device+'\n'+details.summary
                   : (details.permission_confirmation?'此电脑要求确认本次工具使用。\n':'')
                     +'批准本次命令以当前登录用户权限在工作区沙盒外运行。授权包含子进程及后续交互输入。\n'
                     +'设备 '+details.device+'\n目录 '+details.cwd+'\n命令\n'+details.command+'\n理由 '+details.justification,
-                requestedSchema:{type:'object' as const,properties:{}}};
+                requestedSchema:details.module_confirmation?.schema??{type:'object' as const,properties:{}}};
               if(era==='modern') {
                 const ticket=commandTicket !== undefined ? commandTicket :
                   await hub.approvals.ticket(result.approval.id,caller,name,args);
@@ -119,7 +108,8 @@ export function handler(hub: ComputerHubCore) {
                   requestState:'command:'+ticket}),result);
               }
               const answer=await ctx.mcpReq.elicitInput(params);
-              const decision=commandDecision(answer.action);
+              const decision=commandDecision(answer.action==='accept'&&details.module_confirmation&&answer.content?.start!==true
+                ?'decline':answer.action);
               const completed=await hub.approvalResult(result.approval.id,decision,caller,actor);
               return finish(toolResult(completed),completed);
             }

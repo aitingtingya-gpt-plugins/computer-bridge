@@ -17,6 +17,7 @@ from .common import Json, save, uid
 from .network import failure_kind, proxy_for
 from .network_events import NetworkEvents
 from .service import Computer
+from .transfers import transfer_auto_grant
 from .wire import MAX_REQUEST_BYTES, Frames, Sender
 
 log = logging.getLogger(__name__)
@@ -78,16 +79,16 @@ class Connection:
                 answer = {"result": self.computer.updates.cancel(value["params"]["id"])}
             elif value["method"] == "bridge.update.status":
                 answer = {"result": {"jobs": self.computer.updates.states()}}
-            elif value["method"] == "bridge.recover":
-                answer = {
-                    "result": await self.computer.requests.recover(
-                        value["params"].get("request_id"), value["params"].get("seconds", 0)
-                    )
-                }
-            elif value.get("request_id"):
-                answer = await self.computer.requests.execute(value, perform, received)
             else:
-                answer = {"result": await perform()}
+                with transfer_auto_grant(value["params"].get("_auto_tool_grant")):
+                    if value["method"] == "bridge.recover":
+                        answer = {"result": await self.computer.requests.recover(
+                            value["params"].get("request_id"), value["params"].get("seconds", 0)
+                        )}
+                    elif value.get("request_id"):
+                        answer = await self.computer.requests.execute(value, perform, received)
+                    else:
+                        answer = {"result": await perform()}
             response = {"type": "response", "id": value["id"], **answer}
             if value.get("request_id") and not value["method"].startswith("bridge."):
                 # Only execute() returning proves that both receipt writes committed.

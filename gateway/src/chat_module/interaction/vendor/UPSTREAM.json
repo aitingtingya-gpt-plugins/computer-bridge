@@ -1,0 +1,61 @@
+{
+  "commit": "b830ec950faba0a46dda564be3e2d854afed94f1",
+  "files": {
+    "LICENSE": {
+      "upstream": "LICENSE",
+      "sha256": "ebb4f09972aee8608be255debaf78451a68e95c290f55c240dec2ecfa16ea6be"
+    },
+    "fold.ts": {
+      "upstream": "packages/goal/goal/src/fold.ts",
+      "sha256": "8dc7086395f436c6af4a816e668ddfd89ba527f801a877bf74d131f08870ab6e"
+    },
+    "domain.ts": {
+      "upstream": "packages/goal/goal/src/domain.ts",
+      "sha256": "dd1b58235f01e7f65e05afcdc5906516b400b49cc6c33e9e558601c128c77d47"
+    },
+    "types.ts": {
+      "upstream": "packages/goal/goal/src/types.ts",
+      "sha256": "a33a493854f86cfa1bb959d257e1d5b1237f1666dec617633a2af1fe28cd5719"
+    },
+    "runtime.ts": {
+      "upstream": "packages/goal/goal/src/runtime.ts",
+      "sha256": "452f2d21567cdd923067a7011fd16416733de9548aa49221012619901bc30b3a",
+      "excerpt": [
+        "/** Version of the goal change",
+        "/** Error returned by the goal domain"
+      ]
+    },
+    "goal-prompt.ts": {
+      "upstream": "packages/goal/goal-round-driver/src/prompt.ts",
+      "sha256": "48410d77077e88053cded777736a425534e91b36402ab46dc151ea9867a3db97"
+    },
+    "goal-command.ts": {
+      "upstream": "packages/goal/command-goal/src/index.ts",
+      "sha256": "d84165bbf8c1d3962ce0ad97b7641f0955e14fd0c941534dad30d92a1090fcc5",
+      "excerpt": [
+        "type GoalCommand =",
+        "/** Human label for one durable goal phase. */"
+      ]
+    },
+    "plan-types.ts": {
+      "upstream": "packages/plan/plan-mode/src/types.ts",
+      "sha256": "d0facf9115794593fe1afbfb7275a01a8f5aee6a74a5c26bb2aba6c73ebe4693"
+    },
+    "plan-projection.ts": {
+      "upstream": "packages/plan/plan-mode/src/index.ts",
+      "sha256": "d26498675d12d6fe05c26bd80f89c144515130e636817a1cb1b460b756682a87",
+      "excerpt": [
+        "const planUnitStateSchema",
+        "/**\n * `ctx.planMode`:"
+      ]
+    },
+    "plan-policy.ts": {
+      "upstream": "packages/bundle/base/cordis.patch.yml",
+      "sha256": "35290155b32bf5f0362d40d688e52fd6e75120718c10389d52d30063f3a9aebf",
+      "excerpt": [
+        "              You are in plan mode.",
+        "\n    - id: token-meter"
+      ]
+    }
+  }
+}

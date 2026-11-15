@@ -3,11 +3,11 @@ import type {KeyStore} from '../runtime';
 import type {Data} from '../types';
 import {recordObservedTrace,type TraceScope} from './trace';
 import {assertContextSafe} from './context_safety';
-export interface ChatToolBinding {chat_id:string;connection:string;source_message_ids:string[];capture?:'metadata'|'content'}
+export interface ChatToolBinding {chat_id:string;connection:string;source_message_ids:string[];capture?:'metadata'|'content';round_id?:string;review_id?:string}
 export interface ObservedToolTicket {
   chatId:string;writerId:string;account:string;epoch:number;caller:string;callId:string;
   sourceMessageIds:string[];callTraceId?:string;capture:'metadata'|'content';tool:string;
-  logicalCallId?:string;captureState:'recorded'|'unavailable';
+  logicalCallId?:string;captureState:'recorded'|'unavailable';roundId?:string;reviewId?:string;
 }
 export interface ObservedToolReceipt {chat_id:string;call_trace_id?:string;result_trace_id?:string;call_id:string;logical_call_id?:string;provenance:'server_observed';capture:'metadata'|'content';state:'recorded'|'unavailable';execution_evidence:'gateway_observation_only'}
 type MessageReader=(id:string)=>Promise<{id:string;sequence:number;role:string;text:string;attachments?:unknown[]}|undefined>;
@@ -58,13 +58,14 @@ async function logicalCallId(tool:string,input:Data):Promise<string|undefined>{
 export async function observeToolCall(tx:KeyStore,scope:TraceScope,binding:ChatToolBinding,tool:string,input:Data,readMessage:MessageReader):Promise<ObservedToolTicket>{
   const ticket:ObservedToolTicket={chatId:scope.chatId,writerId:scope.writer.id,account:scope.writer.account,epoch:scope.writer.epoch,caller:scope.writer.caller,
     callId:'mcp:'+crypto.randomUUID(),sourceMessageIds:[...binding.source_message_ids],capture:binding.capture??'metadata',tool,
-    logicalCallId:await logicalCallId(tool,input),captureState:'recorded'};
+    logicalCallId:await logicalCallId(tool,input),captureState:'recorded',roundId:binding.round_id,reviewId:binding.review_id};
   const saved=await recordObservedTrace(tx,scope,{kind:'tool_call',call_id:ticket.callId,tool_name:tool,text:observationText(input,ticket.capture,'request'),source_message_ids:ticket.sourceMessageIds,request_key:ticket.callId+':request'},readMessage,ticket.logicalCallId);
   ticket.callTraceId=saved.trace.id;return ticket;
 }
 export function unavailableToolTicket(scope:TraceScope,binding:ChatToolBinding,tool:string):ObservedToolTicket {
   return {chatId:scope.chatId,writerId:scope.writer.id,account:scope.writer.account,epoch:scope.writer.epoch,caller:scope.writer.caller,
-    callId:'mcp:'+crypto.randomUUID(),sourceMessageIds:[...binding.source_message_ids],capture:binding.capture??'metadata',tool,captureState:'unavailable'};
+    callId:'mcp:'+crypto.randomUUID(),sourceMessageIds:[...binding.source_message_ids],capture:binding.capture??'metadata',tool,captureState:'unavailable',
+    roundId:binding.round_id,reviewId:binding.review_id};
 }
 export function toolObservationReceipt(ticket:ObservedToolTicket,resultTraceId?:string):ObservedToolReceipt {
   return {chat_id:ticket.chatId,...(ticket.callTraceId?{call_trace_id:ticket.callTraceId}:{}),...(resultTraceId?{result_trace_id:resultTraceId}:{}),call_id:ticket.callId,

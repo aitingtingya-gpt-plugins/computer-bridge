@@ -1,0 +1,9 @@
+export const channelDeleteInstructions='For a signed chat.channel delete event, permanently remove the Dot host listeners or tasks bound to this exact data.chat_id on this Computer Bridge connection, including active or paused chat.message and legacy chat.summary_due listeners. Use the host event controls to remove them rather than only acknowledging or pausing them. The gateway has already removed the server subscriptions; events/unsubscribe for the deleted chat can complete as a no-op. Keep the plugin-level chat.channel listener and every other conversation. If there is no matching local listener or task, do nothing. Do not call chat.resume or reopen the deleted conversation.';
+
+export const channelEventDefinition={
+  name:'chat.channel',
+  description:'Plugin-level notification channel across conversations (established once per Dot client). action="connect" notifies Dot to open/resume its existing paused chat.message subscription (events/subscribe) or call chat.resume then subscribe to chat.message for chat_id. action="disconnect" notifies Dot to pause that chat.message subscription via events/unsubscribe (or call chat.disconnect if Dot host resources are full). action="delete" means the user permanently deleted chat_id. Follow data.instructions. '+channelDeleteInstructions,
+  delivery:['webhook'],
+  inputSchema:{type:'object',properties:{},additionalProperties:false},
+  payloadSchema:{type:'object',properties:{action:{enum:['connect','disconnect','delete']},chat_id:{type:'string'},device_id:{type:'string'},device_name:{type:'string'},title:{type:'string'},mode:{enum:['chat','super_agent']},repository:{type:['object','null']},source:{enum:['web','tui']},requested_at:{type:'string'},url:{type:'string'},instructions:{type:'string',description:'Host cleanup instructions supplied for action="delete".'}},required:['action','chat_id','device_id','device_name','title','mode','url'],additionalProperties:false}
+};

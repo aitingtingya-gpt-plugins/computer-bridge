@@ -21,10 +21,22 @@ import stat
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
 from .common import Error, Json
+
+_auto_grant: ContextVar[str | None] = ContextVar("transfer_auto_grant", default=None)
+
+
+@contextmanager
+def transfer_auto_grant(grant: str | None):
+    token = _auto_grant.set(grant)
+    try:
+        yield
+    finally:
+        _auto_grant.reset(token)
 
 CHUNK_SIZE = 256 * 1024
 MAX_TRANSFERS = 128
@@ -258,7 +270,11 @@ class Transfers:
     def _check_locked(self, value: Json, *, cancel: bool = True):
         if value["revision"] != self.revision():
             _fail("approval_invalidated", "Transfer permission revision changed")
-        self.permission(value.get("permission_approved", False))
+        if value.get("auto_grant"):
+            if value["auto_grant"] != _auto_grant.get():
+                _fail("chat_auto_ended", "Transfer belongs to another Chat mode revision")
+        else:
+            self.permission(value.get("permission_approved", False))
         if value.get("expires_at", 0) <= self.clock() and value["state"] not in _TERMINAL:
             _fail("transfer_expired", "Transfer expired; start a new authorized transfer")
         self._path(value["session"], value["path"], value["kind"] == "upload")
@@ -305,6 +321,10 @@ class Transfers:
             # grant from a retry key supplied for a different session or file.
             self._load(session, identity, kind)
         else:
+            self._new_permission(approved)
+
+    def _new_permission(self, approved: bool):
+        if not _auto_grant.get():
             self.permission(approved)
 
     def _quota(self, size: int):
@@ -391,7 +411,7 @@ class Transfers:
                     self._recover_commit(value, parent)
                 return self._status(value)
             with self.permission_lock, _Directory(target.parent) as parent:
-                self.permission(permission_approved)
+                self._new_permission(permission_approved)
                 if revision != self.revision():
                     _fail("approval_invalidated", "Transfer permission revision changed")
                 if parent.info(target.name) is not None and not overwrite:
@@ -401,7 +421,7 @@ class Transfers:
                 value = dict(transfer_id=identity, session=session, revision=revision, kind="upload", path=str(target),
                              temporary=str(temporary), size=size, sha256=sha256, offset=0, state="allocating",
                              overwrite=overwrite, inode=None, parent=parent.identity,
-                             permission_approved=permission_approved, created_at=self.clock())
+                             permission_approved=permission_approved, auto_grant=_auto_grant.get(), created_at=self.clock())
                 with self.lock:
                     self._quota(size)
                     self._touch(value)
@@ -574,13 +594,14 @@ class Transfers:
                     return self._status(value)
             else:
                 with self.permission_lock, _Directory(target.parent) as parent, parent.open(target.name, os.O_RDONLY) as file:
-                    self.permission(permission_approved)
+                    self._new_permission(permission_approved)
                     if revision != self.revision():
                         _fail("approval_invalidated", "Transfer permission revision changed")
                     before = os.fstat(file.fileno())
                     value = dict(transfer_id=identity, session=session, revision=revision, kind="download", path=str(target),
                                  size=before.st_size, sha256="", offset=0, state="preparing", fingerprint=_fingerprint(before),
-                                 parent=parent.identity, permission_approved=permission_approved, created_at=self.clock())
+                                 parent=parent.identity, permission_approved=permission_approved,
+                                 auto_grant=_auto_grant.get(), created_at=self.clock())
                     with self.lock:
                         self._quota(0)
                         self._touch(value)

@@ -34,7 +34,8 @@ the exact upstream license and provenance are preserved in
 Incremental attachment digests use @noble/hashes under MIT; bundled notices
 are included by the same build process.
 
-Chat Markdown uses markdown-it (MIT), markdown-it-texmath (MIT), highlight.js
+Chat Markdown uses markdown-it, markdown-it-texmath, markdown-it-footnote,
+@mdit/plugin-tasklist and @mdit/plugin-cjk-friendly (MIT), highlight.js
 (BSD-3-Clause), MathJax 4.1.3 and the MathJax TeX SVG font (Apache-2.0).
 The browser renderer, local SVG preview and local semantic compiler bundles
 carry complete dependency licenses. MathJax font provenance and license are in
@@ -57,3 +58,12 @@ pinned to commit `8c32a9dc5d72c033816c6a8110b37f40cf94fba4` (MIT).
 The complete upstream license is preserved at
 `gateway/src/chat_module/super_agent/vendor/LICENSE`; source provenance and hashes
 are recorded beside the vendored source. No DSH or Cordis runtime is imported.
+
+## Chat goal and plan
+
+The Chat goal parser, replay fold, continuation prompt, plan projection, and
+planning instructions reuse DeepSeek Harness preview
+`b830ec950faba0a46dda564be3e2d854afed94f1` under the MIT license. The complete
+license and source paths, excerpt boundaries, and hashes are preserved in
+`gateway/src/chat_module/interaction/vendor/`. Computer Bridge provides its own
+persistence, event delivery, and human review; the DSH runtime is not imported.

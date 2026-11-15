@@ -80,7 +80,7 @@ class Computer:
             "lock_mode": self.power.status(),
             "request_protocol": 1,
             "protocol": {"min": 1, "max": 1},
-            "capabilities": ["request_recovery", "module_registry", "transport_v2", "command_approval_v1", "tool_permissions_v1", "resumable_file_transfer_v1"]
+            "capabilities": ["request_recovery", "module_registry", "transport_v2", "command_approval_v1", "tool_permissions_v1", "resumable_file_transfer_v1", "chat_auto_transfer_v1"]
             + (["updates_v1"] if self.updates.supported() else []),
             "module_versions": self.modules.status(),
             "install_id": os.environ.get("COMPUTER_BRIDGE_INSTALL_ID"),

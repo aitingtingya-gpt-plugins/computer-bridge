@@ -2,7 +2,7 @@ import {compare,valid,satisfies} from 'semver';
 import type {Store} from './runtime';
 import type {Data} from './types';
 
-export const VERSION='0.2.6-alpha';
+export const VERSION='0.2.6-beta';
 export const DEFAULT_REPOSITORY='aitingtingya-gpt-plugins/computer-bridge';
 export interface Artifact {
   id:string;
@@ -72,6 +72,7 @@ export class Releases {
   }
   private async load():Promise<Data> {
     const settings=await this.settings();
+    if(!settings.repository) throw new Error('请在版本与更新页面先设置 GitHub 更新仓库（owner/repo）');
     let page=1;
     const candidates:Data[]=[];
     while(true) {

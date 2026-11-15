@@ -1,10 +1,28 @@
 import MarkdownIt from 'markdown-it';
+import {cjkFriendly} from '@mdit/plugin-cjk-friendly';
+import {tasklist} from '@mdit/plugin-tasklist';
+import footnote from 'markdown-it-footnote';
 import texmath from 'markdown-it-texmath';
 import hljs from 'highlight.js/lib/common';
+import {gfmStrikethrough} from './strikethrough.mjs';
 export const escape = value => String(value).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const md=new MarkdownIt({html:false,breaks:true,highlight(code,language){
+const md=new MarkdownIt({html:false,breaks:true,linkify:true,highlight(code,language){
   return language&&hljs.getLanguage(language)?hljs.highlight(code,{language,ignoreIllegals:true}).value:escape(code);
-}}).enable(['table','strikethrough']);
+}}).use(cjkFriendly).use(gfmStrikethrough).use(footnote).use(tasklist,{disabled:true,label:false});
+// Reuse the URL validator for GFM's www form without linking bare filenames.
+md.linkify.add('www.',{
+  validate(text,offset,self){
+    const prefix='www.', authority='//'+text.slice(offset-prefix.length);
+    return Math.max(0,self.testSchemaAt(authority,'http:',0)-2-prefix.length);
+  },
+  normalize(link){link.url='http://'+link.raw;},
+});
+md.inline.ruler.disable('footnote_inline');
+md.renderer.rules.checkbox_input=(tokens,index,options,env,self)=>{
+  const token=tokens[index];
+  token.attrSet('aria-label',token.attrGet('checked')?'已完成':'未完成');
+  return self.renderToken(tokens,index,options);
+};
 
 // Keep parser positions through Markdown's indentation, table escaping and CRLF
 // normalization. Repeated formulas never locate themselves by substring search.
@@ -103,6 +121,26 @@ md.core.ruler.at('inline',state=>{
   }
   delete state.env.inlineSourceMap;
 });
+
+function renderFormula(token,env,display,block){
+  const ordinal=env.formulas.length,start=token.meta?.bridgeStart,end=token.meta?.bridgeEnd;
+  env.formulas.push({tex:token.content,display,line:start===undefined?(token.map?.[0]??env.line??0)+1:env.source.slice(0,start).split('\n').length,
+    start:env.points[start],end:env.points[end]});
+  const tag=block?'div':'span';
+  return `<${tag} class="cb-equation${display?' cb-display':''}" data-formula="${ordinal}"><span class="cb-math-target">${escape((display?'\\[':'\\(')+token.content+(display?'\\]':'\\)'))}</span><details class="cb-math-source"><summary>LaTeX 原文</summary><pre><code>${escape(token.content)}</code></pre><button type="button" class="cb-copy">复制 LaTeX</button></details></${tag}>`;
+}
+
+const mathFence=token=>token.info.trim().split(/\s+/,1)[0]==='math';
+const {fn:originalFence,alt:fenceAlt}=md.block.ruler.__rules__.find(rule=>rule.name==='fence');
+md.block.ruler.at('fence',(state,begin,end,silent)=>{
+  const accepted=originalFence(state,begin,end,silent);
+  if(accepted&&!silent) {
+    const token=state.tokens.at(-1);
+    if(mathFence(token))token.meta={bridgeStart:state.bMarks[begin]+state.tShift[begin],bridgeEnd:state.eMarks[token.map[1]-1]};
+  }
+  return accepted;
+},{alt:fenceAlt});
+
 let ruleId=0;
 for(const delimiters of ['dollars','brackets','beg_end']) {
   const rules=texmath.rules[delimiters];
@@ -125,13 +163,7 @@ for(const delimiters of ['dollars','brackets','beg_end']) {
         return accepted;
       },{alt:['paragraph','reference','blockquote','list']});
     }
-    md.renderer.rules[name]=(tokens,index,options,env)=>{
-      const token=tokens[index],display=kind==='block'||!!rule.displayMode;
-      const ordinal=env.formulas.length,start=token.meta?.bridgeStart,end=token.meta?.bridgeEnd;
-      env.formulas.push({tex:token.content,display,line:start===undefined?(token.map?.[0]??env.line??0)+1:env.source.slice(0,start).split('\n').length,
-        start:env.points[start],end:env.points[end]});
-      return `<${display?'div':'span'} class="cb-equation${display?' cb-display':''}" data-formula="${ordinal}"><span class="cb-math-target">${escape((display?'\\[':'\\(')+token.content+(display?'\\]':'\\)'))}</span><details class="cb-math-source"><summary>LaTeX 原文</summary><pre><code>${escape(token.content)}</code></pre><button type="button" class="cb-copy">复制 LaTeX</button></details></${display?'div':'span'}>`;
-    };
+    md.renderer.rules[name]=(tokens,index,options,env)=>renderFormula(tokens[index],env,kind==='block'||!!rule.displayMode,kind==='block');
   }
 }
 md.inline.ruler.before('escape','bridge_unclosed_math',(state,silent)=>{
@@ -143,14 +175,20 @@ md.inline.ruler.before('escape','bridge_unclosed_math',(state,silent)=>{
 md.renderer.rules.bridge_unclosed_math=(tokens,index)=>`<span class="cb-math-error">公式未闭合</span><code>${escape(tokens[index].content)}</code>`;
 const inline=md.renderer.rules.inline;
 md.renderer.rules.inline=(tokens,index,options,env,self)=>{env.line=tokens[index].map?.[0]??0;return inline?inline(tokens,index,options,env,self):self.renderInline(tokens[index].children,options,env);};
-md.renderer.rules.fence=(tokens,index,options)=>{
-  const token=tokens[index],language=token.info.trim().split(/\s+/)[0],highlighted=options.highlight(token.content,language)||escape(token.content);
-  return `<div class="cb-code"><div class="cb-code-heading"><span>${escape(language||'代码')}</span><button type="button" class="cb-copy">复制代码</button></div><pre><code>${highlighted}</code></pre></div>`;
+function renderCode(token,options,language=''){
+  const highlighted=options.highlight(token.content,language);
+  return `<div class="cb-code"><div class="cb-code-heading"><span>${escape(language||'代码')}</span><button type="button" class="cb-copy">复制代码</button></div><pre><code>${highlighted}</code></pre></div>\n`;
+}
+md.renderer.rules.fence=(tokens,index,options,env)=>{
+  const token=tokens[index];
+  return mathFence(token)?renderFormula(token,env,true,true)+'\n':renderCode(token,options,token.info.trim().split(/\s+/,1)[0]);
 };
+md.renderer.rules.code_block=(tokens,index,options)=>renderCode(tokens[index],options);
 const link=md.renderer.rules.link_open;
 md.renderer.rules.link_open=(tokens,index,options,env,self)=>{tokens[index].attrSet('target','_blank');tokens[index].attrSet('rel','noopener noreferrer');return link?link(tokens,index,options,env,self):self.renderToken(tokens,index,options);};
 
-export function parseMessage(text){
-  const {source,points}=normalizeSource(text),env={formulas:[],line:0,source,points};
+export function parseMessage(text,id='message'){
+  const docId='cb-'+Array.from(String(id),char=>char.codePointAt(0).toString(16)).join('-');
+  const {source,points}=normalizeSource(text),env={formulas:[],line:0,source,points,docId};
   return {html:md.render(source,env),formulas:env.formulas};
 }

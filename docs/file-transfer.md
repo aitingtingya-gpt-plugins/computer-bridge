@@ -94,36 +94,9 @@ timeout and five-minute PATCH duration. This is not a distributed quota. All
 responses are no-store. Stream cancellation is bounded so an uncooperative
 request cannot retain an upload lock indefinitely.
 
-## Verification and rollout
-
-Run the Python transfer tests, `npm test --prefix gateway`,
-`npm run check --prefix gateway`, and `npm run build --prefix gateway` on the
-same integrated tree. Include the standard tus client, real HTTP adapters,
-SQLite/blob persistence, permission revocation, source changes, disconnects,
-disk errors, duplicate commit and executor-helper checksum verification.
-Node tests do not certify Cloudflare runtime limits or Windows filesystem
-semantics; those environments require their own release checks.
-
-The new gateway refuses transfer begins for computers without
-`resumable_file_transfer_v1`; existing file/chat tools remain available.
-The legacy MCP path now admits at most 2 MiB per request before parsing JSON.
-Legacy file writes accept at most 1 MiB of UTF-8 text or decoded Base64
-(1,398,104 encoded characters); reads default to a 256 KiB
-window and cannot request more than 1 MiB. This prevents the gateway from
-materializing giant file envelopes. It does not change the host's code-mode
-gRPC limits: a giant tool argument can still be rejected before reaching the
-plugin. Use the direct helper rather than testing a giant model tool payload.
-MCP control bodies have a 30-second idle and two-minute total read budget.
-Gateway device frames are limited to 1 MiB on the wire and 8 MiB aggregate
-reassembly across at most eight groups. Each group is ordered, capped at 512
-frames, and expires after 30 seconds. Ordinary transfer chunks are far below
-these ceilings. This also bounds an old or faulty computer's oversized reply.
-No live service, plugin registration, or installed computer is changed by merely
-building these sources. Deployment and publishing remain separate actions.
-
 ## Explicit network selection
 
-The helper identifies itself as `computer-bridge/0.2.6-alpha transfer-helper` and keeps
+The helper identifies itself as `computer-bridge/0.2.6-beta transfer-helper` and keeps
 TLS certificate verification and redirect rejection enabled. Its first HEAD
 checks the real transfer resource before any upload bytes. DNS, TLS, timeout
 and connection failures are reported separately without URLs or credentials.

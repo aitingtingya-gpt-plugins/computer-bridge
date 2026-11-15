@@ -24,7 +24,10 @@ export const chatLayoutStyles=String.raw`
 .chat-message{width:fit-content;max-width:94%}.chat-message-body{line-height:1.7}
 .chat-compose{height:var(--compose-height);flex:0 0 var(--compose-height);min-height:0;padding:8px 20px 12px;display:flex;flex-direction:column;gap:8px}
 .chat-compose textarea{width:100%;flex:1;min-height:30px;height:0;resize:none;padding:4px 0;border:0;background:transparent;outline:none;color:var(--ink);font:inherit;font-size:14px;line-height:1.7}
-.chat-compose-actions{display:flex;flex-shrink:0;align-items:center;justify-content:space-between;gap:12px}.chat-compose-actions>div{display:flex;align-items:center;gap:10px;min-width:0}.chat-compose-actions button{padding:7px 13px;font-size:13px;white-space:nowrap}
+.chat-compose-actions{display:grid;grid-template-columns:minmax(0,1fr) auto;flex-shrink:0;align-items:center;gap:4px 8px}.chat-compose-tools{display:flex;align-items:center;gap:4px;min-width:0;flex-shrink:0;overflow-x:auto;scrollbar-width:thin;white-space:nowrap}.chat-compose-actions button{white-space:nowrap}
+.chat-mode-button{display:inline-flex;align-items:center;gap:4px;flex:none;min-height:29px;min-width:29px;padding:4px 7px;font-size:12px;color:var(--muted);background:transparent;border:1px solid transparent;border-radius:8px}
+.chat-mode-button[hidden]{display:none}.chat-mode-button:hover{color:var(--accent);background:var(--soft,#eff5f1);border-color:var(--line)}.chat-mode-button svg{width:16px;height:16px;flex:none}#chat-interaction{border-color:var(--line)}#chat-interaction[data-mode=plan]{color:#335887;background:#edf3fb;border-color:#d7e3f3}#chat-interaction[data-mode=auto]{color:#844807;background:#fff0dc;border-color:#efdaba}
+.chat-compose-actions #chat-send{grid-row:1;grid-column:2;padding:7px 10px;font-size:13px}.chat-compose-actions #chat-upload-status{grid-row:1;grid-column:1}.chat-compose-actions #chat-upload-status:empty{display:none}
 .chat-attachments{max-height:35%;overflow:auto;flex-shrink:0}.chat-attachments:empty{display:none}.chat-compose #chat-upload-status{font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-resize{position:relative;touch-action:none;user-select:none;flex-shrink:0;background:#fafcfb;outline-offset:-2px}
 .chat-resize::after{content:'';position:absolute;background:#dce6e0;border-radius:4px;transition:background .15s}
@@ -45,7 +48,7 @@ export const chatLayoutStyles=String.raw`
  .chat-layout>.chat-sidebar{display:none;position:absolute;z-index:4;top:0;bottom:0;left:0;width:min(320px,calc(100% - 48px));box-shadow:8px 0 32px #163b3620}
  .chat-layout[data-drawer=true]>.chat-sidebar{display:block}.chat-layout:not([data-drawer=true]) #chat-sidebar-open{display:inline-flex}.chat-layout[data-drawer=true] #chat-sidebar-open{display:none}
  .chat-icon-button{width:44px;height:44px} .chat-messages{padding:12px 10px}.chat-message{max-width:100%}.chat-compose{padding:6px 10px 8px;gap:6px}.chat-compose textarea{line-height:1.5}
- .chat-compose-actions{gap:8px}.chat-compose-actions>div{gap:6px}.chat-compose-actions button{min-height:44px}.chat-compose #chat-upload-status{max-width:100px}
+ .chat-compose-tools{gap:2px}.chat-compose-tools .chat-mode-button{display:inline-flex;justify-content:center;min-height:40px;min-width:38px;padding:4px 5px}.chat-compose-tools .chat-mode-button[hidden]{display:none}.chat-compose-actions #chat-send{min-height:40px;min-width:54px;padding-inline:7px}.chat-message-action{min-height:44px;min-width:44px}.chat-maintenance-status summary{min-height:28px;min-width:0}
  .chat-attachments{max-height:var(--chat-attachment-height,64px)}
  .chat-resize-compose{height:12px}.chat-resize-compose::after{top:4px}.chat-sidebar-heading label{font-size:14px}.chat-resume button,.chat-list-heading button{min-height:44px}
  .chat-sidebar-backdrop{min-width:0;min-height:0}
@@ -55,6 +58,7 @@ export const chatLayoutStyles=String.raw`
 export const chatLayoutScript=String.raw`<script>
 (()=>{
  const $=id=>document.getElementById(id),layout=document.querySelector('.chat-layout'),sidebar=$('chat-sidebar'),messages=$('chat-messages'),composer=$('chat-compose'),thread=document.querySelector('.chat-thread');
+ const composerRows=['chat-compose-tools','chat-quote-preview','chat-goal-state','chat-compose-actions'].map($);
  const open=$('chat-sidebar-open'),close=$('chat-sidebar-close'),backdrop=$('chat-sidebar-backdrop'),sideHandle=$('chat-sidebar-resize'),composeHandle=$('chat-compose-resize');
  const initial=JSON.parse($('chat-initial').textContent),key='computer-bridge:chat-layout:'+initial.account_id;
  const narrow=matchMedia(${JSON.stringify(compactMedia)}),viewport=window.visualViewport,defaults={width:280,height:160,mobileHeight:120,collapsed:false};
@@ -93,7 +97,9 @@ export const chatLayoutScript=String.raw`<script>
   const fixed=composeHandle.offsetHeight;
   const attached=$('chat-attachments'),computed=getComputedStyle(composer),hasAttachments=attached.childElementCount>0;
   const attachmentHeight=compact?Math.min(64,Math.max(30,(thread.clientHeight-fixed)*.2)):64;
-  const minHeight=Math.ceil(parseFloat(computed.paddingTop)+parseFloat(computed.paddingBottom)+30+composer.querySelector('.chat-compose-actions').offsetHeight+parseFloat(computed.gap)*(hasAttachments?2:1)+(hasAttachments?Math.min(attached.scrollHeight,attachmentHeight):0));
+  const rows=composerRows.filter(node=>!node.hidden);
+  const gap=parseFloat(computed.gap),minHeight=Math.ceil(parseFloat(computed.paddingTop)+parseFloat(computed.paddingBottom)+30+
+    rows.reduce((height,node)=>height+node.offsetHeight+gap,0)+(hasAttachments?Math.min(attached.scrollHeight,attachmentHeight)+gap:0));
   const readingRoom=compact?Math.min(96,Math.max(24,thread.clientHeight-fixed-minHeight)):120;
   const maxHeight=Math.max(minHeight,Math.min(thread.clientHeight*.6,thread.clientHeight-fixed-readingRoom)),height=clamp(compact?prefs.mobileHeight:prefs.height,minHeight,maxHeight);
   if(!viewport||Math.abs(viewport.scale-1)<.01){for(const [name,value] of [['--chat-visible-height',compact?visibleHeight+'px':''],['--chat-visible-top',compact?(viewport?.offsetTop || 0)+'px':'']])if(document.body.style.getPropertyValue(name)!==value)document.body.style.setProperty(name,value);}
@@ -130,7 +136,7 @@ export const chatLayoutScript=String.raw`<script>
  window.addEventListener('bridge-chat-opened',()=>{if(narrow.matches&&drawer)toggle(false);});
  viewport?.addEventListener('resize',schedule);viewport?.addEventListener('scroll',schedule);
  window.addEventListener('resize',schedule);document.addEventListener('focusin',schedule);document.addEventListener('focusout',schedule);
- const observed=[layout,$('chat-attachments'),composer.querySelector('.chat-compose-actions')];
+ const observed=[layout,$('chat-attachments'),...composerRows];
  const observer=new ResizeObserver(schedule);for(const node of observed)observer.observe(node);
  window.addEventListener('pagehide',()=>{stopped=true;observer.disconnect();contentObserver.disconnect();cancelAnimationFrame(applyFrame);cancelAnimationFrame(restoreFrame);cancelAnimationFrame(scrollFrame);applyFrame=restoreFrame=scrollFrame=0;});
  window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;for(const node of window.bridgeChatView.nodes())watch(node);for(const node of observed)observer.observe(node);schedule();}});

@@ -1,4 +1,4 @@
-import {CommandApprovals} from './approvals';
+import {CommandApprovals,type ApprovalOrigin} from './approvals';
 import {ServerModules} from "./modules";
 import {Updates} from "./updates";
 import {VERSION} from './releases';
@@ -11,12 +11,14 @@ import {definitionList} from './definitions';
 import {DeviceTransport,MAX_DEVICE_WIRE_BYTES} from './transport';
 import {ConnectionLatency} from './latency';
 import {RequestRecords} from './requests';
-import type {DeviceSocket, HubContext, ServiceEnv} from "./runtime";
+import type {DeviceSocket, HubContext, KeyStore, ServiceEnv} from "./runtime";
 import {ChatService} from './chat';
 import {authorizeIdentity,type ChatIdentity} from './chat_identity';
 import {HubScheduler} from './scheduler';
 import {hasToolPermission,permissionTools,toolPermission,toolPermissions,toolSummary} from './tool_permissions';
 import {FileTransferHttp,type FileTransferGrant} from './file_transfer_http';
+import {transferModeKey,type AutoToolGrant} from './chat_module/interaction/state';
+import type {ObservedToolTicket} from './chat_module/tool_observation';
 
 export class ComputerHubCore {
   draining=false;
@@ -38,10 +40,11 @@ export class ComputerHubCore {
   constructor(private ctx: HubContext, private env: ServiceEnv) {
     this.scheduler=new HubScheduler(ctx.storage);
     this.ctx=ctx={...ctx,storage:this.scheduler.store()};
-    this.approvals=new CommandApprovals(ctx.storage,(device,method,args)=>
-      this.rpc(device,method,args,false,AbortSignal.timeout(30_000)),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;},
-      (device,records)=>this.notifyApprovals(device,records),(tx,record,details)=>this.chats.approvalCard(tx,record,details),
-      record=>this.finishToolApproval(record));
+    this.approvals=new CommandApprovals(ctx.storage,(device,method,args,beforeSend)=>
+      this.rpc(device,method,args,false,AbortSignal.timeout(30_000),undefined,undefined,beforeSend),work=>{if(ctx.waitUntil)ctx.waitUntil(work);else void work;},
+      (device,records,availabilityChanged)=>this.notifyApprovals(device,records,availabilityChanged),(tx,record,details)=>this.chats.approvalCard(tx,record,details),
+      record=>this.finishToolApproval(record),
+      (tx,record)=>this.chats.assertAutoToolGrant(record.projection.auto_tool_grant,record.device,tx));
     this.transport=new DeviceTransport(ctx,id=>this.requests.received(id));
     this.modules = new ServerModules(ctx.storage);
     this.updates = new Updates(ctx.storage,env,
@@ -55,11 +58,14 @@ export class ComputerHubCore {
       grant=>this.authorizeFileTransfer(grant),
       (grant,action,args,signal)=>this.rpc(grant.device,'computer.transfer',{
         ...args,session:grant.session,transfer_id:grant.transfer_id,action,_tool_revision:grant.revision,
-      },false,signal));
+        ...(grant.auto_tool_grant?{_auto_tool_grant:transferModeKey(grant.auto_tool_grant)}:{}),
+      },false,signal,undefined,undefined,grant.auto_tool_grant?()=>this.authorizeFileTransfer(grant):undefined));
     this.chats=new ChatService(ctx.storage,this.accounts,{publicUrl:env.PUBLIC_URL,
       device:(id,identity)=>this.chatDevice(identity,id),webhookFetch:env.webhookFetch!,blobs:env.chatBlobs,
       equal:ctx.equal,schedule:time=>this.scheduler.schedule('chat',time),
-      changed:id=>this.notifyChat(id),background:work=>{
+      changed:id=>this.notifyChat(id),
+      claimAvailability:(tx,device,id,actor)=>this.approvals.availability(tx,device,id,actor.kind==='account'?actor.actor.id:undefined),
+      background:work=>{
         const observed=work.catch(error=>console.error('chat delivery',(error as Error).name));
         if(ctx.waitUntil)ctx.waitUntil(observed);else void observed;
       }});
@@ -130,18 +136,22 @@ export class ComputerHubCore {
     }));
   }
 
-  private async notifyApprovals(device:string,records:Data[]):Promise<void> {
-    await Promise.all([...new Set(records.map(record=>record.chat_id).filter(Boolean))].map(id=>this.notifyChat(id)));
+  private async notifyClaimAvailability(device:string):Promise<void> {
     const id=await this.refs.assign('c',device);
     await Promise.all(this.ctx.getWebSockets('chat-live').map(async socket=>{
       const state=socket.deserializeAttachment() as Data;
-      if(state.device_id!==device || !records.some(record=>!record.chat_id))return;
+      if(state.device_id!==device)return;
       try {
         if(state.expires_at!==null && state.expires_at<=Date.now())throw new Error('Chat login expired');
         await this.chatDevice(state.principal ?? {kind:'account',actor:{id:state.account,epoch:state.epoch}},device);
         socket.send(JSON.stringify({type:'approvals.changed',device_id:id}));
       }catch{socket.close(1008,'Chat access expired');}
     }));
+  }
+
+  private async notifyApprovals(device:string,records:Data[],availabilityChanged:boolean):Promise<void> {
+    const chats=[...new Set(records.map(record=>record.chat_id).filter(Boolean))];
+    await Promise.all([...chats.map(id=>this.notifyChat(id)),...(availabilityChanged?[this.notifyClaimAvailability(device)]:[])]);
     for(const record of records)if(record.notification && !record.notification.delivered_at) {
       try {await this.deliverApprovalNotice(record.id);}catch { /* Durable target is retried by the next query or decision. */ }
     }
@@ -151,7 +161,7 @@ export class ComputerHubCore {
     const notice=await this.approvals.notification(id);
     if(!notice || notice.delivered_at)return;
     const record=await this.approvals.record(id);
-    await this.chats.approvalNotice(notice.principal,notice.chat_id,id,notice.decision,record.tool);
+    await this.chats.approvalNotice(notice.principal,notice.chat_id,id,notice.decision,record.tool,notice.origin);
     await this.approvals.markNotification(id,notice.chat_id);
   }
 
@@ -315,10 +325,21 @@ export class ComputerHubCore {
       return {approvals:records.map(record=>({id:record.id,state:record.state,decision:record.decision,
         expires_at:record.expires_at,device_id:device.id}))};
     }
+    if(action==='approval-claim') {
+      const chat=await this.chats.authorize(principal,args.chat_id);
+      const guard=(tx:KeyStore)=>this.guardChatApproval(tx,principal,chat.id,chat.device);
+      const account=principal.kind==='account'?principal.actor.id:undefined;
+      if(args.id===undefined)return {approvals:await this.approvals.available(chat.device,chat.id,account,guard)};
+      if(typeof args.id!=='string')throw new Error('无效审批编号');
+      return this.approvals.claim(args.id,chat.device,chat.id,account,guard);
+    }
     if(action==='approval-details'||action==='approval-decide') {
       const record=await this.approvals.record(args.id);
       const device=await this.chatDevice(principal,record.device);
       if(action==='approval-details') {
+        if(record.channel!=='chat' || !record.chat_id || args.chat_id!==record.chat_id)
+          throw Object.assign(new Error('请在审批指定的对话查看详情'),{code:'approval_chat_mismatch'});
+        if(record.chat_id)await this.chats.authorize(principal,record.chat_id);
         const details=await this.approvals.details(args.id);
         return {id:record.id,state:details.state,decision:details.decision,command:details.command,
           cwd:details.cwd,justification:details.justification,expires_at:record.expires_at,device_id:device.id};
@@ -327,20 +348,19 @@ export class ComputerHubCore {
         const selected=await this.chats.authorize(principal,args.chat_id);
         if(selected.device!==record.device)throw Object.assign(new Error('审批与当前对话不属于同一台电脑'),{code:'device_forbidden'});
       }
-      if(record.chat_id && args.chat_id!==record.chat_id)throw Object.assign(new Error('请在审批指定的对话中提交决定'),{code:'approval_chat_mismatch'});
+      if(record.channel!=='chat' || !record.chat_id || args.chat_id!==record.chat_id)
+        throw Object.assign(new Error('请在审批指定的对话中提交决定'),{code:'approval_chat_mismatch'});
       let delivery_pending=false;
       try {
         await this.approvals.decide(args.id,args.decision,undefined,
           args.chat_id?{chat_id:args.chat_id,principal}:undefined,async(tx,current)=>{
-            await authorizeIdentity(this.accounts,this.ctx.storage,principal,current.device,tx);
-            if(args.chat_id) {
-              const chat=await tx.get<Data>('chat:'+args.chat_id);
-              if(!chat || chat.device!==current.device)throw Object.assign(new Error('对话不存在或不属于这台电脑'),{code:'chat_not_found'});
-            }
+            if(current.channel!=='chat' || !current.chat_id || args.chat_id!==current.chat_id)
+              throw Object.assign(new Error('请在审批指定的入口处理'),{code:'approval_chat_mismatch'});
+            await this.guardChatApproval(tx,principal,args.chat_id,current.device);
           });
       }catch(error) {
         // A recorded decision survives a disconnected computer; report it without promising execution.
-        if(!['request_pending','connection_interrupted'].includes((error as Data).code) && (error as Error).name!=='TimeoutError')throw error;
+        if(!['request_pending','connection_interrupted','computer_offline'].includes((error as Data).code) && (error as Error).name!=='TimeoutError')throw error;
         const current=await this.approvals.record(args.id);
         if(!current.decision || !current.delivery_pending)throw error;
         await this.chatDevice(principal,current.device);
@@ -349,11 +369,17 @@ export class ComputerHubCore {
       let notification_pending=false;
       try {await this.deliverApprovalNotice(args.id);}catch {notification_pending=true;}
       const current=await this.approvals.record(args.id);
-      return {id:current.id,state:current.state,decision:current.decision,delivery_pending,
+      return {id:current.id,state:current.state,decision:current.decision,delivery_pending:delivery_pending||!!current.delivery_pending,
         ...(notification_pending?{notification_pending:true}:{})};
     }
     if(action==='connect'||action==='disconnect')return this.chats.channelControl(action,args,principal);
     return this.chats.action(action,args,principal);
+  }
+
+  private async guardChatApproval(tx:KeyStore,principal:ChatIdentity,chatId:string,device:string):Promise<void>{
+    await authorizeIdentity(this.accounts,this.ctx.storage,principal,device,tx);
+    const chat=await tx.get<Data>('chat:'+chatId);
+    if(!chat || chat.device!==device)throw Object.assign(new Error('对话不存在或不属于这台电脑'),{code:'chat_not_found'});
   }
 
   private async control(action:string,value:Data):Promise<Response> {
@@ -441,8 +467,10 @@ export class ComputerHubCore {
     if(action==='approve') return json(await this.approve(value.code,actor));
     if(action==='command-approval') {
       await this.checkApproval(value.id,actor);
+      this.requireHostApproval(await this.approvals.record(value.id));
       if(value.decision) {
-        const outcome=await this.approvals.decide(value.id,value.decision);
+        const outcome=await this.approvals.decide(value.id,value.decision,undefined,undefined,
+          async(_tx,record)=>this.requireHostApproval(record));
         return json(await this.project(outcome.result,outcome.record.projection,actor));
       }
       return json(await this.approvals.details(value.id));
@@ -498,6 +526,10 @@ export class ComputerHubCore {
     await this.accounts.assertAccess(actor,record.device);
     if(actor.role!=='admin' && (record.projection.account || 'u1')!==actor.id)
       throw Object.assign(new Error('审批不属于当前账号'),{code:'handle_forbidden'});
+  }
+
+  private requireHostApproval(record:Data):void {
+    if(record.channel!=='host')throw Object.assign(new Error('此审批须在聊天中处理'),{code:'approval_channel'});
   }
 
   drain():boolean {
@@ -582,13 +614,14 @@ export class ComputerHubCore {
       ...(status?.limitation?{limitation:status.limitation}:{})};
   }
 
-  async lockMode(id:string,enabled?:boolean,accessRevision?:number):Promise<Data> {
+  async lockMode(id:string,enabled?:boolean,accessRevision?:number,autoGrant?:AutoToolGrant):Promise<Data> {
     const raw=await this.refs.raw(id);
     const record=await this.ctx.storage.transaction(async tx=>{
       const current=await tx.get<Data>('device:'+raw);
       if(!current) throw new Error('电脑不存在');
       if(accessRevision!==undefined && (current.access?.revision??0)!==accessRevision)
         throw Object.assign(new Error('电脑权限已更新，请重新调用'),{code:'access_changed'});
+      if(autoGrant)await this.chats.assertAutoToolGrant(autoGrant,raw,tx);
       const previous=current.lock_mode || {enabled:true,revision:0};
       if(enabled!==undefined) {
         current.lock_mode={enabled,revision:previous.revision+(enabled===previous.enabled?0:1)};
@@ -693,6 +726,7 @@ export class ComputerHubCore {
     const latest=await this.ctx.storage.get<Data>('device:'+raw);
     await this.ctx.storage.put('device:'+raw,{...latest,access,workspace_sequence:sequence,access_applied:applied,access_error:''});
     await this.approvals.invalidateTools(raw,access.revision);
+    await this.notifyClaimAvailability(raw);
     return {saved:true,applied:applied===access.revision,offline:!this.ctx.getWebSockets(raw).length};
   }
 
@@ -704,12 +738,15 @@ export class ComputerHubCore {
     if(!issuer || !await this.accounts.canAccess(issuer,entry.device)) return json({error:'下载授权已失效'},403);
     if(actor.role!=='admin' && actor.id!==issuer.id) return json({error:'下载链接不属于当前账号'},403);
     if(!await this.accounts.canAccess(actor,entry.device)) return json({error:'无权下载这台电脑的文件'},403);
+    const beforeSend=entry.auto_tool_grant?()=>this.chats.assertAutoToolGrant(entry.auto_tool_grant,entry.device):undefined;
+    try {await beforeSend?.();}catch(error){return json({error:(error as Data).code},403);}
     let offset=0;
     const stream=new ReadableStream<Uint8Array>({pull:async controller=>{
       try {
         await this.accounts.assertAccess(actor,entry.device);
         await this.accounts.assertAccess(issuer,entry.device);
-        const chunk=await this.rpc(entry.device,'computer.download',{session:entry.session,path:entry.path,offset},false,signal);
+        const chunk=await this.rpc(entry.device,'computer.download',{session:entry.session,path:entry.path,offset},false,signal,undefined,undefined,beforeSend);
+        await beforeSend?.();
         if(chunk.end){controller.close();return;}
         const bytes=Uint8Array.from(atob(chunk.data),(c)=>c.charCodeAt(0));offset=chunk.next;controller.enqueue(bytes);
       } catch(error) {controller.error(error);}
@@ -757,7 +794,7 @@ export class ComputerHubCore {
     return ref.raw;
   }
 
-  async checkToolPermission(method:string,args:Data,actor:Actor):Promise<'allow'|'ask'> {
+  async checkToolPermission(method:string,args:Data,actor:Actor,observation?:ObservedToolTicket):Promise<'allow'|'ask'> {
     if(!hasToolPermission(method))return 'allow';
     let device:string;
     if(['computer.open','computer.workspaces','computer.lock_mode'].includes(method)){
@@ -772,7 +809,16 @@ export class ComputerHubCore {
     await this.accessUpdates.get(device);
     await this.accounts.assertAccess(actor,device);
     const settings=await this.ctx.storage.get<Data>('device:'+device);
+    if(await this.autoOverride(method,settings,observation,actor,device))return 'allow';
     return this.deviceToolPermission(method,settings);
+  }
+
+  private async autoOverride(method:string,settings:Data|undefined,observation:ObservedToolTicket|undefined,actor:Actor,device:string):Promise<AutoToolGrant|undefined>{
+    if(!hasToolPermission(method)||toolPermission(settings?.access,method)==='allow')return;
+    const grant=await this.chats.autoToolGrant(observation,actor,device);
+    if(grant&&method==='computer.transfer'&&!settings?.capabilities?.includes('chat_auto_transfer_v1'))
+      throw Object.assign(new Error('请先更新电脑端以在自动模式下传输文件'),{code:'transfer_update_required'});
+    return grant;
   }
 
   private deviceToolPermission(method:string,settings:Data|undefined):'allow'|'ask'{
@@ -793,7 +839,8 @@ export class ComputerHubCore {
       throw Object.assign(new Error('Transfer session changed'),{code:'handle_forbidden'});
     if((settings?.access?.revision??0)!==grant.revision)
       throw Object.assign(new Error('Transfer permission changed'),{code:'approval_invalidated'});
-    this.deviceToolPermission('computer.transfer',settings);
+    if(grant.auto_tool_grant)await this.chats.assertAutoToolGrant(grant.auto_tool_grant,grant.device);
+    else this.deviceToolPermission('computer.transfer',settings);
     if(!settings?.capabilities?.includes('resumable_file_transfer_v1'))
       throw Object.assign(new Error('Computer requires transfer support'),{code:'transfer_update_required'});
   }
@@ -803,7 +850,7 @@ export class ComputerHubCore {
     const previous=await this.ctx.storage.get<Data>('command-approval:'+id);
     if(previous){
       await this.approvals.record(id,caller);
-      if(previous.decision)return this.approvalResult(id,previous.decision,caller,actor);
+      if(previous.decision)return this.approvalResult(id,undefined,caller,actor);
       if(previous.expires_at<=Date.now() || previous.state!=='pending')return {approved:false,approval_state:'expired',request_id:record.short};
       return this.toolApprovalView(record,previous);
     }
@@ -824,11 +871,15 @@ export class ComputerHubCore {
 
   private toolApprovalView(record:Data,approval:Data):Data{
     return {state:'awaiting_approval',request_id:record.short,device_id:approval.tool.device,
-      approval:{id:approval.id,expires_at:approval.expires_at,channel:approval.channel,
-        ...(approval.chat_id?{chat_id:approval.chat_id}:{}),
-        url:this.env.PUBLIC_URL+'/manage/command-approval?id='+encodeURIComponent(approval.id)},
-      ...(approval.channel==='chat'?{request_key:record.short}:{}),
+      approval:this.approvalView(approval),request_key:record.short,
       recover:{tool:'computer.recover',arguments:{device_id:approval.tool.device,request_id:record.short}}};
+  }
+
+  private approvalView(record:Data):Data {
+    return {id:record.id,expires_at:record.expires_at,channel:record.channel,
+      ...(record.chat_id?{chat_id:record.chat_id}:{}),
+      ...(record.channel==='host'?{url:this.env.PUBLIC_URL+'/manage/command-approval?id='+encodeURIComponent(record.id)}:{}),
+      ...(record.channel==='unassigned'?{message:'审批尚未指定入口；在同一台电脑的 Bridge 聊天中按 F6，或在网页点「领取审批」'}:{})};
   }
 
   private async finishToolApproval(record:Data):Promise<Data>{
@@ -874,25 +925,40 @@ export class ComputerHubCore {
     const result=await this.rpc(record.device,'computer.tool_decide',{
       request_id,method:projection.method,fingerprint:record.digest,caller:record.caller,revision:record.revision,
       decision:approved?'allowed-once':'cancelled',state,
-    },false,AbortSignal.timeout(30_000));
+    },approved&&!!projection.module_confirmation,AbortSignal.timeout(30_000),undefined,undefined,
+    approved&&projection.auto_tool_grant?()=>this.chats.assertAutoToolGrant(projection.auto_tool_grant,record.device):undefined);
     await this.requests.complete(request_id,false);
     return result;
   }
 
-  async invoke(method: string, args: Data, confirmed: boolean, signal: AbortSignal, caller: string, actor:Actor): Promise<any> {
+  private async approvalProjection(args:Data,device:string,observation?:ObservedToolTicket):Promise<Data> {
+    const {approval_channel,approval_chat_id}=args;
+    if(approval_chat_id!==undefined && approval_channel!=='chat')
+      throw Object.assign(new Error('只有聊天审批可以指定目标对话'),{code:'approval_chat_required'});
+    const chat=observation?await this.ctx.storage.get<Data>('chat:'+observation.chatId):undefined;
+    const origin:ApprovalOrigin|undefined=observation&&chat?.device===device&&chat.writer===observation.writerId?{
+      chatId:observation.chatId,writerId:observation.writerId,account:observation.account,epoch:observation.epoch,caller:observation.caller,
+    }:undefined;
+    return {approval_channel:approval_channel??'unassigned',...(approval_chat_id?{approval_chat_id}:{}),
+      ...(origin?{approval_origin:origin}:{})};
+  }
+
+  async invoke(method: string, args: Data, confirmed: boolean, signal: AbortSignal, caller: string, actor:Actor,observation?:ObservedToolTicket): Promise<any> {
     if(method.startsWith('chat.'))return this.chatInvoke(method.slice(5),args,signal,caller,actor);
     if (method === "computer.list") return this.list(actor);
-    if (method === "computer.recover") return this.recover(args,signal,actor);
+    if (method === "computer.recover") return this.recover(args,signal,actor,observation);
     if (method === "computer.lock_mode") {
       const device=await this.refs.raw(args.device_id);
       await this.accessUpdates.get(device);
       await this.accounts.assertAccess(actor,device);
       const settings=(await this.ctx.storage.get<Data>('device:'+device))!;
-      const permission=this.deviceToolPermission(method,settings);
+      const autoGrant=await this.autoOverride(method,settings,observation,actor,device);
+      const permission=autoGrant?'allow':this.deviceToolPermission(method,settings);
       const revision=settings.access?.revision??0;
-      if(permission==='allow' && !args.request_key)return this.lockMode(args.device_id,args.enabled,revision);
+      if(permission==='allow' && !args.request_key)return this.lockMode(args.device_id,args.enabled,revision,autoGrant);
       const projection={method,device,account:actor.id,account_epoch:actor.epoch,
-        power_enabled:args.enabled,approval_channel:args.approval_channel??'host',approval_chat_id:args.approval_chat_id};
+        ...(autoGrant?{auto_tool_grant:autoGrant}:{}),
+        power_enabled:args.enabled,...await this.approvalProjection(args,device,observation)};
       const record=await this.requests.begin(device,method,args,projection,async tx=>{
         if(permission==='ask' && args.approval_channel==='chat')
           await this.chats.approvalTarget(tx,actor,args.approval_chat_id,device);
@@ -900,7 +966,8 @@ export class ComputerHubCore {
       if(permission==='ask' || (await this.ctx.storage.get<Data>('command-approval:approval_'+record.id))?.tool)
         return this.stageToolApproval(record,args,settings,confirmed,caller,actor,signal);
       if(record.power_result)return record.power_result;
-      const result=await this.lockMode(args.device_id,args.enabled,revision);
+      const grant=this.originalAutoGrant(record,autoGrant);
+      const result=await this.lockMode(args.device_id,args.enabled,revision,grant);
       await this.ctx.storage.transaction(async tx=>{
         const key='request:'+record.id,request=(await tx.get<Data>(key))!;
         await tx.put(key,{...request,power_result:result});
@@ -908,7 +975,8 @@ export class ComputerHubCore {
       await this.requests.complete(record.id,true);
       return result;
     }
-    if(method === "computer.module_call" || method === "computer.module_tools") await this.modules.require(args.module);
+    const module=method==='computer.module_call'||method==='computer.module_tools'?await this.modules.require(args.module):undefined;
+    const moduleConfirmation=method==='computer.module_call'&&!confirmed?module?.confirmation(args.action):undefined;
     args = {...args};
     const legacyWorkspace = typeof args.session === "string" && args.session.startsWith("workspace_");
     const selectedFile = method === "computer.files" ? args.payload?.file_ref : undefined;
@@ -942,9 +1010,11 @@ export class ComputerHubCore {
         delete args.file_ref;
       }
     }
+    await this.accessUpdates.get(device);
     await this.accounts.assertAccess(actor,device);
     const settings=await this.ctx.storage.get<Data>('device:'+device);
-    const permission=this.deviceToolPermission(method,settings);
+    const autoGrant=await this.autoOverride(method,settings,observation,actor,device);
+    const permission=autoGrant?'allow':this.deviceToolPermission(method,settings);
     if(method==='computer.files'){
       const payload=args.payload??{};
       const encoded=payload.base64;
@@ -980,12 +1050,16 @@ export class ComputerHubCore {
       args._definition={source:reference.source,locator:reference.locator};
     }
     const outside=method==='computer.exec' && args.sandbox_permissions && !access.full_access;
-    const requiresToolApproval=permission==='ask' && !outside &&
+    const requiresToolApproval=!!moduleConfirmation || permission==='ask' && !outside &&
       (method!=='computer.transfer'||['upload_begin','download_begin'].includes(args.action));
+    if(moduleConfirmation && !settings?.capabilities?.includes('tool_permissions_v1'))
+      throw Object.assign(new Error('请先更新电脑端以支持模块确认'),{code:'tool_permission_update_required'});
     const projection={method,device,scope,root,context,selectedFile,legacyWorkspace,account:actor.id,account_epoch:actor.epoch,
+      ...(autoGrant?{auto_tool_grant:autoGrant}:{}),
       ...(method==='computer.transfer'?{transfer_revision:access.revision}:{}),
-      ...(outside && permission==='ask'?{permission_confirmation:true}:{}),
-      ...(method==='computer.exec' || requiresToolApproval?{approval_channel:args.approval_channel??'host',...(args.approval_chat_id?{approval_chat_id:args.approval_chat_id}:{})}:{}),args:{
+      ...(moduleConfirmation?{module_confirmation:moduleConfirmation}:{}),
+      ...((outside||moduleConfirmation) && permission==='ask'?{permission_confirmation:true}:{}),
+      ...(method==='computer.exec' || requiresToolApproval?await this.approvalProjection(args,device,observation):{}),args:{
       session:args.session,operation:args.operation,action:args.action,consume:args.consume,
       payload:{operation:args.payload?.operation,consume:args.payload?.consume}}};
     const record=await this.requests.begin(device,method,args,projection,async tx=>{
@@ -998,11 +1072,15 @@ export class ComputerHubCore {
     if(method==='computer.transfer'&&['upload_begin','download_begin'].includes(args.action))args={...args,request_key:record.id};
     if(requiresToolApproval || (await this.ctx.storage.get<Data>('command-approval:approval_'+record.id))?.tool)
       return this.stageToolApproval(record,args,settings!,confirmed,caller,actor,signal);
+    const grant=this.originalAutoGrant(record,autoGrant);
+    const beforeSend=observation&&(grant||observation.roundId||observation.reviewId)
+      ?()=>this.chats.assertToolDispatch(observation,device,grant):undefined;
+    const transferScope=grant&&method==='computer.transfer'?{_auto_tool_grant:transferModeKey(grant)}:{};
     const info=await this.ctx.storage.get<Data>('device:'+device);
     let completed=false;
     try {
       const result=await this.rpc(device,method,info?.capabilities?.includes('tool_permissions_v1')
-        ?{...args,_tool_revision:access.revision}:args,confirmed,signal,info?.request_protocol===1?record:undefined);
+        ?{...args,...transferScope,_tool_revision:access.revision}:args,confirmed,signal,info?.request_protocol===1?record:undefined,undefined,beforeSend);
       completed=true;
       await this.requests.complete(record.id,false);
       const projected=await this.project(result,{...record.projection,request_id:record.id},actor);
@@ -1015,7 +1093,7 @@ export class ComputerHubCore {
         // Older clients have no completion envelope. Confirm their durable receipt;
         // an application error and a transport failure are different facts.
         try {
-          const receipt=await this.rpc(device,'bridge.recover',{request_id:record.id,seconds:0},false,AbortSignal.timeout(5000));
+          const receipt=await this.rpc(device,'bridge.recover',{request_id:record.id,seconds:0,...transferScope},false,AbortSignal.timeout(5000),undefined,undefined,beforeSend);
           completed=receipt.state==='completed';
         } catch { /* No durable confirmation: preserve the recoverable pending record. */ }
       }
@@ -1027,7 +1105,14 @@ export class ComputerHubCore {
     }
   }
 
-  private async recover(args:Data,signal:AbortSignal,actor:Actor):Promise<Data> {
+  private originalAutoGrant(record:Data,grant:AutoToolGrant|undefined):AutoToolGrant|undefined{
+    const original:AutoToolGrant|undefined=record.projection.auto_tool_grant;
+    if((original||grant)&&(!original||!grant||transferModeKey(original)!==transferModeKey(grant)))
+      throw Object.assign(new Error('原请求不属于当前自动模式授权'),{code:'request_conflict'});
+    return original;
+  }
+
+  private async recover(args:Data,signal:AbortSignal,actor:Actor,observation?:ObservedToolTicket):Promise<Data> {
     const deadline=Date.now()+((args.seconds || 0)>0?args.seconds*1000:5000);
     const device=await this.refs.raw(args.device_id);
     await this.accounts.assertAccess(actor,device);
@@ -1040,7 +1125,11 @@ export class ComputerHubCore {
       return approval.expires_at<=Date.now()?{request_id:record.short,state:'expired'}:this.toolApprovalView(record,approval);
     }
     let reply:Data;
-    try {reply=await this.rpc(device,'bridge.recover',{request_id:record.id,seconds:args.seconds || 0},false,signal,undefined,deadline);}
+    const grant:AutoToolGrant|undefined=record.method==='computer.exec'?undefined:record.projection.auto_tool_grant;
+    if(grant)this.originalAutoGrant(record,await this.chats.autoToolGrant(observation,actor,device));
+    const beforeSend=grant?()=>this.chats.assertAutoToolGrant(grant,device):undefined;
+    const transferScope=grant&&record.method==='computer.transfer'?{_auto_tool_grant:transferModeKey(grant)}:{};
+    try {reply=await this.rpc(device,'bridge.recover',{request_id:record.id,seconds:args.seconds || 0,...transferScope},false,signal,undefined,deadline,beforeSend);}
     catch(error) {
       if(['request_unknown','request_expired'].includes((error as Data).code))
         return {request_id:record.short,state:(error as Data).code==='request_unknown'?'unknown':'expired',
@@ -1073,10 +1162,15 @@ export class ComputerHubCore {
     return {request_id:record.short,state:'completed',result};
   }
 
-  async approvalResult(id:string,decision:string,caller:string,actor:Actor):Promise<any> {
+  async approvalResult(id:string,decision:string|undefined,caller:string,actor:Actor):Promise<any> {
     await this.checkApproval(id,actor);
-    const outcome=await this.approvals.decide(id,decision,caller);
-    return this.project(outcome.result,outcome.record.projection,actor);
+    if(decision!==undefined) {
+      const outcome=await this.approvals.decide(id,decision,caller,undefined,
+        async(_tx,record)=>this.requireHostApproval(record));
+      return this.project(outcome.result,outcome.record.projection,actor);
+    }
+    const record=await this.approvals.record(id,caller);
+    return this.project(await this.approvals.result(id,caller),record.projection,actor);
   }
 
   private async project(result:Data,projection:Data,actor:Actor):Promise<any> {
@@ -1095,9 +1189,7 @@ export class ComputerHubCore {
         {session:projection.args.session,operation:result.operation,seconds:0},false,AbortSignal.timeout(5000));
       if(result.state==='awaiting_approval') {
         const approval=await this.approvals.register(result.approval,projection);
-        result={...result,approval:{id:approval.id,expires_at:approval.expires_at,channel:approval.channel,
-          ...(approval.chat_id?{chat_id:approval.chat_id}:{}),
-          url:this.env.PUBLIC_URL+'/manage/command-approval?id='+encodeURIComponent(approval.id)}};
+        result={...result,approval:this.approvalView(approval)};
       }
     }
     const {method,device,scope,root,context,selectedFile,legacyWorkspace,args}=projection;
@@ -1120,10 +1212,12 @@ export class ComputerHubCore {
       return decorate(result);
     }
     if(method==='computer.present') {
+      if(projection.auto_tool_grant)await this.chats.assertAutoToolGrant(projection.auto_tool_grant,device);
       const files=[];
       for(const file of result.files) {
         const token=opaque();
-        await this.ctx.storage.put('download:'+token,{...file,device,session:args.session,account:projection.account || 'u1',account_epoch:actor.epoch,expires_at:Date.now()+3600_000});
+        await this.ctx.storage.put('download:'+token,{...file,device,session:args.session,account:projection.account || 'u1',account_epoch:actor.epoch,expires_at:Date.now()+3600_000,
+          ...(projection.auto_tool_grant?{auto_tool_grant:projection.auto_tool_grant}:{})});
         files.push({name:file.name,size:file.size,media_type:file.media_type,url:this.env.PUBLIC_URL+'/download/'+token});
       }
       await this.ctx.storage.setAlarm(Date.now()+3600_000);
@@ -1174,8 +1268,8 @@ export class ComputerHubCore {
   }
 
   async rpc(device:string,method:string,params:Data,confirmed:boolean,signal:AbortSignal,receipt?:Data,
-    deadline?:number):Promise<any> {
-    return this.transport.rpc(device,method,params,confirmed,signal,receipt,deadline);
+    deadline?:number,beforeSend?:()=>Promise<void>):Promise<any> {
+    return this.transport.rpc(device,method,params,confirmed,signal,receipt,deadline,beforeSend);
   }
   private async send(ws:DeviceSocket,value:Data):Promise<void> {
     this.transport.control(ws,value);

@@ -14,9 +14,11 @@ from functools import lru_cache
 from pathlib import Path
 from types import FunctionType
 from typing import Any
+from unicodedata import category, name
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline import StateInline
+from markdown_it.rules_inline.emphasis import tokenize as tokenize_emphasis
 from markdown_it.token import Token
 from mdit_py_plugins.amsmath import amsmath_block, amsmath_plugin
 from mdit_py_plugins.texmath import texmath_plugin
@@ -59,6 +61,21 @@ def formula(tex: str) -> tuple[str | None, str]:
     return result.text, result.reason
 
 
+def cjk_emphasis(state: StateInline, silent: bool) -> bool:
+    start, first = state.pos, len(state.delimiters)
+    accepted = tokenize_emphasis(state, silent)
+    if accepted and not silent and state.src[start] == "*":
+        before = state.src[start - 1] if start else " "
+        after = state.src[state.pos] if state.pos < state.posMax else " "
+        cjk_names = ("CJK ", "HIRAGANA ", "KATAKANA ", "HANGUL ", "BOPOMOFO ")
+        can_open = category(after).startswith(("P", "S")) and name(before, "").startswith(cjk_names)
+        can_close = category(before).startswith(("P", "S")) and name(after, "").startswith(cjk_names)
+        for delimiter in state.delimiters[first:]:
+            delimiter.open |= can_open
+            delimiter.close |= can_close
+    return accepted
+
+
 def parser() -> MarkdownIt:
     md = (
         MarkdownIt("commonmark", {"html": False, "breaks": True})
@@ -72,6 +89,7 @@ def parser() -> MarkdownIt:
     namespace = {**amsmath_block.__globals__, "RE_OPEN": r"\\begin\{([A-Za-z][A-Za-z0-9]*)(\*?)\}"}
     environment_rule = FunctionType(amsmath_block.__code__, namespace)
     md.block.ruler.at("amsmath", environment_rule)
+    md.inline.ruler.at("emphasis", cjk_emphasis)
 
     def unclosed(state: StateInline, silent: bool) -> bool:
         rest = state.src[state.pos :]
@@ -90,7 +108,11 @@ def parser() -> MarkdownIt:
 
 @lru_cache(maxsize=256)
 def parse_message(text: str) -> list[Token]:
-    return parser().parse(text)
+    tokens = parser().parse(text)
+    for token in tokens:
+        if token.type == "fence" and token.info.split()[:1] == ["math"]:
+            token.type = "math_fence"
+    return tokens
 
 
 def has_math(text: str) -> bool:
