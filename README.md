@@ -1,4 +1,4 @@
-# Computer Bridge 0.2.6-beta
+# Computer Bridge 0.2.6
 
 网页和终端聊天支持 Markdown 与科研公式。网页使用 MathJax 完整数学排版；终端显示二维字符公式，`/math` 可在本机打开完整 SVG 排版，无需再次登录或安装 TeX。公式资源随产品提供，不依赖第三方渲染服务。
 

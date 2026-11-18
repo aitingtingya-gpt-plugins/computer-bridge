@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import platform
 import re
 import secrets
 import subprocess
@@ -55,6 +56,8 @@ from .chat_attachments import (
 from .chat_client import ChatClient
 from .chat_clipboard import copy_text, read_clipboard
 from .chat_commands import BY_NAME, CommandCompleter, SlashMenu, help_for_mode
+from .chat_dashboard import render_dashboard
+from .chat_dashboard_update import read_dashboard_update
 from .chat_delivery import DeliveryQueue
 from .chat_dialogs import ChatDialogs, bind_keys, text_navigation
 from .chat_export import export_chat, export_filename
@@ -173,6 +176,17 @@ class ChatTerminal:
         self.pending_creations: dict[str, Json] = {}
         self.chat: Json | None = None
         self.chats: list[Json] = []
+        self.startup_list_state = "正在读取会话…"
+        self.startup_version = "—"
+        self.startup_source = github_update.DEFAULT_REPOSITORY
+        self.startup_channel = github_update.CHANNEL_LABELS["stable"]
+        self.startup_latest = ""
+        self.startup_update = "等待检查"
+        self.startup_gateway = "正在连接"
+        self.startup_local: Json = {}
+        self.startup_device_epoch = 0
+        self.startup_devices_identity: str | None = None
+        self.startup_device_status = "正在读取账户设备…"
         self.messages: dict[int, Json] = {}
         self.sync_cursor = 0
         self.first_cursor = 0
@@ -472,7 +486,13 @@ class ChatTerminal:
                 self.start_review(self.navigate_review())
 
         layout = HSplit([
-            Frame(self.transcript_window),
+            FloatContainer(
+                content=Frame(self.transcript_window),
+                floats=[Float(top=1, right=1, bottom=1, left=1, content=ConditionalContainer(
+                    Window(FormattedTextControl(self.startup_dashboard)),
+                    filter=Condition(lambda: not self.chat and not self.resume),
+                ))],
+            ),
             ConditionalContainer(self.review.container, filter=Condition(lambda: self.review.active),
                                  alternative_content=Frame(self.input)),
             Window(FormattedTextControl(self.status), height=1, style="class:status"),
@@ -865,6 +885,90 @@ class ChatTerminal:
             errors=tuple(getattr(self, "errors", ())),
         )
 
+    def startup_dashboard(self) -> FormattedText:
+        size = self.application.output.get_size()
+        device = self.client.device
+        device_id = str(device.get("id") or "")
+        local = self.startup_local or next(
+            (row for row in self.computers if device_id and str(row.get("id", "")) == device_id), {}
+        )
+        if device_id and self.latency_target == (self.client.identity, device_id):
+            local = self.latency or local
+        _, latency = latency_status(local)
+        if latency.startswith("电脑 "):
+            latency = latency.removeprefix("电脑 ")
+        elif latency == "电脑延迟未知":
+            latency = "未测得" if self.startup_gateway != "正在连接" else "测量中"
+        identity = "未登录 · 本机身份"
+        account_devices = None
+        account_device_status = ""
+        if self.client.mode == "account":
+            name = getattr(self.client, "account", {}).get("username")
+            identity = f"已登录 · {name}" if name else "已登录"
+            account_devices = []
+            if self.startup_devices_identity == self.client.identity:
+                for row in self.computers:
+                    connection = row.get("connection_state")
+                    if row.get("online") is False or connection == "offline":
+                        state, measured = "离线", ""
+                    else:
+                        state = {"recovering": "恢复中", "degraded": "连接不稳"}.get(
+                            connection, "在线" if row.get("online") is True or connection == "healthy" else "状态未知")
+                        _, measured = latency_status(row)
+                        measured = measured.removeprefix("电脑 ").removeprefix("电脑")
+                        if measured in ("延迟未知", "恢复中", "连接不稳"):
+                            measured = "延迟未测得"
+                    account_devices.append((
+                        str(row.get("name") or row.get("id") or "未命名设备"),
+                        str(row.get("system") or ""), state, measured,
+                    ))
+            account_device_status = self.startup_device_status
+        chats = [
+            (
+                str(item.get("title") or "未命名会话"),
+                str(item.get("id") or ""),
+                self._chat_mode_label(item, with_prefix=True),
+                STATES.get(str(item.get("state") or ""), ""),
+                str(item.get("device_name") or ""),
+                beijing_message_time(item.get("updated_at")),
+            )
+            for item in sorted(self.chats, key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+        ]
+        # The existing transcript frame and composer reserve two border cells
+        # each, four editor rows and one status row.
+        return render_dashboard(
+            max(0, size.columns - 2), max(0, size.rows - 9),
+            identity=identity, device=str(device.get("name") or local.get("name") or "本机"),
+            system=str(device.get("system") or local.get("system") or platform.system()),
+            connection=self.startup_gateway, latency=latency,
+            chats=chats, chat_state=self.startup_list_state,
+            current=self.startup_version, source=self.startup_source,
+            channel=self.startup_channel, latest=self.startup_latest, update=self.startup_update,
+            account_devices=account_devices, account_device_status=account_device_status,
+        )
+
+    async def refresh_startup_update(self) -> None:
+        home_dir = self.client.config.parent
+        self.startup_version = github_update.current_installed_version(home_dir)
+        self.startup_update = "检查中"
+        if not self.chat:
+            self.application.invalidate()
+        self.startup_source, self.startup_channel, self.startup_latest, self.startup_update = (
+            await read_dashboard_update(home_dir, self.startup_version)
+        )
+        if not self.chat:
+            self.application.invalidate()
+
+    async def refresh_startup_local(self, target: tuple[str, str]) -> None:
+        try:
+            result = await self.client.action("devices", device_id=target[1])
+            local = next((row for row in result["computers"] if str(row.get("id", "")) == target[1]), {})
+        except (Error, OSError, httpx2.HTTPError):
+            local = {}
+        if not self.chat and target == (self.client.identity, str(self.client.device.get("id") or "")):
+            self.startup_local = local
+            self.application.invalidate()
+
     def status(self) -> FormattedText:
         device = self.selected_device
         chat = self.chat or {}
@@ -998,8 +1102,19 @@ class ChatTerminal:
         return {"device_id": self.client.device["id"]} if self.client.mode == "device" else {}
 
     async def refresh_list(self) -> None:
-        result = await self.client.action("list", **self.list_scope(), limit=1)
+        identity = self.client.identity
+        try:
+            result = await self.client.action("list", **self.list_scope(), limit=5)
+        except (Error, OSError, httpx2.HTTPError):
+            if identity == self.client.identity:
+                self.startup_list_state = "暂无法读取会话"
+                raise
+            return
+        if identity != self.client.identity:
+            return
         self.chats = result["chats"]
+        self.startup_list_state = ""
+        self.application.invalidate()
 
     async def choose(self, title: str, choices: list[tuple[str, str, str]], *,
                      description: str = "", selected_id: str | None = None) -> str | None:
@@ -1243,10 +1358,31 @@ class ChatTerminal:
             await asyncio.sleep(5)
 
     async def refresh_computers(self) -> None:
-        self.computers = (await self.client.action("devices"))["computers"]
+        scope = self.client.identity, self.startup_device_epoch
+        try:
+            computers = (await self.client.action("devices"))["computers"]
+        except (Error, OSError, httpx2.HTTPError):
+            if scope == (self.client.identity, self.startup_device_epoch):
+                self.startup_devices_identity = None
+                self.startup_device_status = "暂无法读取账户设备"
+                if not self.chat and not self.resume:
+                    self.application.invalidate()
+            raise
+        if scope != (self.client.identity, self.startup_device_epoch):
+            return
+        self.computers = computers
+        self.startup_devices_identity = scope[0]
+        self.startup_device_status = ""
         if not self.selected_device and len(self.computers) == 1:
             self.selected_device = self.computers[0]
         await self.restart_latency()
+        if not self.chat and not self.resume:
+            self.startup_gateway = "网关已连接"
+            local_id = str(self.client.device.get("id") or "")
+            if (self.client.mode != "account" and local_id
+                    and local_id != str(self.selected_device.get("id") or "") and self.client.authenticated):
+                self.application.create_background_task(self.refresh_startup_local((self.client.identity, local_id)))
+            self.application.invalidate()
 
     async def choose_computer(self) -> bool:
         await self.refresh_computers()
@@ -1300,6 +1436,13 @@ class ChatTerminal:
         self.draft_attachments = saved.get("attachments", {})
         self.delivery.set_identity(self.client.identity)
         self.chat, self.messages, self.attachments, self.chats = None, {}, [], []
+        self.startup_list_state = "正在读取会话…"
+        self.startup_gateway = "正在连接"
+        self.startup_local = {}
+        self.startup_device_epoch += 1
+        self.startup_devices_identity = None
+        self.startup_device_status = "正在读取账户设备…"
+        self.computers = []
         self.selected_device = dict(self.client.device) if self.client.mode == "device" else {}
         self.has_older, self.network_error, self.sync_cursor = False, False, 0
         self.input.text = ""
@@ -2419,6 +2562,10 @@ class ChatTerminal:
             elif not self.resume:
                 self.notice = "使用 /resume 按名称选择对话，或 /new 新建。"
         except (Error, OSError, httpx2.HTTPError) as exc:
+            if self.startup_gateway == "正在连接":
+                self.startup_gateway = "连接暂不可用"
+            if not self.chats:
+                self.startup_list_state = "暂无法读取会话"
             self.error(str(exc))
             self.application.invalidate()
 
@@ -2428,6 +2575,8 @@ class ChatTerminal:
             if self.drop:
                 self.application.create_background_task(self.drop.run())
             self.application.create_background_task(self.initialize())
+            if not self.resume and not self.chat:
+                self.application.create_background_task(self.refresh_startup_update())
         try:
             await self.application.run_async(pre_run=start)
         finally:

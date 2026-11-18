@@ -13,7 +13,7 @@ import {admitRound,changeGoal,collaborationWakeKey,collaborationWakePrefix,goalK
 import {channelCommandKey,channelDiagnosticsKey,channelOutboxKey,classifyChannelError,eraseChannelDiagnosticsForChat,isChannelRetryable,readChannelDiagnostics,recordChannelDiagnostic,sanitizeChannelCommand,type ChannelAction,type ChannelCommandSummary,type ChannelDiagnostic} from './channel_diagnostics';
 import {maintenanceDiagnosticsKey,readMaintenanceDiagnostics,recordMaintenanceDiagnostic,type MaintenanceDiagnosticPhase} from './maintenance_diagnostics';
 import {buildContext,chatMode,sourceIdentity,fitContextToEnvelope,CHAT_EVENT_BYTES,jsonBytes,type ChatMode,type ChatContext} from './context';
-import {superAgentMessage,superAgentTask,superAgentErase,superAgentDrainOutbox,superAgentTick,HOST_ACTIONS,MUTATING_ACTIONS,normalizeRepository,type RepositoryBinding,type TaskRequest} from './super_agent';
+import {superAgentMessage,superAgentTask,superAgentErase,superAgentDrainOutbox,superAgentTick,superAgentMessageLookup,superAgentResolveTask,parseSuperAgentCommand,type SuperAgentMessageLookup,type SuperAgentMessageMeta,HOST_ACTIONS,MUTATING_ACTIONS,normalizeRepository,type RepositoryBinding,type TaskRequest} from './super_agent';
 import {authenticateDeviceIdentity,authorizeIdentity,modelActor,normalizeIdentity,principalScope,validateIdentity,type ChatIdentity,type ChatPrincipal} from '../chat_identity';
 import type {KeyStore, Store} from '../runtime';
 import {hash, type Data} from '../types';
@@ -49,7 +49,7 @@ export interface ChatEnvironment {
   repositoryFetch?(scope:{chatId:string;deviceId:string;principal:ChatPrincipal;repository:RepositoryBinding},url:string,init:RequestInit):Promise<Response>;
 }
 interface Conversation {mode?:ChatMode;repository?:RepositoryBinding;id:string;owner?:string;device:string;device_id:string;title:string;created_at:string;updated_at:string;sequence:number;attachments:number;active?:string;writer?:string;revision?:number;reconnect_until?:number;interaction_mode?:InteractionMode;interaction_revision?:number;plan_review_id?:string}
-interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model'|'module';source_identity?:ReturnType<typeof sourceIdentity>;command_processed?:string;planning_request?:true;text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;resolves_message_ids?:string[];kind?:'approval';approval?:Data;approval_id?:string;approval_origin?:ApprovalOrigin}
+interface Message {id:string;sequence:number;role:'user'|'assistant';source:'web'|'tui'|'model'|'module';source_identity?:ReturnType<typeof sourceIdentity>;command_processed?:string;planning_request?:true;sender_role?:'master';task_id?:string;task_title?:string;text:string;attachments:AttachmentView[];created_at:string;delivery?:'pending'|'delivered'|'replied'|'failed'|'none';saved_at?:string;reply_to?:string;replies?:string[];replied_at?:string;resolves_message_ids?:string[];kind?:'approval';approval?:Data;approval_id?:string;approval_origin?:ApprovalOrigin}
 interface AttachmentView {id:string;name:string;size:number;mime_type:string;sha256?:string}
 interface Attachment extends AttachmentView {offset:number;chunks:number;state:'uploading'|'ready';expires_at?:number;expected_sha256?:string;protocol?:'tus';upload_metadata?:string}
 interface Candidate {chat:string;account:string;epoch:number;caller:string;expires_at:number}
@@ -314,9 +314,56 @@ export class ChatService {
       reply:{state:m.replied_at?'replied':'none',message_ids:m.replies??[],...(m.replied_at?{at:m.replied_at}:{})},
       delivery:m.replied_at?'replied':m.role==='assistant'?'none':state==='received'?'delivered':'pending'};
   }
-  private async viewMessage(tx:KeyStore,chat:string,m:Message):Promise<Data>{
-    return {...this.projectMessage(m,m.role==='user'?await tx.get<Outbox>(outboxKey(chat,m.sequence)):undefined),
-      ...(m.role==='user'&&!m.approval_id?{processing:await processingRecord(tx,chat,m)}:{})};
+  private async resolveSuperAgentMeta(
+    m:Message,
+    lookup:SuperAgentMessageLookup,
+    readOriginal:(id:string)=>Promise<Message|undefined>,
+  ):Promise<SuperAgentMessageMeta|undefined>{
+    if(m.task_id){
+      const live=lookup.resolve(m.task_id);
+      const title=live?.title??m.task_title;
+      return {task_id:live?.task_id??m.task_id,...(title?{task_title:title}:{})};
+    }
+    if(m.sender_role==='master')return {sender_role:'master'};
+    if(m.source==='module'){
+      const fromOutbox=lookup.outboxByMessageId.get(m.id);
+      if(fromOutbox)return {task_id:fromOutbox.task_id,task_title:fromOutbox.title};
+      if(m.reply_to){
+        const orig=await readOriginal(m.reply_to);
+        if(orig){
+          if(orig.command_processed==='error')return {sender_role:'master'};
+          const parsed=parseSuperAgentCommand(orig.text);
+          if(parsed){
+            if(!parsed.target)return {sender_role:'master'};
+            const live=lookup.resolve(parsed.target);
+            if(live)return {task_id:live.task_id,task_title:live.title};
+          }
+        }
+      }
+    }
+    return {sender_role:'master'};
+  }
+  private async projectMessages(tx:KeyStore,chat:Conversation,messages:Message[]):Promise<Data[]>{
+    if(!messages.length)return [];
+    const superAgent=chatMode(chat.mode)==='super_agent'&&messages.some(m=>m.role==='assistant'&&!m.approval_id);
+    const lookup=superAgent?await superAgentMessageLookup(tx,{chatId:chat.id,deviceId:chat.device}):undefined;
+    const byId=new Map(messages.map(m=>[m.id,m]));
+    const origCache=new Map<string,Message|undefined>();
+    const readOriginal=async(id:string)=>{
+      if(byId.has(id))return byId.get(id);
+      if(!origCache.has(id))origCache.set(id,await tx.get<Message>(messageKey(chat.id,cursorOf(id))));
+      return origCache.get(id);
+    };
+    return Promise.all(messages.map(async m=>{
+      const base=this.projectMessage(m,m.role==='user'?await tx.get<Outbox>(outboxKey(chat.id,m.sequence)):undefined);
+      const withProcessing=m.role==='user'&&!m.approval_id?{...base,processing:await processingRecord(tx,chat.id,m)}:base;
+      if(!lookup||m.role!=='assistant'||m.approval_id)return withProcessing;
+      const attribution=await this.resolveSuperAgentMeta(m,lookup,readOriginal);
+      return attribution?{...withProcessing,...attribution}:withProcessing;
+    }));
+  }
+  private async viewMessage(tx:KeyStore,chat:Conversation,m:Message):Promise<Data>{
+    return (await this.projectMessages(tx,chat,[m]))[0]!;
   }
   private async planReviewPage(tx:KeyStore,chat:string,first:number,last:number,after?:{anchor:number;revision:number}):Promise<Data>{
     const prefix=reviewTimelinePrefix(chat);
@@ -385,7 +432,7 @@ export class ChatService {
     const first=snapshot.messages[0]?.sequence??0;
     const channel=sanitizeChannelCommand(await this.store.get<Data>(channelCommandKey(chat.id)));
     return {chat:await this.summary(snapshot.current,actor,undefined,true),...(channel?{channel}:{}),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),
-      messages:await Promise.all(snapshot.messages.map(m=>this.viewMessage(this.store,chat.id,m))),...snapshot.reviews,pending_approvals:snapshot.pending_approvals,...snapshot.availability,
+      messages:await this.projectMessages(this.store,snapshot.current,snapshot.messages),...snapshot.reviews,pending_approvals:snapshot.pending_approvals,...snapshot.availability,
       cursor:snapshot.cursor,more:snapshot.more,...(!after?{first_cursor:first,has_older:first>1}:{})};
   }
   private async timing(chat:Conversation,args:Data):Promise<Data>{
@@ -449,7 +496,7 @@ export class ChatService {
   private async summary(chat:Conversation,actor:ChatPrincipal,views?:Map<string,Promise<ChatDevice>>,timeline=false):Promise<Data>{
     const device=await this.deviceView(chat.device,actor,views),mode=chatMode(chat.mode);
     const last=chat.sequence?await this.store.get<Message>(messageKey(chat.id,chat.sequence)):undefined;
-    const lastView=last?await this.viewMessage(this.store,chat.id,last):undefined;
+    const lastView=last?await this.viewMessage(this.store,chat,last):undefined;
     return {id:chat.id,title:chat.title,mode,...modeRepository(mode,chat.repository),device_id:device.id,device_name:device.name,system:device.system,
       ...(mode==='chat'?{interaction_mode:chat.interaction_mode??'normal',interaction_revision:chat.interaction_revision??0,
         ...(!views?{goal:goalView(await this.store.get<GoalRecord>(goalKey(chat.id))),
@@ -465,16 +512,17 @@ export class ChatService {
     return {key:k,fingerprint,result:previous?.result};
   }
   /** Stable reply identity survives a legitimate writer change; current authorization is checked by the caller. */
-  private async replyDedupe(tx:KeyStore,chat:string,requestKey:unknown,text:string,ids:string[],replyTo:unknown,resolves:string[]|undefined,revision:unknown){
+  private async replyDedupe(tx:KeyStore,chat:string,requestKey:unknown,text:string,ids:string[],replyTo:unknown,resolves:string[]|undefined,revision:unknown,taskId?:unknown){
     if(typeof requestKey!=='string'||!requestKey)throw fail('request_key_required','请提供 request_key');
-    const k='chat-request:'+chat+':reply:'+await hash(requestKey),fingerprint=await hash(JSON.stringify([text,ids,replyTo??null,resolves??[],resolves?revision:null]));
+    const extra=taskId!==undefined?[taskId]:[];
+    const k='chat-request:'+chat+':reply:'+await hash(requestKey),fingerprint=await hash(JSON.stringify([text,ids,replyTo??null,resolves??[],resolves?revision:null,...extra]));
     const previous=await tx.get<{version?:number;fingerprint:string;result:Data}>(k);
     if(previous){
       if(previous.version===2){if(previous.fingerprint!==fingerprint)throw fail('request_key_conflict','同一 request_key 的参数不一致');}
       else{
         const saved=await tx.get<Message>(messageKey(chat,previous.result.sequence));
         if(!saved)throw fail('reply_receipt_inconsistent','回复回执存在，但原始消息缺失；不能直接重发');
-        if(saved.text!==text||JSON.stringify(saved.attachments.map(a=>a.id))!==JSON.stringify(ids)||(saved.reply_to??null)!==(replyTo??null)||resolves?.length)throw fail('request_key_conflict','同一 request_key 的参数不一致');
+        if(saved.text!==text||JSON.stringify(saved.attachments.map(a=>a.id))!==JSON.stringify(ids)||(saved.reply_to??null)!==(replyTo??null)||resolves?.length||taskId!==undefined)throw fail('request_key_conflict','同一 request_key 的参数不一致');
       }
     }
     return {key:k,fingerprint,result:previous?.result};
@@ -821,7 +869,7 @@ export class ChatService {
       if(!saved)return {chat_id:chat.id,found:false,saved:false,state:'not_found',external_effects:'unknown'};
       const message=await tx.get<Message>(messageKey(chat.id,saved.result.sequence));
       if(!message)throw fail('reply_receipt_inconsistent','回复回执存在，但原始消息缺失；不能直接重发');
-      return {chat_id:chat.id,found:true,saved:true,message:await this.viewMessage(tx,chat.id,message),delivery_confirmed:false};
+      return {chat_id:chat.id,found:true,saved:true,message:await this.viewMessage(tx,chat,message),delivery_confirmed:false};
     });
   }
   private async inputMessages(tx:KeyStore,chat:string,value:unknown):Promise<Message[]>{
@@ -1254,7 +1302,8 @@ export class ChatService {
         if(message.replyTo&&(!original||original.role!=='user'))throw fail('invalid_reply','任务回复必须指向本对话的用户消息');
         const sequence=++current.sequence,stamp=now(),id='m'+sequence;
         const saved:Message={id,sequence,role:'assistant',source:'module',text:message.text,attachments:[],created_at:stamp,saved_at:stamp,
-          ...(message.replyTo?{reply_to:message.replyTo}:{})};
+          ...(message.replyTo?{reply_to:message.replyTo}:{}),
+          ...(message.taskId?{task_id:message.taskId,...(message.taskTitle?{task_title:message.taskTitle}:{})}:{sender_role:'master' as const})};
         current.updated_at=stamp;await tx.put({[messageKey(chat.id,sequence)]:saved,[index]:sequence});
         if(original){
           original.replies=[...(original.replies??[]),id];original.replied_at=stamp;await tx.put(messageKey(chat.id,original.sequence),original);
@@ -1345,7 +1394,7 @@ export class ChatService {
         ?await this.planReviewPage(tx,chat.id,lower,last):{plan_reviews:[]};
       return {messages,reviews,first,last};
     });
-    return {chat:await this.summary(chat,actor,undefined,human),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),notification_diagnostics:await readCallbackDiagnostics(this.store,chat.id),messages:await Promise.all(messages.map(m=>this.viewMessage(this.store,chat.id,m))),...reviews,next_cursor:last,first_cursor:first,eof:last>=chat.sequence,has_older:first>1};
+    return {chat:await this.summary(chat,actor,undefined,human),maintenance_statuses:await maintenanceStatuses(this.store,chat.id),notification_diagnostics:await readCallbackDiagnostics(this.store,chat.id),messages:await this.projectMessages(this.store,chat,messages),...reviews,next_cursor:last,first_cursor:first,eof:last>=chat.sequence,has_older:first>1};
   }
   private async resume(chat:Conversation,args:Data,actor:ChatPrincipal,caller:string):Promise<Data>{
     if(!caller)throw fail('model_connection_required','请通过模型 MCP 连接恢复对话');
@@ -1376,7 +1425,7 @@ export class ChatService {
     }
     const current=await this.chat(chat.id,actor);if(current.writer)await this.connection(current,connection,actor,caller);this.background(()=>this.changed(chat.id));
     return {chat:await this.summary(current,actor),connection,subscribed:!!current.active,context:await this.context(current,{}),
-      next_step:(chatMode(current.mode)==='super_agent'?'Super Agent: first call chat.task instructions for the original role and runtime_version; existing legacy tasks retain their original protocol until drained. In version 2, discuss pending requests here before routing if needed. Choose authorized Bridge or host tools within upstream role rules, with no added tool priority or forced delegation. Explicitly report execution stages; this server does not monitor host agents. Do not also handle this as ordinary Chat. ':'Chat: converse naturally using the included multi-message context. Do not create or dispatch Super Agent tasks. ')+'You may save replies now with chat.reply. Subscribe to chat.message through the host event-task capability (MCP events/subscribe) to receive future notifications. Event delivery is independent of saved messages.',
+      next_step:(chatMode(current.mode)==='super_agent'?'Super Agent: first call chat.task instructions for the original role and runtime_version; existing legacy tasks retain their original protocol until drained. In version 2, discuss pending requests here before routing if needed. Choose authorized Bridge or host tools within upstream role rules, with no added tool priority or forced delegation. Explicitly report execution stages; this server does not monitor host agents. Do not also handle this as ordinary Chat. When calling chat.reply, pass task_id for task-specific progress updates or task attachments so UI displays them under that task; omit task_id for Master orchestration or pre-dispatch discussion. ':'Chat: converse naturally using the included multi-message context. Do not create or dispatch Super Agent tasks. ')+'You may save replies now with chat.reply. Subscribe to chat.message through the host event-task capability (MCP events/subscribe) to receive future notifications. Event delivery is independent of saved messages.',
       ...(current.interaction_mode==='plan'?{planning_instructions:PLAN_GUIDANCE}:{}),
       event:{name:chatEventDefinition.name,arguments:{chat_id:chat.id,connection}},history:{chat_id:chat.id}};
   }
@@ -1414,9 +1463,9 @@ export class ChatService {
     if(event&&event.state!=='delivered'&&event.state!=='resolved'){event.state='resolved';await this.saveEvent(tx,event);}
   }
   private async savedResponse(tx:KeyStore,chat:Conversation,message:Message,summary:Data):Promise<Data>{
-    const visible=await this.viewMessage(tx,chat.id,message);
     const last=message.sequence===chat.sequence?message:(await tx.get<Message>(messageKey(chat.id,chat.sequence)))!;
-    const lastView=await this.viewMessage(tx,chat.id,last);
+    const projected=await this.projectMessages(tx,chat,message.sequence===last.sequence?[message]:[message,last]);
+    const visible=projected[0]!,lastView=projected[message.sequence===last.sequence?0:1]!;
     return {saved:true,message:visible,chat:{...summary,title:chat.title,updated_at:chat.updated_at,message_count:chat.sequence,
       state:chat.writer?'connected':'waiting',subscribed:!!chat.active,notification:lastView.notification,
       delivery_state:last.role==='assistant'?'replied':lastView.delivery}};
@@ -1444,7 +1493,7 @@ export class ChatService {
       processing:'The complete current body and attachments are in context.current_message. Continue this conversation naturally; combine pending inputs when appropriate, without a separate acknowledgement or reply to every message. Do not create Super Agent tasks. Before recovery read newer user directions and inspect uncertain effects.'+
         (chat.interaction_mode==='plan'?'\n\n'+PLAN_GUIDANCE:message.planning_request?' This input was explicitly sent for planning. It is not an instruction to implement the work.':'')}
       :{...base,kind:'user_message',
-      processing:'The complete current body and attachments are in context.current_message. Read chat.task instructions for this runtime version. Discuss with the user here before routing when needed; preserve original source references. Use the original framework tools and report execution stages explicitly. Choose authorized host or Bridge tools under the upstream role rules; no added tool preference or mandatory delegation. Commands marked command_processed are already applied; inspect tasks without repeating commands. Approval notices are not new tasks.'};
+      processing:'The complete current body and attachments are in context.current_message. Read chat.task instructions for this runtime version. Discuss with the user here before routing when needed; preserve original source references. Use the original framework tools and report execution stages explicitly. Choose authorized host or Bridge tools under the upstream role rules; no added tool preference or mandatory delegation. When calling chat.reply, pass task_id for task-specific progress updates or task attachments so UI displays them under that task, or omit task_id for Master orchestration/discussion. Commands marked command_processed are already applied; inspect tasks without repeating commands. Approval notices are not new tasks.'};
     return {eventId:chat.id+'-'+message.id,name:chatEventDefinition.name,timestamp:message.created_at,data,cursor:cursor?'m'+cursor:null};
   }
   private splitOversizedText(mode:ChatMode,text:string):{keptText:string;uploadText:string}{
@@ -1481,6 +1530,12 @@ export class ChatService {
     return {text,attachments};
   }
   private async send(chat:Conversation,args:Data,actor:ChatPrincipal,caller:string,model:boolean):Promise<Data>{
+    const taskIdArg=args.task_id;
+    if(taskIdArg!==undefined){
+      if(!model)throw fail('invalid_chat_argument','只有模型回复可指定 task_id');
+      if(chatMode(chat.mode)!=='super_agent')throw fail('chat_mode_mismatch','只有 Super Agent 对话回复可指定 task_id');
+      if(typeof taskIdArg!=='string'||!taskIdArg.trim()||taskIdArg.length>100)throw fail('invalid_task_argument','task_id 必须为非空文本（最多 100 字符）');
+    }
     const writer=model?await this.connection(chat,args.connection,actor,caller):undefined;
     const originalText=args.text===undefined?'':textValue(args.text,'text');let text=originalText;
     if(new TextEncoder().encode(text).length>(!model?2*1024*1024:512*1024))throw fail('message_too_large','消息超过此接口上限，请作为附件发送');
@@ -1498,16 +1553,19 @@ export class ChatService {
       const current=await tx.get<Conversation>(key(chat.id));if(!current)throw fail('chat_deleted','对话已删除');
       if(model&&current.writer!==writer!.id)throw fail('chat_not_connected','原模型连接已结束');
       if(args.resolves_message_ids!==undefined&&(!model||chatMode(current.mode)!=='chat'))throw fail('invalid_chat_argument','只有普通 Chat 模型回复可合并处理输入');
-      const d=model?await this.replyDedupe(tx,chat.id,args.request_key,text,ids,args.reply_to,args.resolves_message_ids,args.expected_revision)
+      if(taskIdArg!==undefined&&(!model||chatMode(current.mode)!=='super_agent'))throw fail('chat_mode_mismatch','只有 Super Agent 对话回复可指定 task_id');
+      const d=model?await this.replyDedupe(tx,chat.id,args.request_key,text,ids,args.reply_to,args.resolves_message_ids,args.expected_revision,taskIdArg)
         :await this.dedupe(tx,chat.id+':send:'+principalScope(actor),args.request_key,[originalText,ids,args.reply_to??null,null]);
       if(d.result)return this.savedResponse(tx,current,(await tx.get<Message>(messageKey(chat.id,d.result.sequence)))!,summary);
+      const resolvedTask=model&&taskIdArg!==undefined?await superAgentResolveTask(tx,{chatId:chat.id,deviceId:chat.device},taskIdArg):undefined;
       if(args.reply_to!==undefined){
         if(typeof args.reply_to!=='string'||!/^m[1-9]\d*$/.test(args.reply_to))throw fail('invalid_reply','引用必须是本对话的消息编号');
         const quoted=await tx.get<Message>(messageKey(chat.id,cursorOf(args.reply_to)));
         if(!quoted||quoted.role!==(model?'user':'assistant'))throw fail('invalid_reply',model?'模型引用必须指向本对话用户消息':'用户引用必须指向本对话助手消息');
       }
       const sequence=++current.sequence,id='m'+sequence,stamp=now();
-      const m:Message={id,sequence,role:model?'assistant':'user',source,source_identity:sourceIdentity(actor,model),text,attachments:attachments.map(viewAttachment),created_at:stamp,saved_at:stamp,...(args.reply_to?{reply_to:args.reply_to}:{}),...(args.resolves_message_ids?{resolves_message_ids:args.resolves_message_ids}:{})};
+      const replyAttribution=model&&chatMode(current.mode)==='super_agent'?(resolvedTask?{task_id:resolvedTask.task_id,task_title:resolvedTask.title}:{sender_role:'master' as const}):undefined;
+      const m:Message={id,sequence,role:model?'assistant':'user',source,source_identity:sourceIdentity(actor,model),...(replyAttribution??{}),text,attachments:attachments.map(viewAttachment),created_at:stamp,saved_at:stamp,...(args.reply_to?{reply_to:args.reply_to}:{}),...(args.resolves_message_ids?{resolves_message_ids:args.resolves_message_ids}:{})};
       current.updated_at=stamp;
       if(model&&args.reply_to){
         const seq=cursorOf(args.reply_to),old=await tx.get<Message>(messageKey(chat.id,seq));
@@ -1536,7 +1594,9 @@ export class ChatService {
           if(outcome.command){m.command_processed=outcome.command;await tx.put(messageKey(chat.id,m.sequence),m);}
           if(outcome.reply){
             const sequence=++current.sequence;
-            const note:Message={id:'m'+sequence,sequence,role:'assistant',source:'module',text:outcome.reply,attachments:[],created_at:stamp,saved_at:stamp,reply_to:m.id};
+            const attr=(outcome as Data).attribution as SuperAgentMessageMeta|undefined;
+            const noteAttribution=attr?.task_id?{task_id:attr.task_id,...(attr.task_title?{task_title:attr.task_title}:{})}:{sender_role:'master' as const};
+            const note:Message={id:'m'+sequence,sequence,role:'assistant',source:'module',...noteAttribution,text:outcome.reply,attachments:[],created_at:stamp,saved_at:stamp,reply_to:m.id};
             await tx.put(messageKey(chat.id,sequence),note);await this.recordChange(tx,current,[m.sequence,sequence]);
           }
         }

@@ -82,8 +82,18 @@ def _fence(value: str) -> str:
     return marker + '\n' + value + '\n' + marker
 
 
+def _sender(message: Json) -> str:
+    if message['role'] != 'assistant':
+        return '用户'
+    if title := ' '.join(str(message.get('task_title') or '').split()):
+        return '任务 · ' + title
+    if message.get('sender_role') == 'master':
+        return 'Master'
+    return 'Super Agent' if message.get('source') == 'module' else 'GPT / Dot'
+
+
 def _message(message: Json, chat_id: str, paths: dict[str, str], server: str) -> str:
-    sender = 'GPT / Dot' if message['role'] == 'assistant' else '用户'
+    sender = _sender(message)
     result = ['## ' + sender + ' · ' + str(message['id']) + ' · ' + str(message.get('created_at', '')), '']
     if message.get('text'):
         result.extend([_rewrite_links(str(message['text']), chat_id, paths, server), ''])

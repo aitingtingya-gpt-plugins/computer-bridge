@@ -1,7 +1,9 @@
 import type {KeyStore} from '../../runtime';
 import type {ChatPrincipal} from '../../chat_identity';
-import type {ReportState} from './vendor/src/core/index.ts';
+import type {OutboundMessage,ReportState} from './vendor/src/core/index.ts';
 export type RepositoryBinding={provider:'github'|'cnb';url:string}|null;
+export interface SuperAgentMessageMeta {sender_role?:'master';task_id?:string;task_title?:string}
+export interface SuperAgentOutbound {id:string;chatId:string;taskId?:string;taskTitle?:string;replyTo?:string;text:string;kind:OutboundMessage['kind']}
 export interface SuperAgentScope {chatId:string;deviceId:string;principal:ChatPrincipal;repository?:RepositoryBinding;authorizePrincipal?:(tx:KeyStore,principal:ChatPrincipal)=>Promise<void>}
 export interface SuperAgentMessage extends SuperAgentScope {messageId:string;text:string;at:string;attachments?:unknown[]}
 export const TASK_ACTIONS=['read','eval','eval_read','eval_decide','requeue','unsubscribe','action_done','list','detail','pending','instructions','discuss','accept','ignore','attach','stop','candidate_delivered','claim','started','inputs','inputs_delivered','inputs_read','delivery_failed','report','turn_ended','interrupted','reply','note','handback','request_status','follow','unfollow','thread_closed','cancel','retry','pause','resume','recover'] as const;

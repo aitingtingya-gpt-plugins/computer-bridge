@@ -4,8 +4,9 @@ import type {ChatIdentity} from '../../chat_identity';
 import {principalScope,normalizeIdentity} from '../../chat_identity';
 import {Engine,key,latestAssignment,ticketStage,canRetry,type Candidate,type DomainEvent,type OutboundMessage,type Policy,type ReplyStatus,type Ticket,type TicketInput,type Trigger} from './vendor/src/core/index.ts';
 import {SnapshotRepositories,emptyRecords,type Records} from './repository';
-import {HOST_ACTIONS,MUTATING_ACTIONS,type RepositoryBinding,type SuperAgentScope,type SuperAgentMessage,type TaskRequest} from './types';
-export type {SuperAgentScope,SuperAgentMessage,TaskRequest,RepositoryBinding} from './types';
+import {HOST_ACTIONS,MUTATING_ACTIONS,type RepositoryBinding,type SuperAgentMessageMeta,type SuperAgentOutbound,type SuperAgentScope,type SuperAgentMessage,type TaskRequest} from './types';
+import {commandAttribution} from './attribution';
+export type {SuperAgentScope,SuperAgentMessage,SuperAgentMessageMeta,SuperAgentOutbound,TaskRequest,RepositoryBinding} from './types';
 export {HOST_ACTIONS,MUTATING_ACTIONS} from './types';
 export {superAgentTaskSpec} from './contracts';
 
@@ -120,7 +121,7 @@ class Runtime {
   }
   ingest(message:SuperAgentMessage) {
     const match=/^\/(task-new|task-resume|tasks|task|new|cancel|stop|retry|pause|resume)(?:\s+([\s\S]*))?$/.exec(message.text.trim());
-    let reply:string|undefined,command=match?.[1]??null;
+    let reply:string|undefined,command=match?.[1]??null,taskTicket:Ticket|undefined;
     if(command==='task-new')command='new';if(command==='task-resume')command='resume';
     if(match){
       const body=match[2]?.trim()??'';
@@ -131,7 +132,7 @@ class Runtime {
       }else if(command==='new'){
         const ticket=this.create(message,required(body,'任务内容'));reply=`已创建 ${this.alias(ticket.id)}，等待执行宿主领取。`;
       }else{
-        const [id,...rest]=body.split(/\s+/),ticket=this.resolve(id);
+        const [id,...rest]=body.split(/\s+/),ticket=this.resolve(id);taskTicket=ticket;
         if(command==='task'){
           if(ticket.ended?.by==='human')throw fail('task_stopped','该任务已由用户停止；请新建任务，不可隐式恢复');
           this.state.selected=ticket.id;
@@ -152,7 +153,8 @@ class Runtime {
       const trigger=this.trigger(message,message.text,selected);this.engine.receive(trigger);
       this.engine.evaluateDue();
     }
-    return {command,reply,...this.snapshot()};
+    const attribution=commandAttribution(command,taskTicket,taskTicket?this.alias(taskTicket.id):undefined);
+    return {command,reply,...(attribution?{attribution}:{}),...this.snapshot()};
   }
   currentSession(ticket:Ticket,request:TaskRequest,hostId:string) {
     const assignment=latestAssignment(ticket),id=required(request.assignment_id,'assignment_id',100);
@@ -292,7 +294,7 @@ export async function superAgentMessage(tx:KeyStore,message:SuperAgentMessage):P
   }catch(error){
     if(!message.text.trim().startsWith('/'))throw error;
     const clean=new Runtime(before,message,message.at);
-    result={command:'error',reply:(error as Error).message,error:(error as {code?:string}).code??'task_command_failed',...clean.snapshot()};
+    result={command:'error',reply:(error as Error).message,error:(error as {code?:string}).code??'task_command_failed',attribution:commandAttribution('error'),...clean.snapshot()};
     for(const name of Object.keys(runtime.state))delete (runtime.state as any)[name];
     Object.assign(runtime.state,clean.state);
   }
@@ -336,9 +338,6 @@ export async function superAgentErase(tx:KeyStore,chatId:string):Promise<void>{
   await tx.delete(PREFIX+chatId);
 }
 
-export interface SuperAgentOutbound {
-  id:string;chatId:string;taskId?:string;replyTo?:string;text:string;kind:OutboundMessage['kind'];
-}
 /**
  * Bridge's internal channel adapter. The caller must keep this in the same Store transaction as task mutation and
  * saveReply. The callback writes normal chat history, not a network send. Any failure rolls back both the task and reply.
@@ -352,9 +351,10 @@ export async function superAgentDrainOutbox(tx:KeyStore,scope:SuperAgentScope,
     const message=row.message;
     if(message.channel.source!=='computer-bridge'||message.channel.thread!==scope.chatId||message.channel.address.chat_id!==scope.chatId)
       throw fail('outbox_destination_mismatch','任务回复不属于当前对话，已停止保存');
-    if(message.ticketId)await authorizeOrigin(tx,runtime,runtime.resolve(message.ticketId).origin.triggerId);
-    const saved=await saveReply({id:message.id,chatId:scope.chatId,taskId:message.ticketId?runtime.alias(message.ticketId):undefined,
-      replyTo:message.channel.address.message_id,text:message.text,kind:message.kind});
+    const ticket=message.ticketId?runtime.resolve(message.ticketId):undefined;
+    if(ticket)await authorizeOrigin(tx,runtime,ticket.origin.triggerId);
+    const saved=await saveReply({id:message.id,chatId:scope.chatId,taskId:ticket?runtime.alias(ticket.id):undefined,
+      taskTitle:ticket?.title,replyTo:message.channel.address.message_id,text:message.text,kind:message.kind});
     row.status='sent';row.savedMessageId=required(saved.messageId,'saved message id',100);
     receipts.push({reply_id:message.id,message_id:row.savedMessageId,saved:true,delivery_confirmed:false});
   }

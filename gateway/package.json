@@ -1,6 +1,6 @@
 {
   "name": "computer-bridge-gateway",
-  "version": "0.2.6-beta",
+  "version": "0.2.6",
   "private": true,
   "type": "module",
   "scripts": {

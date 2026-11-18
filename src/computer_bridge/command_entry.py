@@ -78,19 +78,19 @@ def register_commands(installation_home: Path, *, user_home: Path | None = None,
     directory.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     if os.name == "nt":
-        # These entry files must retain ASCII command syntax; the installation
-        # directory is discovered relative to the wrapper, so Unicode paths work.
+        # Keep ASCII syntax (home is resolved via %~dp0) and group invocation
+        # inside one parenthesized block so cmd.exe buffers it before self-update
+        # rewrites this .cmd file; bare `exit /b` preserves runtime exit code.
         content = (
             "@echo off\r\nsetlocal\r\n"
             'for %%I in ("%~dp0..") do set "BRIDGE_DATA=%%~fI"\r\n'
             'if defined COMPUTER_BRIDGE_HOME set "BRIDGE_DATA=%COMPUTER_BRIDGE_HOME%"\r\n'
-            'for /f "tokens=2 delims=:" %%C in (\'chcp\') do set "BRIDGE_CODEPAGE=%%C"\r\n'
-            "chcp 65001 >nul\r\n"
+            'set "PYTHONUTF8=1"\r\n'
             'set /p BRIDGE_PYTHON=<"%BRIDGE_DATA%\\launcher-python.txt"\r\n'
-            '"%BRIDGE_PYTHON%" "%BRIDGE_DATA%\\launcher.py" --home "%BRIDGE_DATA%" --command chat %*\r\n'
-            'set "BRIDGE_EXIT=%errorlevel%"\r\n'
-            "chcp %BRIDGE_CODEPAGE% >nul\r\n"
-            "exit /b %BRIDGE_EXIT%\r\n"
+            "(\r\n"
+            '  "%BRIDGE_PYTHON%" "%BRIDGE_DATA%\\launcher.py" --home "%BRIDGE_DATA%" --command chat %*\r\n'
+            "  exit /b\r\n"
+            ")\r\n"
         )
         for name in COMMANDS:
             path = directory / (name + ".cmd")

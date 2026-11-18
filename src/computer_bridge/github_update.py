@@ -16,6 +16,9 @@ import uuid
 import venv
 import zipfile
 from collections.abc import Callable
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -182,6 +185,28 @@ def _error_detail(exc: Exception | None) -> str:
     return str(exc) or type(exc).__name__
 
 
+class ReleaseHTTPError(Error):
+    def __init__(self, status_code: int, retry_after: str | None):
+        super().__init__("github_http", f"GitHub 请求失败：HTTP {status_code}")
+        self.status_code = status_code
+        self.retry_after = _retry_after_seconds(retry_after)
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        return max(0.0, (when - datetime.now(UTC)).total_seconds())
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
 async def _github_get_bytes(
     settings: Json,
     url: str,
@@ -189,18 +214,25 @@ async def _github_get_bytes(
     accept: str,
     token: str | None,
     timeout: float = 30.0,
+    dashboard: bool = False,
 ) -> bytes:
     headers = _github_headers(accept=accept, token=token)
     last_error: Exception | None = None
     for proxy in github_proxy_candidates(settings, url):
         try:
-            async with httpx2.AsyncClient(trust_env=False, proxy=proxy, timeout=timeout) as client:
-                response = await client.get(url, headers=headers, follow_redirects=True)
+            async with asyncio.timeout(timeout if dashboard else None):
+                async with httpx2.AsyncClient(trust_env=False, proxy=proxy, timeout=timeout) as client:
+                    response = await client.get(url, headers=headers, follow_redirects=True)
             if response.status_code >= 400:
+                if dashboard:
+                    # Retry-After applies to the source, not just to this network route.
+                    raise ReleaseHTTPError(response.status_code, response.headers.get("Retry-After"))
                 raise Error("github_http", f"GitHub 请求失败：HTTP {response.status_code}")
             return response.content
         except (httpx2.TransportError, httpx2.TimeoutException, OSError) as exc:
             last_error = exc
+    if dashboard and isinstance(last_error, (TimeoutError, httpx2.TimeoutException)):
+        raise last_error
     raise Error("github_network", f"无法连接 GitHub Releases：{_error_detail(last_error)}")
 
 
@@ -261,6 +293,7 @@ async def fetch_latest_release(
     repository: str = DEFAULT_REPOSITORY,
     api_base: str = GITHUB_API_URL,
     token: str | None = None,
+    dashboard_route_timeout: float | None = None,
 ) -> Json | None:
     if not repository:
         raise Error("update_repository", "请先通过 --repo 或 COMPUTER_BRIDGE_UPDATE_REPOSITORY 指定 GitHub 更新仓库（owner/repo）")
@@ -269,10 +302,13 @@ async def fetch_latest_release(
     resolved_channel = normalize_channel(channel)
     resolved_token = os.environ.get("GITHUB_RELEASE_TOKEN", "").strip() if token is None else token
     base = api_base.rstrip("/")
+    get_bytes = _github_get_bytes if dashboard_route_timeout is None else partial(
+        _github_get_bytes, timeout=dashboard_route_timeout, dashboard=True,
+    )
     candidates: list[tuple[Version, str, Json]] = []
     page = 1
     while True:
-        payload = await _github_get_bytes(
+        payload = await get_bytes(
             settings,
             f"{base}/repos/{repository}/releases?per_page=100&page={page}",
             accept="application/vnd.github+json",
@@ -306,7 +342,7 @@ async def fetch_latest_release(
         manifest_url = str(manifest_asset.get("url") or manifest_asset.get("browser_download_url") or "")
         if not manifest_url:
             continue
-        manifest_raw = await _github_get_bytes(
+        manifest_raw = await get_bytes(
             settings,
             manifest_url,
             accept="application/octet-stream",

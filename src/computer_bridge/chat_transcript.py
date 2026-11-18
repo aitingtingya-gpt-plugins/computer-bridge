@@ -18,7 +18,18 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from .chat_cells import cell_width as cell_width
 from .chat_cells import graphemes, source_lines
 from .chat_markdown import Body, MarkdownWorker
+from .chat_status import clipped
 from .common import Json
+
+
+def format_sender(message: Json, user_name: str = "我") -> str:
+    if message.get("role") != "assistant":
+        return user_name
+    if title := str(message.get("task_title") or "").strip():
+        return f"任务 · {clipped(title, 32)}"
+    if message.get("sender_role") == "master":
+        return "Master"
+    return "Super Agent" if message.get("source") == "module" else "GPT / Dot"
 
 Fragment = tuple[str, str, tuple[str, str] | None]
 Row = list[Fragment]
@@ -394,8 +405,7 @@ class ChatTranscript(UIControl):
             if pending and identifier in self.approval_errors:
                 rows.append(self.row('│ ' + self.approval_errors[identifier], 'class:hint'))
             return [*rows, self.row("└"), self.row("")]
-        sender = "Super Agent" if message.get("source") == "module" else "GPT / Dot" if message["role"] == "assistant" else self.user_name
-        sender = "▐ " + sender + " ▌"
+        sender = "▐ " + format_sender(message, self.user_name) + " ▌"
         signature = (message["text"], tuple((file["id"], file["name"], file["size"]) for file in message.get("attachments", [])))
         sequence = int(message["sequence"])
         previous = self.bodies.get(sequence)

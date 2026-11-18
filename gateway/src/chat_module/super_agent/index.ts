@@ -11,9 +11,12 @@ import {textPage} from './assessment-host';
 import {WorkerSlots} from './upstream-slots';
 import {reportRelay,followupRelay,ticketCard} from './upstream-notices';
 import {rolePrompt} from './role-prompt';
-import {HOST_ACTIONS,MUTATING_ACTIONS,type SuperAgentScope,type SuperAgentMessage,type TaskRequest,type RepositoryBinding} from './types';
+import {HOST_ACTIONS,MUTATING_ACTIONS,type SuperAgentMessageMeta,type SuperAgentOutbound,type SuperAgentScope,type SuperAgentMessage,type TaskRequest,type RepositoryBinding} from './types';
+import {buildLookupFromState,commandAttribution,parseSuperAgentCommand,type SuperAgentMessageLookup,type SuperAgentTicketSummary} from './attribution';
 import * as legacy from './legacy';
-export type {SuperAgentScope,SuperAgentMessage,TaskRequest,RepositoryBinding} from './types';
+export type {SuperAgentScope,SuperAgentMessage,SuperAgentMessageMeta,SuperAgentOutbound,TaskRequest,RepositoryBinding} from './types';
+export type {SuperAgentMessageLookup,SuperAgentTicketSummary} from './attribution';
+export {parseSuperAgentCommand} from './attribution';
 export {HOST_ACTIONS,MUTATING_ACTIONS} from './types';
 export {superAgentTaskSpec} from './contracts';
 export {normalizeRepositoryBinding as normalizeRepository} from '../repositories';
@@ -31,7 +34,7 @@ interface State {
  activity:Record<string,'running'|'idle'|'stopped'>;effects:EffectRecord[];actions:Record<string,Action>;outbox:Record<string,{message:OutboundMessage;status:ReplyStatus;savedMessageId?:string}>;
  aliases:Record<string,string>;counter:number;selected?:string;seen:Record<string,{fingerprint:string;result:any}>;events:DomainEvent[];generation:number;
 }
-const empty=(scope:SuperAgentScope):State=>({version:2,deniedActors:[],chatId:scope.chatId,deviceId:scope.deviceId,repository:scope.repository??null,
+const empty=(scope:Pick<SuperAgentScope,'chatId'|'deviceId'>&{repository?:RepositoryBinding}):State=>({version:2,deniedActors:[],chatId:scope.chatId,deviceId:scope.deviceId,repository:scope.repository??null,
  settings:SettingsSchema.parse({}),records:emptyRecords(),pending:{},authorities:{},candidates:{},activity:{},effects:[],actions:{},outbox:{},aliases:{},counter:0,seen:{},events:[],generation:0});
 const triggerId=(chat:string,message:string)=>key('bridge-trigger',chat,message);
 class Runtime {
@@ -136,13 +139,14 @@ class Runtime {
   const command=match[1],body=match[2]?.trim()??'';let reply='';
   if(command==='tasks')reply=this.repo.tickets.list().map(t=>{const v=this.view(t);return `${v.task_id} · ${v.title} · ${v.state}`;}).join('\n')||'暂无任务。';
   else if(['pause','resume','task-resume'].includes(command)){this.state.settings.paused=command==='pause';reply=command==='pause'?'已暂停调度。':'已恢复调度。';}
-  else if(command==='new'||command==='task-new'){if(!body&&!pending.attachments.length)required(body,'任务内容',MAX_MESSAGE_BYTES);pending.text=body?required(body,'任务内容',MAX_MESSAGE_BYTES):'';this.state.selected=undefined;reply='请求已保存，等待主 Agent 归类。';return {command,reply,...this.snapshot()};}
+  else if(command==='new'||command==='task-new'){if(!body&&!pending.attachments.length)required(body,'任务内容',MAX_MESSAGE_BYTES);pending.text=body?required(body,'任务内容',MAX_MESSAGE_BYTES):'';this.state.selected=undefined;reply='请求已保存，等待主 Agent 归类。';return {command,reply,attribution:commandAttribution(command),...this.snapshot()};}
   else{const [id,...rest]=body.split(/\s+/),ticket=this.resolve(id);
    if(command==='task'){if(ticket.ended?.by==='human')throw fail('task_stopped','已停止的任务不能隐式恢复');this.state.selected=ticket.id;
     if(rest.length||pending.attachments.length){pending.text=rest.join(' ');this.engine.receive(this.trigger(pending,this.repo.triggers.get(ticket.origin.triggerId)!.threads));}reply=`${this.alias(ticket.id)} · ${ticket.title}`;}
    else if(command==='retry'){this.engine.retryTicket(ticket.id);reply='已重新排队 '+this.alias(ticket.id);}
-   else{this.engine.stopTicket(ticket.id,rest.join(' ')||'Stopped by authenticated user');if(this.state.selected===ticket.id)delete this.state.selected;reply='已停止 '+this.alias(ticket.id);}}
-  pending.routed='command';return {command,reply,...this.snapshot()};
+   else{this.engine.stopTicket(ticket.id,rest.join(' ')||'Stopped by authenticated user');if(this.state.selected===ticket.id)delete this.state.selected;reply='已停止 '+this.alias(ticket.id);}
+   pending.routed='command';return {command,reply,attribution:commandAttribution(command,ticket,this.alias(ticket.id)),...this.snapshot()};}
+  pending.routed='command';return {command,reply,attribution:commandAttribution(command),...this.snapshot()};
  }
  assignment(ticket:Ticket,request:TaskRequest){const a=latestAssignment(ticket);if(!a||a.id!==required(request.assignment_id,'assignment_id',100))throw fail('stale_assignment','执行批次已结束或替换');return a;}
  messageId(value:unknown):string {
@@ -253,7 +257,7 @@ class Runtime {
 }
 interface Chunked {storage:'chunks-v1';chunks:number;length:number;digest:string}
 const part=(chat:string,i:number)=>PREFIX+chat+':part:'+String(i).padStart(8,'0');
-async function read(tx:KeyStore,scope:SuperAgentScope):Promise<any>{const saved=await tx.get<any>(PREFIX+scope.chatId);if(!saved)return empty(scope);if(!('storage'in saved))return saved;let json='';for(let i=0;i<saved.chunks;i++){const p=await tx.get<string>(part(scope.chatId,i));if(typeof p!=='string')throw fail('super_agent_state_corrupt','任务数据不完整');json+=p;}if(json.length!==saved.length||key(json)!==saved.digest)throw fail('super_agent_state_corrupt','任务数据校验失败');return JSON.parse(json);}
+async function read(tx:KeyStore,scope:Pick<SuperAgentScope,'chatId'|'deviceId'>&{repository?:RepositoryBinding}):Promise<any>{const saved=await tx.get<any>(PREFIX+scope.chatId);if(!saved)return empty(scope);if(!('storage'in saved))return saved;let json='';for(let i=0;i<saved.chunks;i++){const p=await tx.get<string>(part(scope.chatId,i));if(typeof p!=='string')throw fail('super_agent_state_corrupt','任务数据不完整');json+=p;}if(json.length!==saved.length||key(json)!==saved.digest)throw fail('super_agent_state_corrupt','任务数据校验失败');return JSON.parse(json);}
 async function save(tx:KeyStore,state:State){const previous=await tx.get<any>(PREFIX+state.chatId),json=JSON.stringify(state),chunks=Math.ceil(json.length/16000);for(let i=0;i<chunks;i++)await tx.put(part(state.chatId,i),json.slice(i*16000,(i+1)*16000));if(previous?.storage)for(let i=chunks;i<previous.chunks;i++)await tx.delete(part(state.chatId,i));await tx.put(PREFIX+state.chatId,{storage:'chunks-v1',chunks,length:json.length,digest:key(json)} satisfies Chunked);}
 async function authorize(tx:KeyStore,runtime:Runtime,ids:string[]){for(const id of new Set(ids)){const principal=runtime.state.authorities[id];if(!principal||!runtime.scope.authorizePrincipal)throw fail('task_authority_unavailable','原消息授权无法复核');await runtime.scope.authorizePrincipal(tx,principal);}}
 function runtime(state:State,scope:SuperAgentScope,at?:string){if(state.version!==2)throw fail('super_agent_version','不支持的任务版本');if(state.chatId!==scope.chatId||state.deviceId!==scope.deviceId)throw fail('device_forbidden','任务不属于当前对话');return new Runtime(clone(state),scope,at);}
@@ -262,7 +266,7 @@ export async function superAgentMessage(tx:KeyStore,message:SuperAgentMessage){c
  const id='message:'+message.messageId,fp=key(message.text,JSON.stringify(message.attachments??[])),old=state.seen[id];if(old){if(old.fingerprint!==fp)throw fail('request_key_conflict','消息内容发生变化');return {...old.result,...runtime(state,message).snapshot()};}
  state.authorities[triggerId(message.chatId,message.messageId)]=normalizeIdentity(message.principal);const run=runtime(state,message,message.at);
  if(run.state.selected&&run.resolve(run.state.selected).ended?.by!=='human')await authorize(tx,run,[run.resolve(run.state.selected).origin.triggerId]);
- let result:any;try{result=run.ingest(message);await run.settle();}catch(error){if(!message.text.trim().startsWith('/'))throw error;const clean=runtime(state,message,message.at);result={command:'error',reply:(error as Error).message,...clean.snapshot()};clean.state.seen[id]={fingerprint:fp,result:compact(result)};await save(tx,clean.state);return result;}
+ let result:any;try{result=run.ingest(message);await run.settle();}catch(error){if(!message.text.trim().startsWith('/'))throw error;const clean=runtime(state,message,message.at);result={command:'error',reply:(error as Error).message,attribution:commandAttribution('error'),...clean.snapshot()};clean.state.seen[id]={fingerprint:fp,result:compact(result)};await save(tx,clean.state);return result;}
  run.state.seen[id]={fingerprint:fp,result:compact(result)};await save(tx,run.state);return {...result,...run.snapshot()};}
 export async function superAgentTask(tx:KeyStore,scope:SuperAgentScope,r:TaskRequest,hostId?:string){const state=await read(tx,scope);if(state.version===1){
  if(['instructions','pending'].includes(r.action)){if(!hostId)throw fail('model_connection_required','需要当前模型连接');const snapshot=await legacy.superAgentTask(tx,scope,{action:'list'},hostId);return {runtime_version:1,protocol:'legacy',...snapshot,text:'This existing conversation uses the previous protocol until its tasks finish. Use accept/ignore with candidate eval_id; claim starts a legacy assignment; inputs with input_ids acknowledges legacy delivery/read; report also closes its legacy turn. Do not use v2 started/inputs_delivered/inputs_read/turn_ended in this conversation. New Super Agent conversations use v2. No new Bridge working conversation is required.'};}
@@ -286,8 +290,21 @@ export async function superAgentTick(tx:KeyStore,scope:SuperAgentScope):Promise<
  await run.settle();await save(tx,run.state);return {changed:before!==run.state.generation,next_due:run.nextDue(),generation:run.state.generation,runtime_version:2};
 }
 export async function superAgentErase(tx:KeyStore,chatId:string){return legacy.superAgentErase(tx,chatId);}
-export interface SuperAgentOutbound {id:string;chatId:string;taskId?:string;replyTo?:string;text:string;kind:OutboundMessage['kind']}
+export async function superAgentMessageLookup(tx:KeyStore,scope:Pick<SuperAgentScope,'chatId'|'deviceId'>):Promise<SuperAgentMessageLookup>{
+ const saved=await tx.get<any>(PREFIX+scope.chatId);
+ if(!saved)return buildLookupFromState({tickets:{}},{},{});
+ const state=await read(tx,scope);
+ if(state.chatId!==scope.chatId||state.deviceId!==scope.deviceId)throw fail('device_forbidden','任务不属于当前对话');
+ return buildLookupFromState(state.records,state.aliases,state.outbox);
+}
+export async function superAgentResolveTask(tx:KeyStore,scope:Pick<SuperAgentScope,'chatId'|'deviceId'>,rawTaskId:unknown):Promise<SuperAgentTicketSummary>{
+ const id=required(rawTaskId,'task_id',100);
+ const lookup=await superAgentMessageLookup(tx,scope);
+ const found=lookup.resolve(id);
+ if(!found)throw fail('task_not_found','当前对话不存在该任务');
+ return found;
+}
 export async function superAgentDrainOutbox(tx:KeyStore,scope:SuperAgentScope,saveReply:(m:SuperAgentOutbound)=>Promise<{messageId:string}>){const state=await read(tx,scope);if(state.version===1)return legacy.superAgentDrainOutbox(tx,scope,saveReply);const receipts:{reply_id:string;message_id:string;saved:true;delivery_confirmed:false}[]=[];
- const run=new Runtime(clone(state),scope,undefined,async m=>{if(m.ticketId)await authorize(tx,run,[run.resolve(m.ticketId).origin.triggerId]);const saved=await saveReply({id:m.id,chatId:scope.chatId,taskId:m.ticketId?run.alias(m.ticketId):undefined,replyTo:m.channel.address.message_id,text:m.text,kind:m.kind});run.state.outbox[m.id]!.savedMessageId=saved.messageId;receipts.push({reply_id:m.id,message_id:saved.messageId,saved:true,delivery_confirmed:false});return 'sent';});
+ const run=new Runtime(clone(state),scope,undefined,async m=>{const ticket=m.ticketId?run.resolve(m.ticketId):undefined;if(ticket)await authorize(tx,run,[ticket.origin.triggerId]);const saved=await saveReply({id:m.id,chatId:scope.chatId,taskId:ticket?run.alias(ticket.id):undefined,taskTitle:ticket?.title,replyTo:m.channel.address.message_id,text:m.text,kind:m.kind});run.state.outbox[m.id]!.savedMessageId=saved.messageId;receipts.push({reply_id:m.id,message_id:saved.messageId,saved:true,delivery_confirmed:false});return 'sent';});
  await run.settle();await save(tx,run.state);return receipts;
 }

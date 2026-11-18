@@ -32,9 +32,19 @@ if sys.platform != "win32":
     from prompt_toolkit.input.vt100 import Vt100Input
 
 
+_REMOTE_TERMINAL_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "TMUX", "STY")
+_MODIFIER_VKS = frozenset({0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})
+
+
 def local_apple_terminal(environment: dict[str, str], platform: str = sys.platform) -> bool:
     return platform == "darwin" and environment.get("TERM_PROGRAM") == "Apple_Terminal" and not any(
-        environment.get(name) for name in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "TMUX", "STY")
+        environment.get(name) for name in _REMOTE_TERMINAL_VARS
+    )
+
+
+def local_windows_terminal(environment: dict[str, str], platform: str = sys.platform) -> bool:
+    return platform == "win32" and not any(
+        environment.get(name) for name in _REMOTE_TERMINAL_VARS
     )
 
 
@@ -53,6 +63,28 @@ class AppleShift:
         flags = int(self.read(0)) if self.read else 0
         # Do not turn Control/Option/Command combinations into Shift-only keys.
         return bool(flags & (1 << 17) and not flags & ((1 << 18) | (1 << 19) | (1 << 20)))
+
+
+class WindowsShift:
+    """Recover Shift on standalone bare Enter when a local host strips it (e.g. Electron/xterm)."""
+
+    def __init__(self) -> None:
+        self.key_state: Any = None
+        self.foreground: Any = None
+        if local_windows_terminal(dict(os.environ)):
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            self.key_state = user32.GetAsyncKeyState
+            self.key_state.argtypes = [ctypes.c_int]
+            self.key_state.restype = ctypes.c_short
+            self.foreground = user32.GetForegroundWindow
+            self.foreground.argtypes = []
+            self.foreground.restype = ctypes.c_void_p
+
+    def __call__(self) -> bool:
+        if not self.key_state or not self.foreground or not self.foreground():
+            return False
+        down = lambda vk: bool(int(self.key_state(vk)) & 0x8000)
+        return down(0x10) and not any(down(vk) for vk in (0x11, 0x12, 0x5B, 0x5C))
 
 
 _NEWLINE_SEQUENCES = {
@@ -148,14 +180,25 @@ def windows_shift_enter(event: Any) -> bool:
     return bool(event.KeyDown and event.VirtualKeyCode == 13 and state & 0x10 and not state & 0x0F)
 
 
+def _bare_windows_enter(event: Any) -> bool:
+    return bool(
+        event.KeyDown
+        and event.VirtualKeyCode == 13
+        and event.uChar.UnicodeChar == "\r"
+        and not (int(event.ControlKeyState) & 0x1F)
+    )
+
+
 class KeyboardInput:
     def __init__(self) -> None:
         self.output: Output | None = None
-        self.query_pending = self.pushed = False
+        self.query_pending = self.pushed = self._win32_input_mode = False
         self.shift = AppleShift()
+        self.win_shift = WindowsShift()
         self.input = create_input()
         if sys.platform == "win32":
-            self._windows(self.input)
+            if hasattr(self.input, "console_input_reader"):
+                self._windows(self.input)
         elif isinstance(self.input, Vt100Input):
             target = self.input
             target.vt100_parser = self.parser(lambda key: target._buffer.append(key))
@@ -184,6 +227,9 @@ class KeyboardInput:
 
         from prompt_toolkit.input.win32 import (  # type: ignore[attr-defined]
             ConsoleInputReader,
+            EventTypes,
+            KEY_EVENT_RECORD,
+            MOUSE_EVENT_RECORD,
             raw_mode,
         )
 
@@ -196,7 +242,32 @@ class KeyboardInput:
                 # modifier bits. PTK's native reader needs the original records.
                 windll.kernel32.SetConsoleMode(self.handle, DWORD(mode.value & ~0x0200))
 
+        win_shift = self.win_shift
+
         class NativeReader(ConsoleInputReader):  # type: ignore[misc]
+            def _get_keys(self, read: Any, input_records: Any) -> Any:
+                events: list[Any] = []
+                downs = 0
+                for i in range(read.value):
+                    ir = input_records[i]
+                    name = EventTypes.get(ir.EventType)
+                    if not name:
+                        continue
+                    ev = getattr(ir.Event, name)
+                    events.append(ev)
+                    if isinstance(ev, KEY_EVENT_RECORD) and ev.KeyDown and ev.VirtualKeyCode not in _MODIFIER_VKS:
+                        downs += 1
+                if downs == 1:
+                    bare = next((ev for ev in events if isinstance(ev, KEY_EVENT_RECORD) and _bare_windows_enter(ev)), None)
+                    if bare is not None and win_shift():
+                        for ev in events:
+                            if isinstance(ev, MOUSE_EVENT_RECORD):
+                                yield from self._handle_mouse(ev)
+                            elif ev is bare:
+                                yield KeyPress(Keys.ControlJ, "\n")
+                        return
+                yield from super()._get_keys(read, input_records)
+
             def _event_to_key_presses(self, event: Any) -> list[KeyPress]:
                 # The inherited Ctrl+Enter mapping also prefixes Ctrl+J with
                 # Escape. Preserve Ctrl+J as the explicit newline fallback.
@@ -257,7 +328,13 @@ class KeyboardInput:
 
     def start(self, output: Output) -> None:
         self.output = output
-        if sys.platform != "win32" and isinstance(self.input, Vt100Input) and self.input.stdin.isatty():
+        if sys.platform == "win32":
+            if hasattr(self, "_console_handle") and hasattr(output, "vt100_output"):
+                output.write_raw("\x1b[?9001h")
+                output.flush()
+                self._win32_input_mode = True
+            return
+        if isinstance(self.input, Vt100Input) and self.input.stdin.isatty():
             self.query_pending = True
             output.write_raw("\x1b[?u")
             output.flush()
@@ -271,6 +348,10 @@ class KeyboardInput:
 
     def close(self) -> None:
         self.query_pending = False
+        if self._win32_input_mode and self.output:
+            self.output.write_raw("\x1b[?9001l")
+            self.output.flush()
+            self._win32_input_mode = False
         if self.pushed and self.output:
             self.output.write_raw("\x1b[<u")
             self.output.flush()
